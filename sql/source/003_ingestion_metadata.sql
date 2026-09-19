@@ -10,7 +10,9 @@ CREATE TABLE IF NOT EXISTS ingestion_metadata (
     source_table    VARCHAR(64)  NOT NULL,
     load_type       VARCHAR(16)  NOT NULL,   -- full | incremental
     status          VARCHAR(16)  NOT NULL,   -- running | success | failed
-    watermark_start BIGINT,
+    watermark_start BIGINT,                 -- this run's starting watermark; see
+                                             -- docs/analytics-engineering-guide.md Section 22
+                                             -- for why this column went unpopulated until then
     watermark_end   BIGINT,
     rows_read       BIGINT,
     rows_written    BIGINT,

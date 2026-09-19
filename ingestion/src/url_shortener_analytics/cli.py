@@ -1,7 +1,7 @@
 """Command-line entrypoint: `python -m url_shortener_analytics.cli <command>`
 (or the `ingest` console script installed by pyproject.toml).
 
-Six commands:
+Nine commands:
 
 - `run`                -- dispatch each table in pipelines.yaml to full or
                           incremental load, per its configured `load_type`.
@@ -27,11 +27,21 @@ Six commands:
 - `storage-stats`      -- report object count and total bytes under a
                           Bronze prefix -- a cheap capacity/growth signal.
                           See the guide's Section 18.
+- `layout-report`      -- per-table file-layout health: object count,
+                          average/min/max size, and how many objects are
+                          "small files". See the guide's Section 21.
+- `ingestion-history`  -- the most recent N runs, any status, most recent
+                          first -- the general-purpose "what actually
+                          happened" query. See the guide's Section 22.
+- `ingestion-summary`  -- one row per source table: successful/failed run
+                          counts, total rows written, last success time.
+                          See the guide's Section 22.
 
 See docs/analytics-engineering-guide.md, "Full Load Ingestion -> How to
 Run", Section 15 "How to Run", Section 12 "How to Run", Section 16 "How to
-Run", Section 17 "How to Run", and Section 18 "How to Run", for the exact
-commands and expected output.
+Run", Section 17 "How to Run", Section 18 "How to Run", Section 21 "How to
+Run", and Section 22 "How to Run", for the exact commands and expected
+output.
 """
 
 from __future__ import annotations
@@ -51,7 +61,7 @@ from url_shortener_analytics.exceptions import ContractError
 from url_shortener_analytics.extract_full import run_full_load
 from url_shortener_analytics.extract_incremental import run_incremental_load
 from url_shortener_analytics.logging_setup import configure_logging
-from url_shortener_analytics.object_store import get_bucket_stats, get_s3_client
+from url_shortener_analytics.object_store import get_bucket_stats, get_file_layout_report, get_s3_client
 from url_shortener_analytics.reconciliation import reconcile_bronze
 
 logger = logging.getLogger(__name__)
@@ -259,6 +269,73 @@ def storage_stats_command(prefix: str = "bronze/") -> int:
     return 0
 
 
+def layout_report_command(table_name: str, small_file_threshold_mb: int = 8) -> int:
+    """Report per-table file-layout health: object count, average/min/max
+    object size, and how many objects are "small files" under the given
+    threshold (see the guide's Section 21). Always exits 0 -- reporting
+    only, like `storage-stats`."""
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    s3_client = get_s3_client(settings)
+
+    report = get_file_layout_report(
+        s3_client, settings.minio_bucket, table_name,
+        small_file_threshold_bytes=small_file_threshold_mb * 1024 * 1024,
+    )
+    logger.info("file layout report", extra={"table": table_name, **report})
+    return 0
+
+
+def ingestion_history_command(
+    pipeline_name: str | None = None, source_table: str | None = None, limit: int = 20
+) -> int:
+    """Print the most recent `limit` ingestion_metadata rows, any status,
+    most recent first (see the guide's Section 22). Always exits 0 --
+    reporting only."""
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    engine = engine_from_settings(settings)
+
+    history = metadata.get_run_history(
+        engine, pipeline_name=pipeline_name, source_table=source_table, limit=limit
+    )
+    for run in history:
+        logger.info(
+            "run",
+            extra={
+                "run_id": run["run_id"], "source_table": run["source_table"], "load_type": run["load_type"],
+                "status": run["status"], "rows_written": run["rows_written"],
+                "started_at": str(run["started_at"]), "error_message": run["error_message"],
+            },
+        )
+    logger.info("ingestion history", extra={"rows_returned": len(history), "limit": limit})
+    return 0
+
+
+def ingestion_summary_command(config_path: Path = DEFAULT_PIPELINE_CONFIG) -> int:
+    """Print one row per source table: successful/failed run counts, total
+    rows ever written, and last success time (see the guide's Section
+    22). Always exits 0 -- reporting only."""
+    settings = get_settings()
+    configure_logging(settings.log_level)
+
+    config = _load_pipeline_config(config_path)
+    pipeline_name = config["pipeline_name"]
+    engine = engine_from_settings(settings)
+
+    summary = metadata.get_ingestion_summary(engine, pipeline_name)
+    for row in summary:
+        logger.info(
+            "table summary",
+            extra={
+                "source_table": row["source_table"], "successful_runs": row["successful_runs"],
+                "failed_runs": row["failed_runs"], "total_rows_written": row["total_rows_written"],
+                "last_success_at": str(row["last_success_at"]),
+            },
+        )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="ingest", description="url-shortener-analytics-platform ingestion CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -309,6 +386,30 @@ def main(argv: list[str] | None = None) -> None:
         help="Object key prefix to report stats for (default: bronze/)",
     )
 
+    layout_report_parser = subparsers.add_parser(
+        "layout-report", help="Per-table file-layout health: object count, size stats, small-file count"
+    )
+    layout_report_parser.add_argument("--table", type=str, required=True, help="Table name (e.g. urls, clicks)")
+    layout_report_parser.add_argument(
+        "--small-file-threshold-mb", type=int, default=8,
+        help="Objects smaller than this are counted as 'small files' (default: 8)",
+    )
+
+    ingestion_history_parser = subparsers.add_parser(
+        "ingestion-history", help="The most recent N ingestion_metadata rows, any status, most recent first"
+    )
+    ingestion_history_parser.add_argument("--pipeline", type=str, default=None, help="Filter by pipeline_name")
+    ingestion_history_parser.add_argument("--table", type=str, default=None, help="Filter by source_table")
+    ingestion_history_parser.add_argument("--limit", type=int, default=20, help="Max rows to return (default: 20)")
+
+    ingestion_summary_parser = subparsers.add_parser(
+        "ingestion-summary", help="One row per source table: run counts, total rows written, last success"
+    )
+    ingestion_summary_parser.add_argument(
+        "--config", type=Path, default=DEFAULT_PIPELINE_CONFIG,
+        help="Path to pipelines.yaml (default: ingestion/configs/pipelines.yaml)",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "run":
@@ -323,6 +424,12 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(reconcile_bronze_command(args.config))
     elif args.command == "storage-stats":
         sys.exit(storage_stats_command(args.prefix))
+    elif args.command == "layout-report":
+        sys.exit(layout_report_command(args.table, args.small_file_threshold_mb))
+    elif args.command == "ingestion-history":
+        sys.exit(ingestion_history_command(args.pipeline, args.table, args.limit))
+    elif args.command == "ingestion-summary":
+        sys.exit(ingestion_summary_command(args.config))
 
 
 if __name__ == "__main__":

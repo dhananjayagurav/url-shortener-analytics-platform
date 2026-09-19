@@ -232,3 +232,50 @@ def list_bronze_keys_for_date_range(
         keys.extend(obj["Key"] for obj in response.get("Contents", []))
         current += timedelta(days=1)
     return keys
+
+
+# 8 MiB: an arbitrary but commonly-cited rule-of-thumb "small file" cutoff
+# for analytical file formats (well below typical multi-hundred-MB target
+# object sizes in a real lake) -- see the guide's Section 21 for why this
+# repo's own files, at its current data volume, sit far below it today,
+# and what would have to change before that stopped being true.
+DEFAULT_SMALL_FILE_THRESHOLD_BYTES = 8 * 1024 * 1024
+
+
+def get_file_layout_report(
+    s3_client: BaseClient,
+    bucket: str,
+    table_name: str,
+    *,
+    small_file_threshold_bytes: int = DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
+) -> dict[str, Any]:
+    """Per-table file-layout health: object count, total/average/min/max
+    bytes, and how many objects fall below `small_file_threshold_bytes` --
+    the "small-file problem" a real data lake eventually has to actively
+    manage (see the guide's Section 21). Scoped to one table at a time
+    (`bronze/{table_name}/`) rather than the whole Bronze prefix, since
+    file-layout health is naturally a per-table question -- different
+    tables land at very different object sizes and counts.
+
+    Reuses list_objects_v2's own `Size` field per object, the same
+    no-extra-head_object-calls approach get_bucket_stats (Section 18)
+    already established.
+    """
+    response = s3_client.list_objects_v2(Bucket=bucket, Prefix=f"bronze/{table_name}/")
+    contents = response.get("Contents", [])
+    sizes = [obj["Size"] for obj in contents]
+
+    if not sizes:
+        return {
+            "object_count": 0, "total_bytes": 0, "avg_bytes": 0,
+            "min_bytes": 0, "max_bytes": 0, "small_file_count": 0,
+        }
+
+    return {
+        "object_count": len(sizes),
+        "total_bytes": sum(sizes),
+        "avg_bytes": sum(sizes) // len(sizes),
+        "min_bytes": min(sizes),
+        "max_bytes": max(sizes),
+        "small_file_count": sum(1 for s in sizes if s < small_file_threshold_bytes),
+    }

@@ -57,6 +57,22 @@ def test_run_incremental_load_first_run_reads_everything_and_advances_watermark(
     assert row.bronze_key == result["key"]
 
 
+def test_run_incremental_load_persists_watermark_start_on_the_checkpoint_row(seeded_clicks: Engine) -> None:
+    # Real gap this closed (Section 22): ingestion_metadata.watermark_start
+    # existed in the schema since Section 13 but no code path ever wrote to
+    # it before this fix -- confirmed NULL against real Postgres in this
+    # sandbox. This test is the SQLite-side proof it's fixed.
+    s3_client = MagicMock()
+    result = run_incremental_load(seeded_clicks, s3_client, "test-bucket", "pipeline_a", "clicks")
+
+    with seeded_clicks.begin() as conn:
+        row = conn.execute(text(
+            "SELECT watermark_start, watermark_end FROM ingestion_metadata WHERE run_id = :run_id"
+        ), {"run_id": result["run_id"]}).fetchone()
+    assert row.watermark_start == 0  # first run: watermark started at 0
+    assert row.watermark_end == 5
+
+
 def test_run_incremental_load_second_run_only_reads_new_rows(seeded_clicks: Engine) -> None:
     s3_client = MagicMock()
     run_incremental_load(seeded_clicks, s3_client, "test-bucket", "pipeline_a", "clicks")
@@ -71,6 +87,11 @@ def test_run_incremental_load_second_run_only_reads_new_rows(seeded_clicks: Engi
     assert result["watermark_end"] == 7
     assert s3_client.put_object.call_count == 2
     assert metadata.get_last_watermark(seeded_clicks, "pipeline_a", "clicks") == 7
+    with seeded_clicks.begin() as conn:
+        row = conn.execute(text(
+            "SELECT watermark_start FROM ingestion_metadata WHERE run_id = :run_id"
+        ), {"run_id": result["run_id"]}).fetchone()
+    assert row.watermark_start == 5  # this run's own watermark_start, not the first run's
 
 
 def test_run_incremental_load_with_no_new_rows_skips_the_write_but_still_succeeds(seeded_clicks: Engine) -> None:
@@ -87,13 +108,16 @@ def test_run_incremental_load_with_no_new_rows_skips_the_write_but_still_succeed
     assert s3_client.put_object.call_count == 1
     with seeded_clicks.begin() as conn:
         row = conn.execute(text(
-            "SELECT status, rows_written, bronze_key FROM ingestion_metadata WHERE run_id = :run_id"
+            "SELECT status, rows_written, bronze_key, watermark_start, watermark_end FROM ingestion_metadata WHERE run_id = :run_id"
         ), {"run_id": result["run_id"]}).fetchone()
     assert row.status == "success"
     assert row.rows_written == 0
     # A no-op run wrote nothing to Bronze, so bronze_key must stay NULL --
     # not some recomputed key for an object that doesn't exist.
     assert row.bronze_key is None
+    # A no-op run's watermark didn't move, but watermark_start is still
+    # genuinely known and persisted -- it's simply equal to watermark_end.
+    assert row.watermark_start == row.watermark_end == 5
 
 
 def test_run_incremental_load_checkpoints_failure_and_reraises_without_advancing_watermark(

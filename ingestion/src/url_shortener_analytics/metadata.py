@@ -69,6 +69,7 @@ def finish_run_success(
     *,
     rows_read: int,
     rows_written: int,
+    watermark_start: int | None = None,
     watermark_end: int | None = None,
     bronze_key: str | None = None,
 ) -> None:
@@ -77,7 +78,16 @@ def finish_run_success(
     that wrote nothing -- see extract_incremental.run_incremental_load).
     `bronze_key` is stored explicitly rather than recomputed later from
     `source_table`/`started_at`/watermarks -- see the guide's Section 17.3
-    Design Decision for why recomputation was rejected."""
+    Design Decision for why recomputation was rejected.
+
+    `watermark_start` closes a real, previously-unnoticed gap named in
+    passing back in Section 17.3: the `ingestion_metadata.watermark_start`
+    column has existed in the schema since Section 13, but no code path
+    ever wrote to it before Section 22 -- every incremental run's starting
+    watermark was known (it's literally embedded in that run's own
+    `bronze_key`, via `build_bronze_incremental_key`) but was never
+    persisted as its own queryable column. See the guide's Section 22 for
+    the full story and the real, genuinely-run proof that it was NULL."""
     try:
         with engine.begin() as conn:
             conn.execute(
@@ -87,6 +97,7 @@ def finish_run_success(
                     SET status = 'success',
                         rows_read = :rows_read,
                         rows_written = :rows_written,
+                        watermark_start = :watermark_start,
                         watermark_end = :watermark_end,
                         bronze_key = :bronze_key,
                         completed_at = :completed_at
@@ -97,6 +108,7 @@ def finish_run_success(
                     "run_id": run_id,
                     "rows_read": rows_read,
                     "rows_written": rows_written,
+                    "watermark_start": watermark_start,
                     "watermark_end": watermark_end,
                     "bronze_key": bronze_key,
                     "completed_at": datetime.now(UTC),
@@ -107,7 +119,10 @@ def finish_run_success(
 
     logger.info(
         "ingestion run succeeded",
-        extra={"run_id": run_id, "rows_written": rows_written, "bronze_key": bronze_key},
+        extra={
+            "run_id": run_id, "rows_written": rows_written,
+            "watermark_start": watermark_start, "bronze_key": bronze_key,
+        },
     )
 
 
@@ -236,3 +251,85 @@ def list_successful_bronze_keys(engine: Engine, pipeline_name: str | None = None
         raise MetadataError("failed to list successful bronze keys") from err
 
     return [row[0] for row in rows]
+
+
+def get_run_history(
+    engine: Engine, *, pipeline_name: str | None = None, source_table: str | None = None, limit: int = 20
+) -> list[dict[str, Any]]:
+    """The most recent `limit` runs, any status, most recent first -- the
+    general-purpose "what actually happened" query this table has never
+    had a dedicated function for before this section. Every other reader
+    in this module is narrowly scoped to one status (`get_last_watermark`:
+    success only; `find_stale_running_runs`: running only;
+    `list_successful_bronze_keys`: success only) -- this one deliberately
+    isn't, because a human debugging "why does Bronze look wrong" usually
+    needs to see failures and successes side by side, in order, not one
+    status at a time. See docs/analytics-engineering-guide.md, Section 22,
+    for the full reasoning and LAB 17 for a genuine run against this
+    sandbox's real Postgres."""
+    query = "SELECT run_id, pipeline_name, source_table, load_type, status, rows_read, rows_written, bronze_key, started_at, completed_at, error_message FROM ingestion_metadata WHERE 1=1"
+    params: dict[str, Any] = {"limit": limit}
+    if pipeline_name is not None:
+        query += " AND pipeline_name = :pipeline_name"
+        params["pipeline_name"] = pipeline_name
+    if source_table is not None:
+        query += " AND source_table = :source_table"
+        params["source_table"] = source_table
+    query += " ORDER BY started_at DESC LIMIT :limit"
+
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(text(query), params).fetchall()
+    except Exception as err:
+        raise MetadataError("failed to read run history") from err
+
+    return [
+        {
+            "run_id": row.run_id, "pipeline_name": row.pipeline_name, "source_table": row.source_table,
+            "load_type": row.load_type, "status": row.status, "rows_read": row.rows_read,
+            "rows_written": row.rows_written, "bronze_key": row.bronze_key,
+            "started_at": row.started_at, "completed_at": row.completed_at, "error_message": row.error_message,
+        }
+        for row in rows
+    ]
+
+
+def get_ingestion_summary(engine: Engine, pipeline_name: str | None = None) -> list[dict[str, Any]]:
+    """One row per `source_table`: how many runs have succeeded, how many
+    have failed, total rows ever written by a successful run, and the most
+    recent successful run's timestamp -- an at-a-glance health summary,
+    aggregated server-side in one query rather than computed by fetching
+    every row and reducing it in Python (see Section 22.3's Design
+    Decision for why that distinction matters here specifically)."""
+    query = """
+        SELECT
+            source_table,
+            COUNT(*) FILTER (WHERE status = 'success') AS successful_runs,
+            COUNT(*) FILTER (WHERE status = 'failed') AS failed_runs,
+            COALESCE(SUM(rows_written) FILTER (WHERE status = 'success'), 0) AS total_rows_written,
+            MAX(started_at) FILTER (WHERE status = 'success') AS last_success_at
+        FROM ingestion_metadata
+        WHERE 1=1
+    """
+    params: dict[str, Any] = {}
+    if pipeline_name is not None:
+        query += " AND pipeline_name = :pipeline_name"
+        params["pipeline_name"] = pipeline_name
+    query += " GROUP BY source_table ORDER BY source_table"
+
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(text(query), params).fetchall()
+    except Exception as err:
+        raise MetadataError("failed to build ingestion summary") from err
+
+    return [
+        {
+            "source_table": row.source_table,
+            "successful_runs": row.successful_runs,
+            "failed_runs": row.failed_runs,
+            "total_rows_written": int(row.total_rows_written),
+            "last_success_at": row.last_success_at,
+        }
+        for row in rows
+    ]

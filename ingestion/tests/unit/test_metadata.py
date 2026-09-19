@@ -51,6 +51,24 @@ def test_finish_run_success_persists_the_bronze_key(sqlite_engine: Engine) -> No
     assert row.bronze_key == "bronze/clicks/x.parquet"
 
 
+def test_finish_run_success_persists_watermark_start(sqlite_engine: Engine) -> None:
+    # Real gap closed in Section 22: this column existed in the schema
+    # since Section 13 but finish_run_success never accepted or wrote it
+    # before now -- confirmed NULL against real Postgres in this sandbox.
+    run_id = metadata.start_run(sqlite_engine, "pipeline_a", "clicks", load_type="incremental")
+    metadata.finish_run_success(
+        sqlite_engine, run_id, rows_read=100, rows_written=100, watermark_start=5000, watermark_end=5100
+    )
+
+    with sqlite_engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT watermark_start, watermark_end FROM ingestion_metadata WHERE run_id = :run_id"),
+            {"run_id": run_id},
+        ).fetchone()
+    assert row.watermark_start == 5000
+    assert row.watermark_end == 5100
+
+
 def test_finish_run_success_defaults_bronze_key_to_none(sqlite_engine: Engine) -> None:
     # The no-op incremental path (no new rows) calls finish_run_success
     # without a bronze_key -- see extract_incremental.run_incremental_load.
@@ -141,3 +159,87 @@ def test_list_successful_bronze_keys_can_be_filtered_by_pipeline_name(sqlite_eng
     metadata.finish_run_success(sqlite_engine, run_b, rows_read=1, rows_written=1, bronze_key="bronze/b.parquet")
 
     assert metadata.list_successful_bronze_keys(sqlite_engine, pipeline_name="pipeline_a") == ["bronze/a.parquet"]
+
+
+def test_get_run_history_returns_most_recent_first_regardless_of_status(sqlite_engine: Engine) -> None:
+    now = datetime.now(UTC)
+
+    run_1 = metadata.start_run(sqlite_engine, "pipeline_a", "clicks", load_type="full")
+    _set_started_at(sqlite_engine, run_1, now - timedelta(minutes=10))
+    metadata.finish_run_success(sqlite_engine, run_1, rows_read=5, rows_written=5, bronze_key="bronze/clicks/a.parquet")
+
+    run_2 = metadata.start_run(sqlite_engine, "pipeline_a", "urls", load_type="full")
+    _set_started_at(sqlite_engine, run_2, now - timedelta(minutes=5))
+    metadata.finish_run_failure(sqlite_engine, run_2, "simulated failure")
+
+    run_3 = metadata.start_run(sqlite_engine, "pipeline_a", "clicks", load_type="incremental")
+    _set_started_at(sqlite_engine, run_3, now)
+    metadata.finish_run_success(sqlite_engine, run_3, rows_read=2, rows_written=2, watermark_end=7)
+
+    history = metadata.get_run_history(sqlite_engine, pipeline_name="pipeline_a")
+
+    # Most recent first, regardless of status -- unlike every other reader
+    # in this module, which is scoped to one status.
+    assert [r["run_id"] for r in history] == [run_3, run_2, run_1]
+    assert history[1]["status"] == "failed"
+    assert history[1]["error_message"] == "simulated failure"
+
+
+def test_get_run_history_can_be_filtered_by_source_table(sqlite_engine: Engine) -> None:
+    run_clicks = metadata.start_run(sqlite_engine, "pipeline_a", "clicks", load_type="full")
+    metadata.finish_run_success(sqlite_engine, run_clicks, rows_read=1, rows_written=1)
+
+    run_urls = metadata.start_run(sqlite_engine, "pipeline_a", "urls", load_type="full")
+    metadata.finish_run_success(sqlite_engine, run_urls, rows_read=1, rows_written=1)
+
+    history = metadata.get_run_history(sqlite_engine, source_table="clicks")
+
+    assert [r["run_id"] for r in history] == [run_clicks]
+
+
+def test_get_run_history_respects_the_limit(sqlite_engine: Engine) -> None:
+    for _ in range(5):
+        run_id = metadata.start_run(sqlite_engine, "pipeline_a", "clicks", load_type="full")
+        metadata.finish_run_success(sqlite_engine, run_id, rows_read=1, rows_written=1)
+
+    assert len(metadata.get_run_history(sqlite_engine, limit=3)) == 3
+
+
+def test_get_ingestion_summary_aggregates_correctly_per_table(sqlite_engine: Engine) -> None:
+    # clicks: two successes (10 + 5 rows), one failure
+    run_1 = metadata.start_run(sqlite_engine, "pipeline_a", "clicks", load_type="full")
+    metadata.finish_run_success(sqlite_engine, run_1, rows_read=10, rows_written=10)
+    run_2 = metadata.start_run(sqlite_engine, "pipeline_a", "clicks", load_type="incremental")
+    metadata.finish_run_success(sqlite_engine, run_2, rows_read=5, rows_written=5)
+    run_3 = metadata.start_run(sqlite_engine, "pipeline_a", "clicks", load_type="incremental")
+    metadata.finish_run_failure(sqlite_engine, run_3, "simulated failure")
+
+    # urls: one failure only, no successes yet
+    run_4 = metadata.start_run(sqlite_engine, "pipeline_a", "urls", load_type="full")
+    metadata.finish_run_failure(sqlite_engine, run_4, "simulated failure")
+
+    summary = {row["source_table"]: row for row in metadata.get_ingestion_summary(sqlite_engine, "pipeline_a")}
+
+    assert summary["clicks"]["successful_runs"] == 2
+    assert summary["clicks"]["failed_runs"] == 1
+    assert summary["clicks"]["total_rows_written"] == 15
+    assert summary["clicks"]["last_success_at"] is not None
+
+    assert summary["urls"]["successful_runs"] == 0
+    assert summary["urls"]["failed_runs"] == 1
+    assert summary["urls"]["total_rows_written"] == 0
+    assert summary["urls"]["last_success_at"] is None
+
+
+def test_get_ingestion_summary_can_be_filtered_by_pipeline_name(sqlite_engine: Engine) -> None:
+    run_a = metadata.start_run(sqlite_engine, "pipeline_a", "clicks", load_type="full")
+    metadata.finish_run_success(sqlite_engine, run_a, rows_read=1, rows_written=1)
+
+    run_b = metadata.start_run(sqlite_engine, "pipeline_b", "clicks", load_type="full")
+    metadata.finish_run_success(sqlite_engine, run_b, rows_read=1, rows_written=1)
+
+    summary = metadata.get_ingestion_summary(sqlite_engine, "pipeline_a")
+
+    assert len(summary) == 1
+    assert summary[0]["source_table"] == "clicks"
+    assert summary[0]["successful_runs"] == 1

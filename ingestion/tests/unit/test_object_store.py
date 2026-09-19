@@ -12,6 +12,7 @@ from url_shortener_analytics.object_store import (
     build_bronze_incremental_key,
     build_bronze_key,
     get_bucket_stats,
+    get_file_layout_report,
     head_object,
     list_bronze_keys,
     list_bronze_keys_for_date_range,
@@ -224,3 +225,51 @@ def test_list_bronze_keys_for_date_range_single_day_issues_exactly_one_call() ->
 
     assert keys == ["bronze/urls/ingestion_date=2026-09-19/urls.parquet"]
     assert s3_client.list_objects_v2.call_count == 1
+
+
+def test_get_file_layout_report_computes_size_stats_and_small_file_count() -> None:
+    s3_client = MagicMock()
+    s3_client.list_objects_v2.return_value = {
+        "Contents": [
+            {"Key": "bronze/clicks/a.parquet", "Size": 1_000_000},        # ~1MB -- small
+            {"Key": "bronze/clicks/b.parquet", "Size": 50_000_000},       # ~50MB -- not small
+            {"Key": "bronze/clicks/c.parquet", "Size": 500_000},          # ~0.5MB -- small
+        ]
+    }
+
+    report = get_file_layout_report(s3_client, "test-bucket", "clicks")
+
+    assert report["object_count"] == 3
+    assert report["total_bytes"] == 51_500_000
+    assert report["avg_bytes"] == 51_500_000 // 3
+    assert report["min_bytes"] == 500_000
+    assert report["max_bytes"] == 50_000_000
+    assert report["small_file_count"] == 2  # default threshold is 8MB
+    s3_client.list_objects_v2.assert_called_once_with(Bucket="test-bucket", Prefix="bronze/clicks/")
+
+
+def test_get_file_layout_report_respects_a_custom_threshold() -> None:
+    s3_client = MagicMock()
+    s3_client.list_objects_v2.return_value = {
+        "Contents": [{"Key": "bronze/clicks/a.parquet", "Size": 1_000_000}]
+    }
+
+    # 1MB object, 500KB threshold -- NOT small.
+    report = get_file_layout_report(s3_client, "test-bucket", "clicks", small_file_threshold_bytes=500_000)
+    assert report["small_file_count"] == 0
+
+    # Same object, 2MB threshold -- IS small.
+    report = get_file_layout_report(s3_client, "test-bucket", "clicks", small_file_threshold_bytes=2_000_000)
+    assert report["small_file_count"] == 1
+
+
+def test_get_file_layout_report_is_all_zero_for_a_table_with_no_objects() -> None:
+    s3_client = MagicMock()
+    s3_client.list_objects_v2.return_value = {}
+
+    report = get_file_layout_report(s3_client, "test-bucket", "urls")
+
+    assert report == {
+        "object_count": 0, "total_bytes": 0, "avg_bytes": 0,
+        "min_bytes": 0, "max_bytes": 0, "small_file_count": 0,
+    }

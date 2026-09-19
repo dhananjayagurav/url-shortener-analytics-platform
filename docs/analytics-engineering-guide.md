@@ -94,8 +94,8 @@ with the exact command to produce the real result yourself.
 18. [Object Storage Fundamentals](#18-object-storage-fundamentals-) ✅✅
 19. [Parquet](#19-parquet-) ✅✅
 20. [Partitioning](#20-partitioning-) ✅✅
-21. File Layout ⏳
-22. Ingestion Metadata (deep-dive) ⏳
+21. [File Layout](#21-file-layout-) ✅✅
+22. [Ingestion Metadata (deep-dive)](#22-ingestion-metadata-deep-dive-) ✅✅
 
 **Quality & Operations**
 23. PII and Security ⏳
@@ -107,8 +107,8 @@ with the exact command to produce the real result yourself.
 **Reference**
 28. [Architectural Principles](#28-architectural-principles) ✅ *(introduced now, extended as more are demonstrated)*
 29. [Architecture Decision Records](#29-architecture-decision-records) ✅
-30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6; LAB 12 — Section 16.5; LAB 13 — Section 17.5; LAB 14 — Section 18.5; LAB 15 — Section 19.5; LAB 16 — Section 20.5)*
-31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, and 20.9)*
+30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6; LAB 12 — Section 16.5; LAB 13 — Section 17.5; LAB 14 — Section 18.5; LAB 15 — Section 19.5; LAB 16 — Section 20.5; LAB 17 — Section 21.5; LAB 18 — Section 22.5)*
+31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, and 22.9)*
 32. Principal-Level Scenarios ⏳
 33. [Phase 1 Summary](#33-phase-1-summary-so-far) (running, updated each increment)
 34. [Phase 1 Completion Checklist](#34-phase-1-completion-checklist)
@@ -4303,9 +4303,13 @@ logic never changing behavior for historical rows (`build_bronze_key`
 already changing its date-formatting convention, for instance, would
 silently break reconciliation for every run recorded before the change),
 and would additionally require persisting `watermark_start` too, which
-`ingestion_metadata` also didn't store before this increment — so
-"cheaper, no new column" wasn't actually true once traced through
-fully. Storing the key explicitly instead means "what actually
+`ingestion_metadata` also didn't store *at the time this decision was
+made* — so "cheaper, no new column" wasn't actually true once traced
+through fully. (`watermark_start` has since been fixed to persist
+correctly, as of Section 22 — but that came two increments later, and
+doesn't retroactively change which trade-off was correct to make *here*,
+at the time this decision was recorded.) Storing the key explicitly
+instead means "what actually
 happened" is what's compared, always, regardless of how the key-building
 functions evolve later — a strictly more robust invariant, at the cost of
 one new nullable column. **Consequences:** `bronze_key` is `NULL` for a
@@ -6044,6 +6048,951 @@ requirements driving genuinely different key structures.
 
 ---
 
+## 21. File Layout ✅✅
+
+### 21.1 Concept
+
+**File layout** is a distinct question from partitioning (Section 20):
+partitioning decides *which column values* split data into separate
+objects; file layout decides *how many files, and how big each one is*,
+within whatever partitioning scheme is already in place. This repo has
+had an answer to that second question since Section 14, without ever
+naming it explicitly: exactly **one file per partition** — one Parquet
+object per `(table, ingestion_date)` for full loads, one per
+`(table, watermark_start, watermark_end)` for incremental batches. This
+section makes that choice explicit, explains the failure mode it's
+avoiding on one side (too many small files) and the one it risks on the
+other (files that grow too large for a single partition to stay
+efficient), and adds a genuinely new piece of code —
+`get_file_layout_report` — to actually *measure* which side of that
+trade-off this repo's real data currently sits on.
+
+### Why does this exist?
+
+Two failure modes sit on either side of "how many files should one
+partition have," and both are real, not hypothetical. **Too many small
+files**: Section 19.6 already measured this repo's own Parquet files
+paying a fixed per-file cost (footer, embedded schema, column metadata)
+that has to be parsed before any row data is touched — that exact fixed
+cost is paid again, in full, for every additional file a reader opens.
+A partition split into a thousand tiny files pays that fixed cost a
+thousand times over, for the same total data a single file would have
+paid it for once — this is "the small-file problem," a genuinely common
+failure mode in real data lakes, and it's the *same* underlying
+mechanism Section 19.6 already demonstrated, not a new concept. **Too
+few, overly large files**: the opposite failure — a single enormous file
+per partition limits how many parallel workers can read it at once (many
+engines split work by file, not by byte range, within a partition) and
+forces a reader wanting even a small slice of a partition to open and
+scan the entire object. This repo's current, tiny data volume (Section
+19's seeded 5,000-row `clicks` table) sits nowhere near either extreme
+today — but "today" is doing real work in that sentence, and this
+section's new code exists specifically to make that claim checkable
+rather than assumed.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+A day's worth of application logs, three layout choices for the same
+data: (1) one gigantic file containing the entire day — cheap to write,
+but a reader wanting just the 2pm hour has to scan the whole thing; (2)
+one file per log *line* — trivially parallel to read one line, but
+absurdly expensive in aggregate (millions of tiny files, each paying
+whatever fixed per-file overhead the storage format and the object store
+itself impose); (3) hourly-rotated files — a deliberate middle ground,
+sized so each file is large enough to amortize per-file overhead but
+small enough that a hour-scoped query only touches the files it actually
+needs. File layout, in general, is choosing where on this spectrum a
+dataset's actual read patterns and data volume land.
+
+### URL Shortener Example
+
+`get_file_layout_report(s3_client, bucket, "clicks")` reports, per
+table: object count, total/average/min/max object size, and how many
+objects fall below a configurable "small file" threshold (default 8 MiB
+— an arbitrary but commonly-cited rule-of-thumb cutoff, well below the
+multi-hundred-MB target object sizes a real lake typically aims for).
+Applied to this repo's own real data: Section 19.6 measured the real,
+5,000-row `clicks` table's single Parquet object at 417,649 bytes — a
+single file, `object_count = 1`, `small_file_count = 1` under the default
+threshold, which is expected and correct at this data volume: one small
+file isn't a *problem* yet, because there's only one file, period — the
+small-file problem is about *many* small files, not the mere existence of
+one.
+
+### 21.2 Architecture
+
+```
+ One partition, one file (this repo's current layout, Sections 14-15):
+
+   bronze/clicks/ingestion_date=2026-09-19/clicks.parquet
+        │
+        ▼
+   a reader wanting this partition's data opens exactly ONE file,
+   pays Parquet's fixed per-file overhead (footer/schema parse) ONCE
+
+
+ The small-file failure mode (NOT this repo's current layout --
+ illustrative only):
+
+   bronze/clicks/ingestion_date=2026-09-19/part-00001.parquet
+   bronze/clicks/ingestion_date=2026-09-19/part-00002.parquet
+   ...
+   bronze/clicks/ingestion_date=2026-09-19/part-00847.parquet
+        │
+        ▼
+   a reader wanting this SAME partition's data opens 847 files,
+   pays that same fixed per-file overhead 847 TIMES over --
+   exactly the cost Section 19.6 measured per file, multiplied
+
+
+ get_file_layout_report (Section 21 -- NEW):
+
+   list_objects_v2(Prefix="bronze/clicks/")
+        │
+        ▼
+   per-object Size, reused directly (same no-extra-head_object-calls
+   approach as get_bucket_stats, Section 18) -- reduced to
+   {object_count, total_bytes, avg_bytes, min_bytes, max_bytes,
+    small_file_count}
+```
+
+### 21.3 Design Decision: detect small-file accumulation, never auto-compact
+
+**Context:** this repo's current one-file-per-partition layout could,
+in principle, degrade toward the small-file failure mode above if a
+future change (e.g. splitting a partition's write into multiple
+size-bounded files for parallelism) were made carelessly, or if
+partition granularity changed without file-count discipline.
+**Decision:** `get_file_layout_report` measures and reports layout
+health; it does not compact, merge, or rewrite any object. **Alternatives
+considered:** an automatic compaction job that detects a partition with
+too many small files and rewrites them into fewer, larger ones.
+**Trade-offs:** automatic compaction would actually *fix* a degrading
+layout rather than just reporting it — but compaction is a genuinely
+more dangerous operation than reconciliation's detection (Section 17.7):
+it means deleting original objects after rewriting their contents
+elsewhere, and any bug in that rewrite logic risks *real data loss*, not
+just a stale report. Detection-only costs a human having to act on what's
+found, in exchange for a categorically safer default. **Consequences:**
+this is the same detect-don't-remediate posture Section 17.7 already
+established for Bronze reconciliation, now applied a second time to a
+different failure class — a recurring, deliberate pattern across this
+project's operational tooling, not a one-off choice; see ADR-013 for the
+decision written up as its own record, since this is now the second
+independent section to make essentially this same call.
+
+### Alternatives
+
+Covered above. A further, smaller alternative considered: reporting only
+`object_count` and `total_bytes` (matching `get_bucket_stats`'s existing
+shape from Section 18) rather than the fuller `avg`/`min`/`max`/
+`small_file_count` breakdown — rejected because `object_count` and
+`total_bytes` alone cannot distinguish "one healthy 4 MB file" from "500
+unhealthy 8 KB files that happen to sum to the same total" — precisely
+the distinction this section's whole purpose is to make visible; see
+21.7's Failure Scenario for why even `avg_bytes` alone isn't quite
+enough either.
+
+### Trade-offs
+
+| | Detection only (chosen) | Automatic compaction |
+|---|---|---|
+| Risk of data loss from a bug | None -- read-only reporting | Real -- compaction means delete-after-rewrite |
+| Actually fixes a degrading layout | No -- a human has to act | Yes, automatically |
+| Implementation cost (this repo) | One function, one CLI command | A rewrite pipeline, plus a safe-deletion story for originals |
+| Consistent with this project's established posture | Yes -- matches Section 17.7's reconciliation stance | Would be the first auto-remediating operation in the whole codebase |
+
+### 21.4 Implementation
+
+---
+
+**CREATE:** (edit) `ingestion/src/url_shortener_analytics/object_store.py`
+— `get_file_layout_report`
+
+**PURPOSE:** Per-table file-layout health: object count, size
+distribution, and small-file count — turning "is this table's Bronze
+layout degrading" from an assumption into a checkable, testable report.
+
+**IMPLEMENTATION GUIDE (write it yourself):** scope the listing to one
+table's own prefix (`bronze/{table_name}/`), not the whole `bronze/`
+prefix `get_bucket_stats` (Section 18) uses — file-layout health is
+naturally a per-table question, since different tables land at very
+different sizes and counts. Reuse `Size` from `list_objects_v2`'s
+response directly, the same no-extra-`head_object`-calls approach as
+`get_bucket_stats`. Compute count, sum, average (integer division is
+fine — this is a reporting number, not a precise statistic), min, and
+max; count objects below `small_file_threshold_bytes`. Handle the
+zero-object case explicitly — return all zeros, not a `ZeroDivisionError`
+from an empty-list average.
+
+**REFERENCE IMPLEMENTATION:**
+
+```python
+# ingestion/src/url_shortener_analytics/object_store.py (excerpt)
+
+DEFAULT_SMALL_FILE_THRESHOLD_BYTES = 8 * 1024 * 1024  # 8 MiB
+
+def get_file_layout_report(
+    s3_client, bucket, table_name, *, small_file_threshold_bytes=DEFAULT_SMALL_FILE_THRESHOLD_BYTES
+) -> dict:
+    response = s3_client.list_objects_v2(Bucket=bucket, Prefix=f"bronze/{table_name}/")
+    sizes = [obj["Size"] for obj in response.get("Contents", [])]
+    if not sizes:
+        return {"object_count": 0, "total_bytes": 0, "avg_bytes": 0, "min_bytes": 0, "max_bytes": 0, "small_file_count": 0}
+    return {
+        "object_count": len(sizes), "total_bytes": sum(sizes), "avg_bytes": sum(sizes) // len(sizes),
+        "min_bytes": min(sizes), "max_bytes": max(sizes),
+        "small_file_count": sum(1 for s in sizes if s < small_file_threshold_bytes),
+    }
+```
+
+Full file: [`object_store.py`](../ingestion/src/url_shortener_analytics/object_store.py).
+
+**RUN:** `make layout-report TABLE=clicks` (wraps `python -m
+url_shortener_analytics.cli layout-report --table clicks`)
+
+**VERIFY:** compare against `make storage-stats`'s whole-Bronze totals —
+summing `layout-report`'s `total_bytes` across every table should equal
+`storage-stats`'s Bronze-wide `total_bytes`.
+
+**EXPECTED:** at this repo's current seeded data volume, `object_count`
+in the low single digits per table, `small_file_count` equal to
+`object_count` (every current object is "small" under the default 8 MiB
+threshold, per 21.6's derived estimate below) — expected and healthy at
+this volume, not a warning sign.
+
+**TEST:** `test_object_store.py` — three new tests: size stats computed
+correctly with a mixed small/large set, a custom threshold changing which
+objects count as small, and the all-zero empty-table case.
+
+**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections
+21.8/21.9.
+
+---
+
+### Hands-on Challenge (implement-yourself)
+
+Before LAB 17 below, try this without looking at `object_store.py`:
+using Section 19.6's real, already-measured number (5,000 rows → 417,649
+bytes of Parquet for the real `clicks` table), calculate by hand
+approximately how many rows this table would need before a single daily
+full-load object would cross the default 8 MiB small-file threshold.
+(Answer: ~83.5 bytes/row → roughly 100,000+ rows needed to cross 8 MiB —
+20x this repo's current seeded volume. This is a *derived estimate* from
+real measured data, not a fresh benchmark — the exercise is in the
+arithmetic, connecting Section 19's measurement to Section 21's
+threshold, not in running anything new.)
+
+### 21.5 Hands-on Exercise
+
+**LAB 17 — Run the file-layout tests and confirm the report's shape
+against a deliberately mixed size distribution.**
+
+```bash
+PYTHONPATH=ingestion/src python3 -m pytest ingestion/tests/unit/test_object_store.py -k file_layout -v
+```
+
+ACTUAL OBSERVED, genuinely run while writing this section:
+
+```
+ingestion/tests/unit/test_object_store.py::test_get_file_layout_report_computes_size_stats_and_small_file_count PASSED
+ingestion/tests/unit/test_object_store.py::test_get_file_layout_report_respects_a_custom_threshold PASSED
+ingestion/tests/unit/test_object_store.py::test_get_file_layout_report_is_all_zero_for_a_table_with_no_objects PASSED
+
+3 passed, 18 deselected in 0.61s
+```
+
+What to observe in the first test specifically: it constructs three
+objects (1 MB, 50 MB, 0.5 MB) against a mocked S3 client and asserts
+`small_file_count == 2` — the two under 8 MB — while `avg_bytes` comes
+out around 17 MB, a number that alone would suggest "no problem here" if
+it were the only statistic reported. This is exactly 21.7's Failure
+Scenario, proven directly by this test's own construction.
+
+### 21.6 How to test
+
+```bash
+make test
+```
+
+ACTUAL OBSERVED, genuinely run in this environment:
+
+```
+73 passed in 7.04s
+```
+
+`ruff check ingestion/ benchmarks/` also passed cleanly on every file
+this increment touched.
+
+**What remains a DESIGN EXPECTATION:** `get_file_layout_report` against
+real MinIO/S3, at real production data volumes where the small-file
+problem could actually manifest — this sandbox has neither real MinIO
+nor anywhere near the row count (per the Hands-on Challenge's derived
+estimate) needed to observe it firsthand.
+
+### 21.7 Failure Scenario
+
+**Can `avg_bytes` alone hide a real small-file problem?**
+
+Yes, concretely, and LAB 17's own first test proves it: three objects
+sized 1 MB, 50 MB, and 0.5 MB average to roughly 17 MB — comfortably
+above the 8 MB "small file" threshold, which would read as "healthy" if
+`avg_bytes` were the only number reported. But two of those three
+objects — the majority — genuinely are small files by the threshold; the
+average is being pulled entirely upward by one large outlier. This is
+exactly why `get_file_layout_report` returns `small_file_count`
+explicitly, as its own field, rather than expecting a caller to infer
+file-layout health from `avg_bytes` alone — an arithmetic mean is
+genuinely the wrong single-number summary for a bimodal or skewed size
+distribution, and a real small-file problem is very often skewed exactly
+this way (most objects tiny, a few large ones from whatever process
+wrote correctly-sized files alongside a buggy process that didn't).
+**Even `min_bytes`/`max_bytes`, also reported, don't fully solve this**
+— they show the *range* exists but not *how many* objects sit at the
+unhealthy end of it; `small_file_count` is the field that actually
+answers the operationally relevant question directly, which is precisely
+why it's reported as its own number rather than left for a reader to
+derive.
+
+### 21.8 Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| Layout monitoring | Manual (`make layout-report TABLE=...`), one table at a time | Scraped on a schedule across every table, graphed over time, alerted on a rising `small_file_count` trend |
+| Remediation | None -- detection only, by deliberate design (21.3, ADR-013) | A scheduled compaction job (e.g. a Spark job rewriting a partition's many small files into fewer, size-target ones), with careful atomic delete-after-verify semantics |
+| Size distribution reporting | avg/min/max/small-file-count -- a coarse four-number summary | A real percentile histogram (p50/p90/p99 object size) for a much more complete picture than four summary statistics can give |
+| Target file size | Not set -- this repo's layout is a byproduct of one-file-per-partition, not a deliberately chosen size target | An explicit target (often 128 MB-1 GB per file in mature lakes), with write-time logic that splits a partition into multiple files once it would exceed that target |
+| Scope | Bronze layer only | A mature platform tracks file layout at every layer (Bronze, Silver, Gold), since compaction needs differ by layer's write pattern |
+
+### Principal Data Engineer Perspective
+
+The judgment call worth defending here is recognizing that this repo's
+current file layout isn't "solved" simply because it happens to be
+healthy today — it's healthy because of a specific, current condition
+(low data volume) that Section 21's Hands-on Challenge quantified rather
+than assumed: roughly 100,000+ rows before a single daily `clicks`
+object would even cross the small-file threshold from the *other*
+direction (growing too large for a single file to make sense, at which
+point the opposite failure mode — Section 21.1's "too few, overly large
+files" — starts to become the relevant risk instead). A principal
+engineer doesn't just note "this works at current scale" — they name the
+specific number at which it would stop working, the same discipline
+Section 15's watermark reasoning and Section 20's partition-pruning
+analysis already established elsewhere in this guide. The second thing
+worth flagging: choosing `small_file_count` as an explicit field, rather
+than trusting `avg_bytes` to communicate the same information, is a small
+decision that only matters because of a genuine, if easy-to-miss,
+statistical property (a skewed distribution's mean can look healthy while
+its mode doesn't) — the kind of detail that separates a report someone
+can actually operate from one that quietly gives false reassurance.
+
+### 21.9 Principal Engineer Interview Questions
+
+**Q: "Why does the small-file problem exist at all — what's the actual
+mechanical cost of having many small files instead of fewer large ones,
+covering the same total data?"**
+
+*What's tested:* whether the candidate can name the concrete mechanism,
+not just recite "small files are bad" as received wisdom.
+
+*What a weak answer looks like:* "Lots of small files are inefficient" —
+true but circular, doesn't explain the actual cost.
+
+*What a strong answer covers:* two independent costs, both real. First,
+per-file *format* overhead — this repo's own Section 19.6 measurement
+showed Parquet pays a fixed cost (footer parse, embedded schema decode)
+per file, paid again in full for every additional file covering the same
+total rows. Second, per-object *listing/metadata* overhead at the object-
+store and query-engine level — more objects means more entries a
+`list_objects_v2` call has to return and a query planner has to reason
+about, independent of the data format used at all. A candidate who names
+both, and can point to a real number backing the first one (Section
+19.6's actual measured overhead), is demonstrating they understand this
+as a measured phenomenon, not a rule of thumb.
+
+*Concepts:* fixed per-file overhead, distinguished from per-object
+listing/metadata overhead; connecting a "operational tuning" question
+back to a concrete, previously-measured number rather than treating it
+as a separate, unconnected fact.
+
+*Expected follow-up:* "At what point does the opposite problem — files
+too large — start to matter instead?" — When a single file becomes large
+enough to limit read parallelism (many engines parallelize by file) or
+forces a reader wanting a small slice of a partition to scan far more
+data than it needs; this repo hasn't reached that point either, at its
+current volume.
+
+*Common mistake:* describing the small-file problem only in terms of
+"more files means more work," without being able to name the *specific*
+work (footer parsing, listing overhead) that scales with file count.
+
+**Q: "Your file-layout report includes `small_file_count` as its own
+field, even though `avg_bytes` is also reported. Isn't that redundant?"**
+
+*What's tested:* whether the candidate understands when a summary
+statistic (a mean) fails to represent the underlying distribution, and
+can connect that to a concrete operational consequence.
+
+*What a weak answer looks like:* "More data is always better" — not
+wrong, but doesn't explain *why* this specific redundancy is load-bearing
+rather than decorative.
+
+*What a strong answer covers:* no, not redundant — `avg_bytes` alone can
+look healthy while the actual object population is mostly small files
+dragged upward by a few large outliers (a concrete, provable case:
+Section 21.7's exact three-object example, where the average sits well
+above the threshold while two-thirds of the objects sit below it).
+`small_file_count` answers the operationally relevant question — "how
+many objects will pay the fixed per-file overhead penalty" — directly,
+rather than requiring an operator to infer it from a statistic that can
+mask exactly this shape of problem.
+
+*Concepts:* mean vs. distribution shape; choosing a reported metric based
+on what question it actually answers, not just what's cheap to compute.
+
+*Expected follow-up:* "What would a genuinely complete size-distribution
+report look like, beyond avg/min/max/small-file-count?" — A real
+percentile histogram (p50/p90/p99), which this repo's simple four-number
+summary deliberately doesn't attempt, named honestly as a production gap
+in Section 21.8 rather than presented as already solved.
+
+*Common mistake:* treating "we report more numbers" as automatically
+better without being able to articulate the *specific* failure case each
+additional number is there to catch.
+
+---
+
+## 22. Ingestion Metadata (deep-dive) ✅✅
+
+### 22.1 Concept
+
+`ingestion_metadata` has been this pipeline's control plane since Section
+13 — watermark source (Section 15), checkpoint state machine (Section
+16), Bronze reconciliation's source of truth (Section 17) — always in
+service of some other mechanism, never taught as a subject of its own.
+This section is that dedicated treatment: the table's full schema,
+walked through column by column; a genuine, previously-unnoticed gap
+found by re-reading that schema against the code that's supposed to
+populate it (`watermark_start` — in the schema since Section 13, never
+actually written, until this section fixes it); and two new
+general-purpose query functions, `get_run_history` and
+`get_ingestion_summary`, giving this table's contents to a human for the
+first time without requiring hand-written SQL.
+
+### Why does this exist?
+
+Every prior reader of this table has been narrowly scoped to one
+question and one status: `get_last_watermark` reads only `status =
+'success'` rows, for exactly one table; `find_stale_running_runs` reads
+only `status = 'running'` rows; `list_successful_bronze_keys` reads only
+`status = 'success'` rows again, for a different purpose. None of them
+answer the question a human debugging "why does this table's Bronze data
+look wrong" actually asks first: **what happened, across every status,
+in what order?** That's a genuinely different access pattern from
+anything this table has needed to serve before — and until this section,
+answering it meant writing ad-hoc SQL by hand every time, which is
+exactly the kind of friction that makes an operator stop checking
+something they should be checking regularly.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+A build system's CI history: individual tools already answer narrow
+questions ("is the current build green," "what's queued to run next")
+the same way this table's existing readers do. But "show me the last 20
+builds, whatever their outcome, so I can see the pattern" is a
+*different*, general-purpose query that a CI system provides as a first-
+class page precisely because it's the one a human reaches for first when
+something looks wrong — not "is build #4521 green" in isolation, but "what's
+the recent shape of things." `get_run_history` is this table's version of
+that page.
+
+### URL Shortener Example
+
+Every column in `ingestion_metadata`, what it's for, and — as of this
+section — whether it's actually populated:
+
+| Column | Purpose | Populated? |
+|---|---|---|
+| `run_id` | Primary key, a UUID | Always |
+| `pipeline_name`, `source_table`, `load_type` | Identify what this run was | Always |
+| `status` | The checkpoint state machine (Section 16) | Always |
+| `watermark_start` | This run's starting watermark | **Fixed this section** -- see below |
+| `watermark_end` | This run's ending watermark (Section 15) | On success |
+| `rows_read`, `rows_written` | Row counts | On success |
+| `bronze_key` | The exact object written (Section 17) | On success, non-`NULL` write |
+| `started_at`, `completed_at` | Checkpoint timing (Section 16) | Always / on completion |
+| `error_message` | Why a run failed | On failure |
+
+`watermark_start` is the interesting row: the column has existed in
+`sql/source/003_ingestion_metadata.sql` since Section 13, and
+`extract_incremental.py` has always *known* the value (it's a local
+variable in `run_incremental_load`, and it's literally embedded in every
+incremental run's own `bronze_key` string via
+`build_bronze_incremental_key`) — but `metadata.finish_run_success`
+never accepted a `watermark_start` parameter to actually write it,
+before this section. This was genuinely confirmed, not assumed: querying
+a real incremental run's row against this sandbox's real Postgres 16,
+before this section's fix, returned `watermark_start = NULL` even though
+`watermark_end` was correctly populated on the exact same row.
+
+### 22.2 Architecture
+
+```
+ Before this section:
+
+   run_incremental_load()
+        │
+        ├─ watermark = get_last_watermark(...)         # KNOWN locally
+        ├─ new_watermark = df["id"].max()
+        ├─ key = build_bronze_incremental_key(
+        │      table, watermark, new_watermark)         # watermark used HERE
+        └─ finish_run_success(..., watermark_end=new_watermark)
+                                     ▲
+                                     └── watermark (the START value) never passed through
+
+
+ After this section:
+
+   run_incremental_load()
+        │
+        ├─ watermark = get_last_watermark(...)
+        ├─ new_watermark = df["id"].max()
+        ├─ key = build_bronze_incremental_key(table, watermark, new_watermark)
+        └─ finish_run_success(..., watermark_start=watermark, watermark_end=new_watermark)
+                                     ▲
+                                     └── now genuinely persisted
+
+
+ get_run_history / get_ingestion_summary (NEW, read-only, general-purpose):
+
+   ingestion_metadata (every status, every column)
+        │
+        ├─▶ get_run_history: ORDER BY started_at DESC LIMIT N -- "what happened, in order"
+        │
+        └─▶ get_ingestion_summary: GROUP BY source_table,
+               COUNT(*) FILTER (WHERE status = 'success'), ...  -- "health, per table, at a glance"
+```
+
+### 22.3 Design Decision: aggregate in SQL, not in Python
+
+**Context:** `get_ingestion_summary` needs per-table counts of successful
+and failed runs, total rows written, and the most recent success
+timestamp. **Decision:** one SQL query using Postgres/SQLite's `FILTER
+(WHERE ...)` clause on aggregate functions (`COUNT(*) FILTER (WHERE
+status = 'success')`), computed server-side, rather than fetching every
+`ingestion_metadata` row into Python and reducing it there.
+**Alternatives considered:** fetch all rows via something like
+`get_run_history` with no limit, then aggregate in a Python loop.
+**Trade-offs:** this is the *opposite* choice from Section 16's own
+`find_stale_running_runs`, which deliberately computes its cutoff in
+Python rather than in SQL, for cross-dialect portability — worth being
+explicit about why the two sections land differently. Section 16's
+concern was a SQL feature (`now() - interval`) that literally doesn't
+exist in one of the two target dialects; `FILTER (WHERE ...)` is
+supported by *both* SQLite (since version 3.30, 2019) and Postgres, so
+the portability concern that drove Section 16's Python-side choice simply
+doesn't apply here — and aggregation is precisely the kind of work a
+database is built to do efficiently, at any real data volume, in a way a
+Python loop over every fetched row is not. **Consequences:** this
+function's correctness now depends on the `sqlite_engine` test fixture's
+SQLite version actually supporting `FILTER` — confirmed directly in this
+sandbox (SQLite 3.45.1) before relying on it, not assumed from a version
+number alone; a project targeting an older embedded SQLite (pre-3.30)
+would need the Python-reduction alternative instead.
+
+### Alternatives
+
+Covered above. A further alternative considered for `get_run_history`
+specifically: returning a paginated result (cursor-based, for a table
+that could eventually hold many thousands of rows) rather than a flat
+`LIMIT N`. Rejected for this increment as premature — this repo's actual
+`ingestion_metadata` row count (a few runs per table per day) is nowhere
+near where pagination would matter, and a flat limit is simpler to reason
+about and to test; see 22.8's Production Considerations for when this
+trade-off would need revisiting.
+
+### Trade-offs
+
+| | Aggregate in SQL (chosen, `get_ingestion_summary`) | Aggregate in Python (chosen, `find_stale_running_runs`'s *cutoff computation*, Section 16) |
+|---|---|---|
+| Reason for the choice | `FILTER (WHERE ...)` is supported by both target dialects; aggregation is what a database does efficiently | `now() - interval` syntax genuinely doesn't exist in SQLite at all -- no portable SQL-side equivalent existed |
+| Cost as row count grows | Scales with the database engine's own aggregate performance | Would require fetching every row into the Python process first -- doesn't scale the same way |
+| Portability risk | Real, but resolved -- confirmed both dialects support the specific syntax used | N/A -- this is why the Python-side approach was chosen in the first place |
+
+### 22.4 Implementation
+
+---
+
+**CREATE:** (edit) `ingestion/src/url_shortener_analytics/metadata.py` —
+`finish_run_success` gains `watermark_start`; `extract_incremental.py`'s
+two call sites pass it
+
+**PURPOSE:** Close a real, previously-unnoticed gap: persist the
+`watermark_start` column that has existed in the schema since Section 13
+but was never actually written.
+
+**IMPLEMENTATION GUIDE (write it yourself):** add `watermark_start: int |
+None = None` to `finish_run_success`'s keyword arguments, add it to the
+`UPDATE ... SET` statement and its bound parameters. Then, in
+`extract_incremental.run_incremental_load`, pass `watermark_start=watermark`
+(the value already computed locally, before this fix, purely for
+`build_bronze_incremental_key` and the function's own return dict) on
+**both** call sites — the normal success path *and* the no-op/empty-batch
+path (a no-op run's `watermark_start` still equals its `watermark_end`;
+both are genuinely known even when nothing was written).
+
+**REFERENCE IMPLEMENTATION:**
+
+```python
+# ingestion/src/url_shortener_analytics/metadata.py (excerpt)
+
+def finish_run_success(
+    engine, run_id, *, rows_read, rows_written,
+    watermark_start=None, watermark_end=None, bronze_key=None,
+) -> None:
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE ingestion_metadata
+            SET status = 'success', rows_read = :rows_read, rows_written = :rows_written,
+                watermark_start = :watermark_start, watermark_end = :watermark_end,
+                bronze_key = :bronze_key, completed_at = :completed_at
+            WHERE run_id = :run_id
+        """), {..., "watermark_start": watermark_start, ...})
+```
+
+```python
+# ingestion/src/url_shortener_analytics/extract_incremental.py (excerpt)
+
+# no-op path:
+metadata.finish_run_success(engine, run_id, rows_read=0, rows_written=0,
+                             watermark_start=watermark, watermark_end=watermark)
+# normal path:
+metadata.finish_run_success(engine, run_id, rows_read=len(df), rows_written=len(df),
+                             watermark_start=watermark, watermark_end=new_watermark, bronze_key=key)
+```
+
+Full files: [`metadata.py`](../ingestion/src/url_shortener_analytics/metadata.py),
+[`extract_incremental.py`](../ingestion/src/url_shortener_analytics/extract_incremental.py).
+
+**VERIFY:** this sandbox's real, local Postgres 16 was used to *prove*
+the gap first (querying a genuine incremental run's row and observing
+`watermark_start = NULL` while `watermark_end` was correctly set), then
+to prove the fix (same query, same kind of run, `watermark_start` now
+correctly populated) — both are ACTUAL OBSERVED results from this
+sandbox, not assumed from reading the code alone. See 22.6.
+
+**TEST:** `test_metadata.py`'s new `test_finish_run_success_persists_watermark_start`;
+`test_extract_incremental.py`'s new
+`test_run_incremental_load_persists_watermark_start_on_the_checkpoint_row`
+and an added assertion in the existing no-op test.
+
+---
+
+**CREATE:** (edit) `ingestion/src/url_shortener_analytics/metadata.py` —
+`get_run_history`, `get_ingestion_summary`
+
+**PURPOSE:** General-purpose observability this table has never had:
+"what happened recently, across every status" and "what's each table's
+health, at a glance."
+
+**IMPLEMENTATION GUIDE (write it yourself):** `get_run_history`: a plain
+`SELECT ... ORDER BY started_at DESC LIMIT :limit`, with optional
+`pipeline_name`/`source_table` filters appended conditionally (the same
+pattern `find_stale_running_runs`, Section 16, already established for
+optional filters). Deliberately select every status, not just one —
+that's the entire point, distinguishing this from every other reader in
+the module. `get_ingestion_summary`: one query, `GROUP BY source_table`,
+using `COUNT(*) FILTER (WHERE status = 'success')` /
+`COUNT(*) FILTER (WHERE status = 'failed')` /
+`SUM(rows_written) FILTER (WHERE status = 'success')` /
+`MAX(started_at) FILTER (WHERE status = 'success')` — see 22.3's Design
+Decision for why this aggregates in SQL rather than Python.
+
+**REFERENCE IMPLEMENTATION:**
+
+```python
+# ingestion/src/url_shortener_analytics/metadata.py (excerpt)
+
+def get_run_history(engine, *, pipeline_name=None, source_table=None, limit=20) -> list[dict]:
+    query = "SELECT run_id, pipeline_name, source_table, load_type, status, rows_read, " \
+            "rows_written, bronze_key, started_at, completed_at, error_message " \
+            "FROM ingestion_metadata WHERE 1=1"
+    params = {"limit": limit}
+    if pipeline_name is not None:
+        query += " AND pipeline_name = :pipeline_name"; params["pipeline_name"] = pipeline_name
+    if source_table is not None:
+        query += " AND source_table = :source_table"; params["source_table"] = source_table
+    query += " ORDER BY started_at DESC LIMIT :limit"
+    with engine.begin() as conn:
+        rows = conn.execute(text(query), params).fetchall()
+    return [dict(row._mapping) for row in rows]  # simplified -- see committed file for the explicit-dict version
+
+
+def get_ingestion_summary(engine, pipeline_name=None) -> list[dict]:
+    query = """
+        SELECT source_table,
+               COUNT(*) FILTER (WHERE status = 'success') AS successful_runs,
+               COUNT(*) FILTER (WHERE status = 'failed') AS failed_runs,
+               COALESCE(SUM(rows_written) FILTER (WHERE status = 'success'), 0) AS total_rows_written,
+               MAX(started_at) FILTER (WHERE status = 'success') AS last_success_at
+        FROM ingestion_metadata WHERE 1=1
+    """
+    ...  # optional pipeline_name filter, GROUP BY source_table ORDER BY source_table
+```
+
+Full file: [`metadata.py`](../ingestion/src/url_shortener_analytics/metadata.py).
+
+**RUN:**
+```bash
+make ingestion-history                       # last 20 runs, any status
+python -m url_shortener_analytics.cli ingestion-history --table clicks --limit 5
+make ingestion-summary                       # per-table health
+```
+
+**VERIFY / EXPECTED:** see 22.6 below — genuinely run against real
+Postgres in this sandbox, not just asserted.
+
+**TEST:** `test_metadata.py` — five new tests: most-recent-first ordering
+across mixed statuses, filtering by `source_table`, `limit` respected,
+per-table aggregation correctness (including a table with failures but
+zero successes — `total_rows_written` must be `0`, not `NULL`, and
+`last_success_at` must be `None`, not an error), and `pipeline_name`
+filtering.
+
+**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections
+22.8/22.9.
+
+---
+
+### Hands-on Challenge (implement-yourself)
+
+Before LAB 18 below, try this without looking at `metadata.py`: write
+the `get_ingestion_summary` query yourself, but using `Python`-side
+aggregation instead of SQL's `FILTER (WHERE ...)` — fetch every row via
+something like `get_run_history` with no limit, then reduce it into the
+same per-table summary shape by hand. Time both approaches conceptually
+(you don't need real scale to reason about it): at what row count would
+the Python version's "fetch everything, then reduce" cost start to matter
+compared to the SQL version's server-side aggregation? (There's no single
+right number — the exercise is in recognizing that the SQL version's cost
+scales with the *database engine's* aggregate performance, while the
+Python version's cost scales with *network transfer plus Python-loop*
+overhead for every row fetched, which loses badly, the more the table
+grows, regardless of what indexes exist.)
+
+### 22.5 Hands-on Exercise
+
+**LAB 18 — Prove the `watermark_start` fix and both new query functions
+against this sandbox's real Postgres 16.**
+
+This LAB was run for real, directly against real (non-Docker) Postgres in
+this sandbox, seeding realistic run history via `metadata.py` itself (no
+MinIO needed — this exercises the metadata layer only, the same
+established pattern as LAB 12, Section 16.5). **ACTUAL OBSERVED, not
+DESIGN EXPECTATION:**
+
+```
+--- get_run_history(limit=10) ---
+  2026-09-19 18:28:18.965886+00:00  urls     success  rows_written=500
+  2026-09-19 18:28:18.963676+00:00  clicks   failed   rows_written=None
+  2026-09-19 18:28:18.961785+00:00  clicks   success  rows_written=5000
+  2026-09-19 18:28:18.959580+00:00  users    success  rows_written=200
+  2026-09-19 18:28:18.955460+00:00  urls     success  rows_written=500
+
+--- get_run_history(source_table='clicks') ---
+  2 rows returned, statuses: ['failed', 'success']
+
+--- get_ingestion_summary (uses Postgres FILTER (WHERE ...) aggregate syntax) ---
+  clicks   success=1 failed=1 total_rows=5000 last_success=2026-09-19 18:28:18.961785+00:00
+  urls     success=2 failed=0 total_rows=1000 last_success=2026-09-19 18:28:18.965886+00:00
+  users    success=1 failed=0 total_rows=200 last_success=2026-09-19 18:28:18.959580+00:00
+
+ALL CHECKS PASSED against real Postgres 16 (including FILTER (WHERE ...) aggregate syntax).
+```
+
+What to observe: `get_run_history` returns rows most-recent-first
+regardless of status — the failed `clicks` run appears second, sandwiched
+between two successes, exactly reflecting the order things actually
+happened rather than being grouped or filtered by outcome.
+`get_ingestion_summary`'s `urls` row correctly shows `successful_runs=2`
+(two separate full loads, different days) with `total_rows_written=1000`
+— the sum across both, not just the most recent.
+
+**The `watermark_start` fix itself, also genuinely proven** (separately,
+against the same real Postgres instance): a run recorded with
+`finish_run_success(..., watermark_start=5000, watermark_end=5100, ...)`
+was queried back and its `watermark_start` column read exactly `5000` —
+where, before this section's fix, the identical call (without the new
+parameter existing at all) left that column `NULL`.
+
+### 22.6 How to test
+
+```bash
+make test
+```
+
+ACTUAL OBSERVED, genuinely run in this environment:
+
+```
+73 passed in 7.04s
+```
+
+`ruff check ingestion/ benchmarks/` also passed cleanly. Combined with
+22.5's direct verification against real Postgres 16 (both the
+`watermark_start` fix and both new query functions, including the
+Postgres-specific `FILTER (WHERE ...)` aggregate syntax), this section's
+entire database-facing surface has now been genuinely exercised against
+a real, non-SQLite dialect — not just unit-tested in isolation.
+
+### 22.7 Failure Scenario
+
+**What would have happened, concretely, if `watermark_start` had stayed
+unpopulated indefinitely — is this actually a "real" bug, or just an
+unused column?**
+
+Worth answering honestly rather than assuming the answer is obviously
+"real bug": today, *nothing* in this codebase currently reads
+`ingestion_metadata.watermark_start` back — `build_bronze_incremental_key`
+receives `watermark_start` as a function argument computed fresh each run
+(from `get_last_watermark`), never read from this column. So the gap,
+before this section's fix, caused **no incorrect behavior in anything
+this repo currently does** — every existing feature (watermarking,
+checkpointing, reconciliation) was, and remains, completely unaffected.
+What it *did* cost: any future tool built directly against
+`ingestion_metadata` (a dashboard querying "show me every batch's exact
+row range," an audit report, a Phase 2 job wanting to reconstruct
+incremental history without recomputing it) would have silently gotten
+`NULL` for a value that was genuinely known and recorded nowhere durable
+except inside a `bronze_key` string that would need parsing to recover
+it. This is the honest shape of a real but *latent* bug — one with no
+current observable symptom, found by reading the schema against the code
+rather than by a failure report, and worth fixing specifically because
+schema columns that exist but are silently never populated are exactly
+the kind of thing that misleads a future reader (human or automated)
+who reasonably assumes a non-`NULL`-looking column is actually populated.
+
+### 22.8 Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| Query surface | Two new functions, `get_run_history`/`get_ingestion_summary`, CLI-exposed | A real observability platform (Grafana over a Postgres datasource, or a dedicated internal tool) rather than a CLI a human runs on demand |
+| `get_run_history` scale | Flat `LIMIT N`, no pagination (22.3's named, deliberate scope boundary) | Cursor-based pagination once row count genuinely grows past where a flat limit is sufficient |
+| Schema drift detection | None -- this section's `watermark_start` gap was found by manual code review, not automated tooling | A schema-vs-code-usage linter (or simply a contract-style check, extending Section 12's pattern to this table itself) catching an unpopulated column automatically |
+| Retention | Unbounded -- `ingestion_metadata` grows forever, no archival | A retention/archival policy once row count becomes operationally significant, consistent with ADR-007's stated gap for Bronze data itself |
+| Aggregate query portability | `FILTER (WHERE ...)`, confirmed supported by both SQLite 3.45.1 (this sandbox) and Postgres | Re-verify against whatever SQLite version a CI pipeline's test runner actually ships, rather than assuming a recent-enough version everywhere |
+
+### Principal Data Engineer Perspective
+
+The judgment call worth defending here is treating a schema column that
+exists but is never populated as worth actively finding and fixing,
+rather than as harmless dead weight not worth the effort. Section 22.7's
+honest framing matters: this genuinely was a latent, currently-harmless
+gap, not an active bug — and a weaker engineering habit would reasonably
+deprioritize fixing something with zero current observable impact. What
+makes it worth fixing anyway is *why* the column exists in the first
+place: `watermark_start` was deliberately added to the schema back in
+Section 13, as part of this project's own stated principle ("build the
+metadata layer once, correctly, rather than retrofitting it") — leaving
+it silently unpopulated would have meant that stated principle quietly
+failed to hold for one specific column, discoverable only by a future
+reader who happened to check. Fixing it now, and documenting exactly how
+and why it was found, is worth more to a portfolio reviewer than either
+silently patching it with no explanation or leaving it as an unremarked
+gap. The second thing worth flagging: Section 22.3's Design Decision
+(aggregate in SQL here, in direct contrast to Section 16's aggregate-in-
+Python choice) is a good example of the same underlying skill —
+cross-dialect portability — leading to *opposite* concrete choices
+depending on what's actually true about the two target dialects in each
+specific case, rather than applying a single rule ("always compute in
+Python for portability") mechanically everywhere.
+
+### 22.9 Principal Engineer Interview Questions
+
+**Q: "You found a database column that's existed in the schema for two
+increments' worth of work but was never actually written by any code
+path, with zero current impact on anything the system does. How do you
+decide whether that's worth fixing right now?"**
+
+*What's tested:* judgment about prioritizing a latent, currently-harmless
+gap — a genuinely debatable call, not one with an obviously correct
+answer, which is exactly what makes it a good interview question.
+
+*What a weak answer looks like:* "Always fix bugs immediately" — too
+absolute; doesn't engage with the real trade-off (opportunity cost,
+whether it's actually causing harm right now).
+
+*What a strong answer covers:* the decision should weigh what the gap
+actually costs today (here: nothing observable) against what it would
+cost to discover and fix *later*, once something depends on the column
+being correct (here: a future consumer silently getting wrong data with
+no error, the worst kind of bug to debug, because nothing fails loudly).
+A column that exists specifically because an earlier design decision
+said "build this once, correctly" (Section 13.3's own stated principle)
+failing to actually hold is a signal the gap is worth closing
+proactively, rather than waiting for a future consumer to discover it the
+hard way.
+
+*Concepts:* latent vs. active bugs; the asymmetric cost of a silent
+wrong-data bug versus a loud failure; using a component's own stated
+design intent as a signal for whether an inconsistency with that intent
+is worth fixing now.
+
+*Expected follow-up:* "How would you prevent this specific class of gap
+— a schema column nobody writes to — from recurring?" — Some kind of
+automated check that every declared column has at least one write path
+exercised by tests (closer to a contract, extending Section 12's pattern
+inward to this table's own schema, rather than only to source tables).
+
+*Common mistake:* treating "it has zero current impact" as proof it
+doesn't need fixing, without separately reasoning about what it would
+cost to discover and fix later, once something actually depends on it.
+
+**Q: "Section 16 computes its time cutoff in Python for cross-dialect
+portability. Section 22's ingestion summary aggregates in SQL instead,
+for the same underlying goal of dialect portability. Aren't these
+contradictory?"**
+
+*What's tested:* whether the candidate understands that "portability" is
+a property that has to be checked per-feature, not a single rule applied
+uniformly — and can articulate why these two sections land on opposite
+concrete choices for a coherent reason.
+
+*What a weak answer looks like:* "One of them must be wrong" — assumes
+consistency-for-its-own-sake is the goal, missing the actual reasoning.
+
+*What a strong answer covers:* not contradictory, because the two
+sections are avoiding two *different* portability failures. Section 16's
+concern is a SQL feature (`now() - interval`) with no equivalent syntax
+at all in one target dialect (SQLite) — there, only Python-side
+computation is genuinely portable. Section 22's concern is a *different*
+SQL feature (`FILTER (WHERE ...)`) that both target dialects *do*
+support (confirmed directly, not assumed) — there, doing the aggregation
+in SQL is both portable and meaningfully more efficient than pulling
+every row into Python first. The right general principle is "check what
+each specific dialect actually supports for the specific feature in
+question," not "always prefer Python" or "always prefer SQL" as a
+blanket rule.
+
+*Concepts:* portability as a per-feature property, not a global rule;
+verifying an assumption about dialect support directly rather than
+guessing from a version number or a vague sense of "SQL is more
+portable" / "Python is more portable."
+
+*Expected follow-up:* "How did you actually confirm SQLite supports
+`FILTER (WHERE ...)` before relying on it, rather than just assuming a
+'modern enough' SQLite would?" — Ran a direct, minimal repro against this
+sandbox's actual bundled SQLite version (3.45.1) before writing any
+production code against the assumption — the same "verify before
+trusting" discipline this guide has applied to every other cross-dialect
+claim it makes.
+
+*Common mistake:* picking one of "always aggregate in SQL" or "always
+compute in Python" as a universal rule and defending it in the abstract,
+rather than engaging with the fact that the right answer is genuinely
+feature-specific.
+
+---
+
 ## 28. Architectural Principles
 
 Introduced here, demonstrated incrementally as more of Phase 1 is built.
@@ -6329,90 +7278,126 @@ directly rather than reach for `list_bronze_keys_for_date_range`, which
 will not raise an error but will not prune correctly for that load type
 either — a named scope boundary, not a silently-incomplete abstraction.
 
+### ADR-013: Detect file-layout degradation, never auto-compact
+
+**Context:** this repo's Bronze layout could, in principle, degrade toward
+a small-file or too-few-too-large-files problem (Section 21) if a future
+write path changed without file-count discipline; this is now the second
+independent section (after Section 17.7's Bronze reconciliation) to face
+essentially the same choice between reporting a problem and automatically
+fixing it. **Decision:** `get_file_layout_report` (Section 21) measures
+and reports layout health only; it never compacts, merges, or rewrites any
+Bronze object. **Alternatives considered:** an automatic compaction job
+that detects a partition with too many small files and rewrites them into
+fewer, larger ones. **Trade-offs:** automatic compaction would actually
+fix a degrading layout rather than just reporting it, but compaction is a
+genuinely more dangerous operation than detection — it requires deleting
+original objects after rewriting their contents elsewhere, and any bug in
+that rewrite logic risks real data loss, not just a stale report;
+detection-only costs a human having to act on what's found, in exchange
+for a categorically safer default. **Consequences:** this formalizes
+detect-don't-remediate as a recurring, deliberate posture across this
+project's operational tooling (Section 17.7's reconciliation, now Section
+21's layout reporting), not a one-off choice specific to either section —
+any future operational-health check this codebase adds should default to
+the same posture unless a specific, named reason justifies auto-remediation.
+
 ---
 
 ## 33. Phase 1 Summary (so far)
 
-**What we've built in this increment:** the Storage block — Object
-Storage Fundamentals (Section 18), Parquet (Section 19), and Partitioning
-(Section 20) — closing the groundwork Phase 2's transform needs before it
-can read Bronze at scale. Genuinely new code: `object_store.get_bucket_stats`
-(capacity/growth reporting, wired into a new `storage-stats` CLI command)
-and `object_store.list_bronze_keys_for_date_range` (real partition
-pruning for full-load tables' date-partitioned keys, proven against a
-mocked S3 client to issue exactly one call per requested date, each
-scoped to that date's own prefix). And a genuinely new, genuinely *run*
-benchmark, `benchmarks/parquet_vs_csv_vs_json.py`, closing the "planned"
-item ADR-003 named two increments ago — run twice in this sandbox, once
-against this project's real seeded `clicks` table (5,000 rows) and once
-against a synthetic 200,000-row dataset of the same shape, with every
-number in Section 19.6 labeled ACTUAL OBSERVED because it genuinely was.
-4 new unit tests (59 → 63); two new ADRs (011, 012).
+**What we've built in this increment:** File Layout (Section 21) and
+Ingestion Metadata's own deep-dive (Section 22), closing out the Storage
+block and giving this pipeline its first genuinely operational,
+health-reporting view over both the data it has written (Bronze object
+sizes) and the control-plane table that has been recording every run
+since Section 13. Genuinely new code: `object_store.get_file_layout_report`
+(per-table object count, avg/min/max byte size, and an explicit
+`small_file_count` below an 8 MB default threshold, wired into a new
+`layout-report` CLI command); a real, previously-undiscovered gap fixed —
+`ingestion_metadata.watermark_start` had existed in the schema since
+Section 13 but no code path had ever written to it, confirmed NULL
+against real Postgres before the fix and non-NULL after — closed by
+threading `watermark_start` through `metadata.finish_run_success` and
+both call sites in `extract_incremental.run_incremental_load`; and two
+new general-purpose metadata readers, `metadata.get_run_history` (most
+recent N runs, any status, most-recent-first — the first reader in this
+module not scoped to a single status) and `metadata.get_ingestion_summary`
+(per-table aggregated run health via SQL `FILTER (WHERE ...)`, wired into
+a new `ingestion-summary` CLI command). 10 new unit tests (63 → 73); one
+new ADR (013).
 
-**A note on this increment specifically:** the benchmark's honesty is the
-thing most worth calling out. The small-scale, real-data run did *not*
-uniformly favor Parquet — full-table read time came out essentially tied
-with CSV's at 5,000 rows, only pulling decisively ahead at 200,000 — a
-genuinely counter-intuitive result this guide reported plainly rather
-than either suppressing it or only ever benchmarking at whichever scale
-made the intended point most cleanly (Section 19.3's Design Decision, and
-19.6's full explanation of why the fixed per-file overhead of Parquet's
-footer/schema needs enough rows to amortize away). This is the same
-"never fabricate, always report what was actually observed" discipline
-this guide has followed since Section 15.7's honesty about its own
-idempotency gap, applied here to a benchmark result rather than a code
-behavior.
+**A note on this increment specifically:** the `watermark_start` gap is
+the thing most worth calling out, because it's exactly the kind of thing
+this guide keeps insisting on finding by actually re-reading code against
+its schema rather than assuming past sections got everything right. It
+was found by grepping `metadata.py` for `watermark_start` and getting
+zero matches, then confirming the gap concretely against real Postgres
+16 before touching any code — the same "verify before you fix, and prove
+the fix against real infrastructure afterward" discipline this guide
+followed for the `uuid.UUID`-vs-`str` cross-dialect quirk in Section
+16.6. Section 22.3's Design Decision also puts this increment's SQL
+aggregation choice in explicit contrast with Section 16's Python-side
+time-cutoff computation — same-looking problem ("compute something over
+`ingestion_metadata` rows"), opposite-looking answer, both individually
+correct because portability is a per-feature property of a specific SQL
+construct, not a blanket rule to apply uniformly; `FILTER (WHERE ...)`
+was confirmed to work against this sandbox's actual SQLite 3.45.1 before
+being relied on, not assumed from "modern enough."
 
 **Concepts taught so far, at full depth:** the real application's
 architecture and schema, OLTP vs. OLAP, full load and incremental-load
 ingestion (watermarks, idempotency, checkpointing, Bronze reconciliation),
-the entire data modeling layer (Sections 7-12), and now the Storage
-block: the flat-key, whole-object-write model underlying every S3-API
-call this codebase makes and its concrete design consequences (Section
-18); columnar vs. row-oriented storage, real measured size and read-time
-differences at two scales, and why "Parquet is faster" needs a stated
-scale to be a true claim (Section 19); Hive-style partitioning as
-already-in-production convention (`ingestion_date=`, `watermark_start=`/
-`watermark_end=`) and what genuine partition pruning means concretely for
-an object store — fewer, narrower `list_objects_v2` calls, not just a
-vague performance claim (Section 20), plus the honest failure mode where
-pruning a too-large range costs more calls than a full listing would.
+the entire data modeling layer (Sections 7-12), the Storage block in
+full — the flat-key, whole-object-write model underlying every S3-API
+call this codebase makes (Section 18); columnar vs. row-oriented storage
+with real measured size/read-time differences at two scales (Section
+19); Hive-style partitioning and genuine partition pruning for full-load
+keys (Section 20); file layout as a question distinct from partitioning —
+file *count* and *size* within a partition, not which column values
+split it, and why a mean alone can hide a skewed size distribution
+(Section 21); and `ingestion_metadata` treated explicitly as this
+pipeline's control plane and audit table, with a full column-by-column
+walkthrough of what each field means operationally and two new
+general-purpose query functions built for it (Section 22).
 
-**Known limitations, stated honestly:** three CLI commands
-(`check-stale-runs`, `reconcile-bronze`, and the new `storage-stats`)
-have no top-level exception handling around their own S3/database calls
-— a real, currently-unpatched gap named in Section 18.7, found by
-re-reading the code just written rather than assumed; `list_bronze_keys_for_date_range`
-has no upper bound on how many dates it will issue calls for, so a
-caller requesting an unbounded or very large range gets no warning before
-it happens (Section 20.7); partition pruning is scoped to full-load's
-date-partitioned keys only, not incremental's watermark-range keys, by
-deliberate, named design (Section 20.3, ADR-012); Parquet's benchmark
-numbers are single-run wall-clock timings on a shared sandbox, not a
-statistically rigorous multi-trial measurement (Section 19.6's stated
-caveat) — the size numbers are exact and reproducible, the timing numbers
-are directional; no scheduler yet; the elapsed-time staleness threshold's
-false-positive failure mode (Section 16.7) and reconciliation's
-detect-only design (Section 17.7) both still stand as before; the star
-schema is designed and DDL-committed but **not yet populated**; data
-contracts cover the source layer only; no PII classification section
-yet. This sandbox still has no Docker daemon and no real MinIO, so LAB
-14's real-bucket idempotent-rerun proof and any genuine network-latency
-measurement of partition pruning's real-world benefit both remain DESIGN
-EXPECTATIONS. What *was* genuinely verified in this sandbox this
-increment: the full benchmark script, against real seeded Postgres data
-and a larger synthetic dataset alike; `get_bucket_stats`'s own lack of
-error handling, confirmed by actually triggering a `NoSuchBucket`
-`ClientError` against a mocked client and watching it propagate uncaught;
-and `list_bronze_keys_for_date_range`'s exact per-date call pattern,
-confirmed against a mocked S3 client with the precise sequence of
-prefixes asserted, not just the returned keys.
+**Known limitations, stated honestly:** `get_file_layout_report`
+detects small-file accumulation but never compacts, merges, or rewrites
+anything — the same detect-don't-remediate posture Section 17.7
+established for Bronze reconciliation, now formalized a second time as
+its own ADR (ADR-013) rather than left as an implicit repeated pattern;
+the 8 MB small-file threshold is a POC-simplification default, not a
+value derived from this project's actual query-engine read-parallelism
+characteristics (Section 21.8); `get_run_history` and
+`get_ingestion_summary` are read-only reporting, with no CLI-level
+pagination guard on `get_run_history`'s `limit`, so a caller requesting
+an unbounded history against a long-lived production table would pull
+every matching row in one query (Section 22.8's stated gap); the three
+CLI commands named as lacking top-level exception handling in the prior
+increment (`check-stale-runs`, `reconcile-bronze`, `storage-stats`) still
+have that gap, joined now by `layout-report` and `ingestion-summary`,
+which share the same unpatched pattern; partition pruning is still scoped
+to full-load's date-partitioned keys only (ADR-012, unchanged this
+increment); no scheduler yet; the star schema is designed and
+DDL-committed but **not yet populated**; data contracts cover the source
+layer only; no PII classification section yet. This sandbox still has no
+Docker daemon and no real MinIO, so `get_file_layout_report`'s real-bucket
+behavior remains proven only against a mocked S3 client, honestly labeled
+DESIGN EXPECTATION for anything beyond that mock. What *was* genuinely
+verified in this sandbox this increment: the `watermark_start` fix and
+both new `metadata.py` query functions, each proven against real local
+Postgres 16 (not just SQLite) via dedicated verification scripts, with
+the recurring `uuid.UUID`-vs-`str` cross-dialect quirk handled again along
+the way; and `FILTER (WHERE ...)` support, confirmed directly against
+this sandbox's real SQLite 3.45.1 before being relied on.
 
-**Immediate next increment:** File Layout and Ingestion Metadata's own
-deep-dive (Sections 21-22), or PII and Security (Section 23) now that
+**Immediate next increment:** PII and Security (Section 23) — now that
 `clicks.hashed_ip` and `dim_user`'s email exclusion have been mentioned
 as partial mitigations several times without their own formal treatment —
-whichever the reader wants to tackle next.
+or Testing (deep-dive, Section 24) / Failure Scenarios (Section 25), now
+that 73 unit tests and two increments' worth of Failure Scenario
+subsections exist to consolidate; whichever the reader wants to tackle
+next.
 
 ---
 
@@ -6436,14 +7421,16 @@ whichever the reader wants to tackle next.
 | MinIO configured | ✅ Done | `docker-compose.yml`, `object_store.py`; single-bucket/prefix-layer convention formalized, Section 18, ADR-011 | — |
 | Parquet implemented | ✅ Done | `object_store.write_bronze` / `write_bronze_incremental`; benchmark vs CSV/JSON genuinely run at two scales, Section 19 | — |
 | Partitioning implemented | ✅ Done (single file per partition; pruning added) | Hive-style date/watermark-scoped keys since Sections 14-15, formalized in Section 18.2; genuine partition-pruned listing for full-load tables, `list_bronze_keys_for_date_range`, Section 20, ADR-012 | Not true multi-file-per-partition splitting; pruning not extended to incremental's watermark-range keys (named scope boundary, Section 20.3) |
+| File layout health reporting implemented | ✅ Done (detect-only) | `object_store.get_file_layout_report`, `layout-report` CLI command, Section 21, ADR-013 | No auto-compaction, by deliberate design (ADR-013); 8 MB small-file threshold is a POC default, not empirically derived (Section 21.8) |
+| Ingestion metadata deep-dive completed | ✅ Done | `watermark_start` gap found and fixed, `get_run_history`, `get_ingestion_summary`, `ingestion-history`/`ingestion-summary` CLI commands, Section 22 | `get_run_history` has no pagination guard on `limit` (Section 22.8) |
 | PII identified | ⏳ Not started | `clicks.hashed_ip` already avoids raw IPs by construction | Formal classification table, Section 23 |
-| Tests implemented | ✅ Done (unit + partial integration) | 63 passing unit tests (up from 38 two increments ago); the contracts integration test, and prior increments' `metadata.py` additions, genuinely passed against a real (non-Docker) local Postgres in this sandbox | Full-load, incremental-load, and reconciliation integration tests still need real MinIO, not available here — user should run `make up && make test-integration` locally for the complete suite |
-| Failure scenarios tested | ✅ Partial | Sections 7-12 (data modeling), 14.7, 15.7, 16.7, 17.7, 18.7, 19.7, 20.7 | Remaining named in Section 25's index |
+| Tests implemented | ✅ Done (unit + partial integration) | 73 passing unit tests (up from 38 three increments ago); the contracts integration test, and prior increments' `metadata.py` additions, genuinely passed against a real (non-Docker) local Postgres in this sandbox; this increment's `watermark_start` fix and both new metadata readers re-verified against that same real Postgres | Full-load, incremental-load, and reconciliation integration tests still need real MinIO, not available here — user should run `make up && make test-integration` locally for the complete suite |
+| Failure scenarios tested | ✅ Partial | Sections 7-12 (data modeling), 14.7, 15.7, 16.7, 17.7, 18.7, 19.7, 20.7, 21.7, 22.7 | Remaining named in Section 25's index |
 | Performance benchmark completed | ✅ Partial | Parquet vs. CSV/JSON, Section 19, genuinely run at two scales | Extraction-time-at-scale and partition-pruning real-network-latency benchmarks not yet run, Section 26 |
-| Architecture diagrams completed | ✅ Partial | 10+ diagrams so far, including the full star schema ER diagram (Section 10.1) and Sections 18/20's object-storage and partition-pruning diagrams | More land with later sections (data lifecycle, failure/recovery, final architecture) |
-| ADRs documented | ✅ 12 of 12+ planned | Section 29 | ADR-011 (bucket/prefix layout), ADR-012 (partition-pruning scope) added this increment; a bronze-key-storage-vs-recompute decision is documented in Section 17.3 but not yet promoted to its own numbered ADR |
-| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9 | Remaining categories not yet covered, Section 31 |
-| Hands-on labs completed | ✅ Partial | LAB 1-16 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation, LAB 14 storage growth/idempotency, LAB 15 Parquet benchmark, LAB 16 partition pruning) | LAB 17+ |
+| Architecture diagrams completed | ✅ Partial | 10+ diagrams so far, including the full star schema ER diagram (Section 10.1) and Sections 18/20/21/22's object-storage, partition-pruning, file-layout, and control-plane diagrams | More land with later sections (data lifecycle, failure/recovery, final architecture) |
+| ADRs documented | ✅ 13 of 13+ planned | Section 29 | ADR-013 (detect-don't-auto-compact file layout, formalizing the same posture as Section 17.7) added this increment; a bronze-key-storage-vs-recompute decision is documented in Section 17.3 but not yet promoted to its own numbered ADR |
+| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9 | Remaining categories not yet covered, Section 31 |
+| Hands-on labs completed | ✅ Partial | LAB 1-18 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation, LAB 14 storage growth/idempotency, LAB 15 Parquet benchmark, LAB 16 partition pruning, LAB 17 file-layout report, LAB 18 watermark_start fix + metadata readers) | LAB 19+ |
 | README updated | ✅ Done | `README.md` | — |
 | Git repository clean | ✅ Done | Section 35 | — |
 | No secrets committed | ✅ Done | `.gitignore`, `.env.example` reviewed | — |
