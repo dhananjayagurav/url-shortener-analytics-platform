@@ -47,8 +47,14 @@ def test_run_incremental_load_first_run_reads_everything_and_advances_watermark(
     assert result["rows"] == 5
     assert result["watermark_start"] == 0
     assert result["watermark_end"] == 5
+    assert result["key"] is not None
     assert s3_client.put_object.call_count == 1
     assert metadata.get_last_watermark(seeded_clicks, "pipeline_a", "clicks") == 5
+    with seeded_clicks.begin() as conn:
+        row = conn.execute(text(
+            "SELECT bronze_key FROM ingestion_metadata WHERE run_id = :run_id"
+        ), {"run_id": result["run_id"]}).fetchone()
+    assert row.bronze_key == result["key"]
 
 
 def test_run_incremental_load_second_run_only_reads_new_rows(seeded_clicks: Engine) -> None:
@@ -81,10 +87,13 @@ def test_run_incremental_load_with_no_new_rows_skips_the_write_but_still_succeed
     assert s3_client.put_object.call_count == 1
     with seeded_clicks.begin() as conn:
         row = conn.execute(text(
-            "SELECT status, rows_written FROM ingestion_metadata WHERE run_id = :run_id"
+            "SELECT status, rows_written, bronze_key FROM ingestion_metadata WHERE run_id = :run_id"
         ), {"run_id": result["run_id"]}).fetchone()
     assert row.status == "success"
     assert row.rows_written == 0
+    # A no-op run wrote nothing to Bronze, so bronze_key must stay NULL --
+    # not some recomputed key for an object that doesn't exist.
+    assert row.bronze_key is None
 
 
 def test_run_incremental_load_checkpoints_failure_and_reraises_without_advancing_watermark(

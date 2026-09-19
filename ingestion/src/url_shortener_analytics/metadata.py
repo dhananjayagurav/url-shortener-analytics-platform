@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import Engine, text
 
@@ -69,7 +70,14 @@ def finish_run_success(
     rows_read: int,
     rows_written: int,
     watermark_end: int | None = None,
+    bronze_key: str | None = None,
 ) -> None:
+    """Record a successful run -- including, since Section 17, the exact
+    Bronze object key this run wrote (or None, for a no-op incremental run
+    that wrote nothing -- see extract_incremental.run_incremental_load).
+    `bronze_key` is stored explicitly rather than recomputed later from
+    `source_table`/`started_at`/watermarks -- see the guide's Section 17.3
+    Design Decision for why recomputation was rejected."""
     try:
         with engine.begin() as conn:
             conn.execute(
@@ -80,6 +88,7 @@ def finish_run_success(
                         rows_read = :rows_read,
                         rows_written = :rows_written,
                         watermark_end = :watermark_end,
+                        bronze_key = :bronze_key,
                         completed_at = :completed_at
                     WHERE run_id = :run_id
                     """
@@ -89,13 +98,17 @@ def finish_run_success(
                     "rows_read": rows_read,
                     "rows_written": rows_written,
                     "watermark_end": watermark_end,
+                    "bronze_key": bronze_key,
                     "completed_at": datetime.now(UTC),
                 },
             )
     except Exception as err:
         raise MetadataError(f"failed to record success for run {run_id}") from err
 
-    logger.info("ingestion run succeeded", extra={"run_id": run_id, "rows_written": rows_written})
+    logger.info(
+        "ingestion run succeeded",
+        extra={"run_id": run_id, "rows_written": rows_written, "bronze_key": bronze_key},
+    )
 
 
 def finish_run_failure(engine: Engine, run_id: str, error_message: str) -> None:
@@ -150,3 +163,76 @@ def get_last_watermark(engine: Engine, pipeline_name: str, source_table: str) ->
     watermark = int(row[0]) if row and row[0] is not None else 0
     logger.debug("watermark read", extra={"source_table": source_table, "watermark": watermark})
     return watermark
+
+
+def find_stale_running_runs(
+    engine: Engine, *, max_runtime_minutes: int = 60, pipeline_name: str | None = None
+) -> list[dict[str, Any]]:
+    """Return every ingestion_metadata row still `status = 'running'` whose
+    `started_at` is older than `max_runtime_minutes` ago -- almost
+    certainly a crashed run (see Section 14.7/15.7's "killed mid-flight"
+    failure scenarios), not one still legitimately in progress. See the
+    guide's Section 16 for the full concept and why this exists.
+
+    The cutoff is computed here, in Python, and passed as a plain
+    timestamp parameter -- not `now() - interval 'N minutes'` in SQL --
+    for the same cross-dialect-portability reason contracts.py computes
+    type categories in Python: this function is unit-tested against
+    SQLite (whose SQL dialect has no `interval` syntax at all) and used
+    against Postgres in production, and a bound parameter works
+    identically against both.
+    """
+    cutoff = datetime.now(UTC) - timedelta(minutes=max_runtime_minutes)
+    query = """
+        SELECT run_id, pipeline_name, source_table, load_type, started_at
+        FROM ingestion_metadata
+        WHERE status = 'running'
+          AND started_at < :cutoff
+    """
+    params: dict[str, Any] = {"cutoff": cutoff}
+    if pipeline_name is not None:
+        query += " AND pipeline_name = :pipeline_name"
+        params["pipeline_name"] = pipeline_name
+    query += " ORDER BY started_at ASC"
+
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(text(query), params).fetchall()
+    except Exception as err:
+        raise MetadataError("failed to query for stale running runs") from err
+
+    stale = [
+        {
+            "run_id": row.run_id,
+            "pipeline_name": row.pipeline_name,
+            "source_table": row.source_table,
+            "load_type": row.load_type,
+            "started_at": row.started_at,
+        }
+        for row in rows
+    ]
+    if stale:
+        logger.warning("stale running runs found", extra={"count": len(stale)})
+    return stale
+
+
+def list_successful_bronze_keys(engine: Engine, pipeline_name: str | None = None) -> list[str]:
+    """Every `bronze_key` recorded by a `status = 'success'` run -- the
+    control plane's own record of what it believes it wrote to Bronze.
+    Used by reconciliation.py (Section 17) to compare against what
+    actually exists in object storage. Excludes NULL keys (no-op
+    incremental runs that wrote nothing -- see
+    extract_incremental.run_incremental_load)."""
+    query = "SELECT bronze_key FROM ingestion_metadata WHERE status = 'success' AND bronze_key IS NOT NULL"
+    params: dict[str, Any] = {}
+    if pipeline_name is not None:
+        query += " AND pipeline_name = :pipeline_name"
+        params["pipeline_name"] = pipeline_name
+
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(text(query), params).fetchall()
+    except Exception as err:
+        raise MetadataError("failed to list successful bronze keys") from err
+
+    return [row[0] for row in rows]

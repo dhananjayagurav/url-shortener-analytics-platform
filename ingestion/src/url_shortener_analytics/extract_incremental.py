@@ -104,7 +104,8 @@ def run_incremental_load(
         new_watermark = int(df["id"].max())
         key = write_bronze_incremental(df, table_name, watermark, new_watermark, s3_client, bucket)
         metadata.finish_run_success(
-            engine, run_id, rows_read=len(df), rows_written=len(df), watermark_end=new_watermark
+            engine, run_id, rows_read=len(df), rows_written=len(df),
+            watermark_end=new_watermark, bronze_key=key,
         )
     except Exception as err:
         metadata.finish_run_failure(engine, run_id, str(err))

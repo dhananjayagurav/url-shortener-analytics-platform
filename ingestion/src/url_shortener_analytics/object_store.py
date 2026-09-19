@@ -165,3 +165,21 @@ def head_object(s3_client: BaseClient, bucket: str, key: str) -> dict[str, Any] 
         if err.response.get("Error", {}).get("Code") in {"404", "NoSuchKey"}:
             return None
         raise
+
+
+def list_bronze_keys(s3_client: BaseClient, bucket: str, prefix: str = "bronze/") -> list[str]:
+    """Every object key under `prefix` -- the object store's own view of
+    what actually exists, independent of what ingestion_metadata believes
+    it wrote. Used by reconciliation.py (Section 17) to detect drift
+    between the two.
+
+    POC SIMPLIFICATION: a single `list_objects_v2` call, capped at 1,000
+    keys (S3's per-call limit) -- no pagination. Every table in this
+    project writes at most a few dozen Bronze objects even after months of
+    runs (one per full-load day, one per incremental batch), so this is
+    nowhere near the cap. Production equivalent: paginate with
+    `s3_client.get_paginator("list_objects_v2")` once a table's object
+    count could plausibly exceed 1,000.
+    """
+    response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+    return [obj["Key"] for obj in response.get("Contents", [])]

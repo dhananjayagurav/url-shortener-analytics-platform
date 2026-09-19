@@ -65,7 +65,7 @@ def run_full_load(
         df = extract_full(table_name, engine)
         run_date = datetime.now(UTC)
         key = write_bronze(df, table_name, run_date, s3_client, bucket)
-        metadata.finish_run_success(engine, run_id, rows_read=len(df), rows_written=len(df))
+        metadata.finish_run_success(engine, run_id, rows_read=len(df), rows_written=len(df), bronze_key=key)
     except Exception as err:
         metadata.finish_run_failure(engine, run_id, str(err))
         raise

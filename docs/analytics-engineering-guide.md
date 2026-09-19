@@ -87,8 +87,8 @@ with the exact command to produce the real result yourself.
 13. [Batch Ingestion Design](#13-batch-ingestion-design) ✅
 14. [Full Load Ingestion](#14-full-load-ingestion-) ✅✅
 15. [Incremental Load & Watermarks](#15-incremental-load--watermarks-) ✅✅
-16. Checkpointing ⏳ *(the mechanism exists and checkpoint recovery is now observable — see [Section 13.3](#133-checkpointing-and-watermark-mechanism-already-built) and [Section 15.7](#157-failure-scenario) — still awaits its own dedicated deep-dive section)*
-17. Idempotency ⏳ *(the mechanism exists for both load types — see [Section 14](#14-full-load-ingestion) (LAB 4/5) and [Section 15.7](#157-failure-scenario) (LAB 2/3, plus the one documented residual edge case) — still awaits its own dedicated deep-dive section)*
+16. [Checkpointing](#16-checkpointing-) ✅✅
+17. [Idempotency](#17-idempotency-) ✅✅
 
 **Storage**
 18. Object Storage Fundamentals ⏳
@@ -107,8 +107,8 @@ with the exact command to produce the real result yourself.
 **Reference**
 28. [Architectural Principles](#28-architectural-principles) ✅ *(introduced now, extended as more are demonstrated)*
 29. [Architecture Decision Records](#29-architecture-decision-records) ✅
-30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6)*
-31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, and 15.9)*
+30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6; LAB 12 — Section 16.5; LAB 13 — Section 17.5)*
+31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, 15.9, 16.9, and 17.9)*
 32. Principal-Level Scenarios ⏳
 33. [Phase 1 Summary](#33-phase-1-summary-so-far) (running, updated each increment)
 34. [Phase 1 Completion Checklist](#34-phase-1-completion-checklist)
@@ -2626,7 +2626,9 @@ support **both** full and incremental load from day one — see
 [`sql/source/003_ingestion_metadata.sql`](../sql/source/003_ingestion_metadata.sql)
 for the schema. This is a deliberate case of building the metadata layer
 once, correctly, rather than retrofitting it when incremental load
-(Section 15) needs it.
+(Section 15) needs it. See [Section 16](#16-checkpointing-) for the
+dedicated deep-dive on checkpointing itself, once both load types have
+made checkpoint recovery observable.
 
 ---
 
@@ -3635,6 +3637,1164 @@ this mechanism was never designed to look for that in the first place.
 
 ---
 
+## 16. Checkpointing ✅✅
+
+### 16.1 Concept
+
+A **checkpoint** is a durable record of whether one specific run of a
+pipeline completed, currently in progress, or failed — independent of
+watermarks, and independent of what the run actually produced. This repo's
+checkpoint is the `status` column on `ingestion_metadata`
+(`'running'` → `'success'` or `'failed'`), one row per run, written
+*before* extraction starts (`status='running'`) and updated exactly once
+more when the run ends. Sections 14 and 15 already used this mechanism —
+every `run_full_load` and `run_incremental_load` call is checkpointed —
+but always in service of watermarking or idempotency, never as the subject
+itself. This section is that dedicated treatment: what a checkpoint is
+*for*, on its own; what "stale" means for one; and the gap named as far
+back as Section 15.8's Production Considerations table
+("`ingestion_metadata` has no automated stale-`running`-row alerting") —
+closed in this increment by `metadata.find_stale_running_runs` and the new
+`check-stale-runs` CLI command.
+
+### Why does this exist?
+
+Without a checkpoint, "did this run finish?" has no answer that survives a
+crash. A batch job's own process exiting non-zero is a fine signal *while
+the process is still running and something is watching it* — but the
+moment the process itself is killed (OOM, a spot-instance eviction, a
+`kubectl delete pod`, a laptop losing power mid-run), there's no process
+left to report anything. A checkpoint answers the question a different
+way: **write down the intent before doing the work, and update the record
+only on definite success or definite failure.** Anyone querying
+`ingestion_metadata` later — a human debugging, an orchestrator deciding
+whether to retry, a monitoring job — reconstructs exactly what happened
+from the row itself, with no dependency on the crashed process still being
+around to explain itself.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+Imagine a nightly job that copies files from server A to server B. With no
+checkpoint: the job runs, copies file 3 of 10, and the machine loses power.
+Tomorrow, nobody — not a human, not a script — can tell from server B alone
+whether last night's job completed, partially completed, or never started;
+inspecting file counts on B is a guess, not a fact, since a legitimately
+completed prior run and a half-finished one can look identical from the
+destination's point of view. With a checkpoint: a `runs` table gets a row
+the instant the job starts (`status='running'`), and a second update the
+instant it finishes (`status='done'`) or fails. A row still `status='running'`
+the next morning is now a *fact*, not a guess — the job crashed mid-flight,
+full stop, and whoever finds that row knows to investigate rather than
+assume.
+
+### URL Shortener Example
+
+Concretely, in this repo: `metadata.start_run(engine, pipeline_name,
+table_name, load_type)` inserts a row with `status='running'` and a real
+`started_at` timestamp *before* `extract_full`/`extract_incremental` ever
+touches the database. If the ingestion process is killed by, say, an OOM
+kill while `pd.read_sql_table` is mid-scan on a large `clicks` table, that
+row is left exactly as it was written: `status='running'`, `completed_at`
+still `NULL`. Nothing updates it, because nothing is left running to update
+it. Section 14.7 and 15.7 already walked through what this means for the
+*specific* run that crashed (its watermark/Bronze object never gets
+promoted); this section is about the row itself, sitting there
+indefinitely, until something notices it.
+
+### 16.2 Architecture
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │            ingestion_metadata            │
+                    │                                           │
+  start_run() ─────▶│  INSERT status='running', started_at=now │
+                    │                                           │
+                    │        (extraction + Bronze write         │
+                    │         happen HERE, outside the table)   │
+                    │                                           │
+finish_run_success()│  UPDATE status='success', bronze_key,     │
+      ─────────────▶│         watermark_end, completed_at       │
+                    │                                           │
+ finish_run_failure()│ UPDATE status='failed', error_message,   │
+      ─────────────▶│         completed_at                      │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       │  a crash between start_run()
+                                       │  and either finish_run_*()
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │  row permanently stuck at status='running'│
+                    │  (nothing left to update it)               │
+                    └─────────────────────────────────────────┘
+                                       │
+                     find_stale_running_runs(engine,
+                       max_runtime_minutes=60)
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │  check-stale-runs CLI: logs each one,      │
+                    │  exits 1 — wire into a monitoring cron     │
+                    └─────────────────────────────────────────┘
+```
+
+The checkpoint write is deliberately *outside* the extraction/write
+transaction — `start_run` commits and returns before `extract_full` or
+`extract_incremental` ever runs. This is what makes the `status='running'`
+row observable *while the run is still in progress*, not just after it
+ends; a checkpoint that only got written at the end wouldn't distinguish
+"still running, legitimately" from "crashed," which is the entire point
+of having one.
+
+### 16.3 Design Decision: detect staleness by elapsed time, not by a heartbeat
+
+**Context:** a `status='running'` row could mean two very different
+things — a run that's still legitimately in progress (a large `clicks`
+full load can take real wall-clock time), or a run that crashed. Something
+needs to tell these apart without a human eyeballing timestamps by hand.
+**Decision:** `find_stale_running_runs(engine, max_runtime_minutes=60)`
+treats any `'running'` row whose `started_at` is older than
+`max_runtime_minutes` ago as stale — a single, simple threshold, no
+heartbeat mechanism. **Alternatives considered:** (1) a periodic
+heartbeat, where a long-running process updates its own row every N
+seconds to prove it's still alive, and a row is stale only if its
+heartbeat has also gone quiet; (2) a distributed lock / lease (e.g. a
+Postgres advisory lock held for the run's duration), where staleness is
+"the lock is free but the row says running" instead of elapsed time at
+all. **Trade-offs:** a heartbeat correctly distinguishes "still running,
+slowly" from "crashed" even for a run that legitimately takes longer than
+`max_runtime_minutes` — this threshold approach cannot make that
+distinction and will misclassify a genuinely slow-but-healthy run as
+stale. In exchange, the threshold approach needs no changes to the running
+process itself (`start_run`/`finish_run_success`/`finish_run_failure`
+already existed, unchanged, from Sections 14-15) and no extra
+infrastructure (no lock manager, no separate heartbeat writer thread) —
+it's a single read-only query over data this table already has.
+**Consequences:** `max_runtime_minutes` must be set to something
+meaningfully larger than this pipeline's slowest *legitimate* run (a full
+load of the largest configured table, under realistic load) — set it too
+low and `check-stale-runs` produces false positives; the guide's Section
+16.7 Production Considerations table names this directly as an operational
+tuning parameter, not a fixed constant.
+
+### Alternatives
+
+Covered above as part of the Design Decision — repeated here per this
+guide's template: heartbeat-based liveness, and lock/lease-based liveness,
+both rejected in favor of the simpler elapsed-time threshold for this
+project's current scale and operational maturity (no orchestrator, no
+distributed workers yet — see Section 13.1's explicit scope boundary).
+
+### Trade-offs
+
+| | Elapsed-time threshold (chosen) | Heartbeat | Lock/lease |
+|---|---|---|---|
+| Distinguishes "slow but healthy" from "crashed" | No — a threshold is a guess, tuned by hand | Yes, precisely | Yes, precisely |
+| Infra required | None — one query | A writer thread/process per run, updating its own row | A lock manager (Postgres advisory locks work; needs care around connection lifetime) |
+| Implementation cost (this repo) | One function, ~15 lines | Would touch every `run_*_load` function | Would touch every `run_*_load` function and add a new failure mode (lock never released) |
+| Right fit for this project's current scale | Yes | Overkill — no long-running or highly-variable-duration jobs yet | Overkill — no concurrent workers to arbitrate between yet |
+
+### 16.4 Implementation
+
+**Implementation Guide vs. Reference Implementation:** as in Sections 14-15,
+read the *Implementation Guide* paragraph, close the guide, write the
+function yourself against the stated signature, then compare.
+
+---
+
+**CREATE:** (edit) `ingestion/src/url_shortener_analytics/metadata.py` —
+`find_stale_running_runs`
+
+**PURPOSE:** Query for every checkpoint row that's almost certainly a
+crashed run, so an operator or a monitoring job can find out without
+manually inspecting `ingestion_metadata`.
+
+**DEPENDENCIES:** nothing new — the same `Engine`/`text()` pattern every
+other function in this module already uses.
+
+**IMPLEMENTATION GUIDE (write it yourself):** the query itself is simple —
+`SELECT ... FROM ingestion_metadata WHERE status = 'running' AND started_at
+< :cutoff`, optionally `AND pipeline_name = :pipeline_name`. The one
+genuine design decision is *where* `:cutoff` gets computed. Two options:
+`started_at < now() - interval '60 minutes'` entirely in SQL, or `cutoff =
+datetime.now(UTC) - timedelta(minutes=60)` in Python, passed as a bound
+parameter. Pick the second — and before reading further, work out why.
+(Answer: this function is unit-tested against SQLite, whose SQL dialect
+has no `interval` syntax at all, and used against Postgres in production.
+Computing the cutoff in Python and binding it as a plain timestamp works
+identically against both dialects; this is the exact same
+cross-dialect-portability reasoning `contracts.py`'s `_categorize_type`
+used in Section 12.2 for comparing reflected column types instead of raw
+SQL type strings — the same lesson, applied a second time, in a different
+part of the codebase.)
+
+**REFERENCE IMPLEMENTATION:**
+
+```python
+# ingestion/src/url_shortener_analytics/metadata.py (excerpt)
+
+def find_stale_running_runs(
+    engine: Engine, *, max_runtime_minutes: int = 60, pipeline_name: str | None = None
+) -> list[dict[str, Any]]:
+    cutoff = datetime.now(UTC) - timedelta(minutes=max_runtime_minutes)
+    query = """
+        SELECT run_id, pipeline_name, source_table, load_type, started_at
+        FROM ingestion_metadata
+        WHERE status = 'running' AND started_at < :cutoff
+    """
+    params: dict[str, Any] = {"cutoff": cutoff}
+    if pipeline_name is not None:
+        query += " AND pipeline_name = :pipeline_name"
+        params["pipeline_name"] = pipeline_name
+    query += " ORDER BY started_at ASC"
+
+    with engine.begin() as conn:
+        rows = conn.execute(text(query), params).fetchall()
+    return [
+        {"run_id": r.run_id, "pipeline_name": r.pipeline_name, "source_table": r.source_table,
+         "load_type": r.load_type, "started_at": r.started_at}
+        for r in rows
+    ]
+```
+
+Full file (with the existing `start_run`/`finish_run_success`/
+`finish_run_failure`/`get_last_watermark` this section builds on):
+[`ingestion/src/url_shortener_analytics/metadata.py`](../ingestion/src/url_shortener_analytics/metadata.py).
+
+**RUN:** `make check-stale-runs` (wraps `python -m
+url_shortener_analytics.cli check-stale-runs --max-runtime-minutes 60`)
+
+**VERIFY:** `PGPASSWORD=analytics psql -h localhost -U analytics -d
+analytics -c "SELECT run_id, source_table, started_at FROM
+ingestion_metadata WHERE status='running';"` — compare against what
+`check-stale-runs` reports.
+
+**EXPECTED:** with no crashed runs, `check-stale-runs` logs "no stale
+running runs found" and exits 0. With a genuinely stuck row (LAB 12
+below), it logs one `"stale running run"` warning per row and exits 1.
+
+**TEST:** `ingestion/tests/unit/test_metadata.py` — five new tests:
+finds-a-genuinely-stale-run, excludes-a-run-within-the-cutoff,
+excludes-success-and-failed-rows (only `status='running'` counts —
+completed rows of either outcome are not "stale," by definition),
+pipeline-name filtering, plus the pre-existing suite this section didn't
+touch.
+
+**PRODUCTION CONSIDERATIONS:** see Section 16.7.
+
+**INTERVIEW QUESTIONS:** see Section 16.9.
+
+---
+
+**CREATE:** (edit) `ingestion/src/url_shortener_analytics/cli.py` —
+`check_stale_runs_command` / `check-stale-runs` subcommand
+
+**PURPOSE:** Surface `find_stale_running_runs` as something a cron job or
+an orchestrator step can actually call and alert on.
+
+**IMPLEMENTATION GUIDE (write it yourself):** follow this file's
+established pattern exactly (see `validate_contracts_command` for the
+closest precedent): build `settings`/`engine`, call
+`metadata.find_stale_running_runs(...)`, log a warning per stale run
+found, and return `1` if any were found, `0` otherwise — the exit code is
+what makes this wireable into automated alerting (a non-zero exit from a
+cron step is the universal "something's wrong" signal).
+
+**REFERENCE IMPLEMENTATION:**
+
+```python
+# ingestion/src/url_shortener_analytics/cli.py (excerpt)
+
+def check_stale_runs_command(max_runtime_minutes: int = 60) -> int:
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    engine = engine_from_settings(settings)
+
+    stale = metadata.find_stale_running_runs(engine, max_runtime_minutes=max_runtime_minutes)
+    if not stale:
+        logger.info("no stale running runs found", extra={"max_runtime_minutes": max_runtime_minutes})
+        return 0
+    for run in stale:
+        logger.warning("stale running run", extra={**run, "started_at": str(run["started_at"])})
+    logger.error("stale running runs found", extra={"count": len(stale)})
+    return 1
+```
+
+Full file: [`ingestion/src/url_shortener_analytics/cli.py`](../ingestion/src/url_shortener_analytics/cli.py).
+
+**RUN / VERIFY / EXPECTED:** see the block above — identical, since this
+*is* the CLI wrapper around it.
+
+**TEST:** exercised indirectly by `test_metadata.py`'s coverage of the
+underlying function; `cli.py`'s command functions themselves are thin
+enough (settings → engine → one function call → log/exit) that this repo
+does not unit-test the CLI layer separately, consistent with how
+`run_command`/`run_full_load_command`/`validate_contracts_command` are
+already treated in Sections 14-15 — see Section 16.7's Production
+Considerations table for what a production monitoring setup adds on top
+of this.
+
+**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections 16.7/16.9.
+
+---
+
+### Hands-on Challenge (implement-yourself)
+
+Before LAB 12 below, try this without looking at `metadata.py`: write a
+SQL query (not Python — raw SQL) that does what `find_stale_running_runs`
+does, using Postgres's own `now() - interval '60 minutes'` instead of a
+bound parameter. Run it directly with `psql`. Then answer: why does this
+guide's actual implementation deliberately avoid the syntax you just used?
+(You already have the answer from 16.4's Implementation Guide — this
+exercise is about *feeling* the portability cost firsthand: try running
+your `interval`-based query against the SQLite `sqlite_engine` fixture in
+`ingestion/tests/unit/conftest.py` and watch it fail outright, since
+SQLite has no `interval` syntax at all.)
+
+### 16.5 Hands-on Exercise
+
+**LAB 12 — Manufacture a stale run and detect it.**
+
+Prerequisites: a running Postgres reachable at `DATABASE_URL` (real
+`docker compose`, or the local Postgres 16 this guide has used directly in
+this sandbox — see Section 16.6 below for exactly which one this lab was
+run against).
+
+```bash
+# 1. Start a run's checkpoint (simulating a process that's about to crash)
+python3 -c "
+from url_shortener_analytics.config import get_settings
+from url_shortener_analytics.db import engine_from_settings
+from url_shortener_analytics import metadata
+engine = engine_from_settings(get_settings())
+run_id = metadata.start_run(engine, 'lab12_pipeline', 'clicks', load_type='full')
+print('started', run_id)
+"
+
+# 2. Confirm check-stale-runs does NOT flag it yet (started seconds ago)
+make check-stale-runs   # exits 0 -- "no stale running runs found"
+
+# 3. Backdate it to simulate a crash 90 minutes ago
+psql "$DATABASE_URL" -c "
+  UPDATE ingestion_metadata
+  SET started_at = now() - interval '90 minutes'
+  WHERE pipeline_name = 'lab12_pipeline'
+"
+
+# 4. Now check-stale-runs finds it
+make check-stale-runs   # exits 1 -- one "stale running run" warning logged
+echo $?                 # 1
+```
+
+What to observe: `check-stale-runs`'s exit code flips from 0 to 1 purely
+because of the backdated `started_at` — nothing else about the row
+changed. This is the exact mechanism a production alerting rule would
+watch (`echo $? != 0` in a cron wrapper, or a dedicated Airflow sensor task
+in Phase 3+).
+
+### 16.6 How to test
+
+```bash
+make test                # unit: SQLite, no Docker needed
+```
+
+The full unit suite (59 tests — up from 38 at the end of the Section 7-12
+increment, 21 new: 8 for `find_stale_running_runs`/bronze-key persistence
+in `test_metadata.py`, 5 for `head_object`/`list_bronze_keys` in
+`test_object_store.py`, 9 in the new `test_reconciliation.py` covering
+Section 17 below) was run in this environment while writing this section
+and genuinely passed — ACTUAL OBSERVED, not a projection:
+
+```
+59 passed in 6.96s
+```
+
+`find_stale_running_runs` and `list_successful_bronze_keys` were also
+genuinely exercised against this sandbox's real (non-Docker) local
+Postgres 16 — not just SQLite — directly with SQLAlchemy against
+`postgresql+psycopg2://analytics:analytics@localhost:5432/analytics`: a
+run's `bronze_key` really does persist and round-trip through
+`list_successful_bronze_keys`; a row's `started_at` backdated 90 minutes
+really is picked up by `find_stale_running_runs(max_runtime_minutes=60)`
+and a fresh row genuinely is excluded; deleting the verification rows
+afterward left the table exactly as it was before. One genuine,
+previously-undiscovered cross-dialect wrinkle surfaced doing this: a
+Postgres `uuid` column round-trips as a Python `uuid.UUID` object through
+a raw `SELECT`, while this same table's SQLite unit-test fixture (`run_id
+TEXT PRIMARY KEY`) round-trips it as a plain `str` — comparing a
+`find_stale_running_runs` result's `run_id` against the `str` returned by
+`start_run` needs an explicit `str(...)` cast when reading it back from
+real Postgres, even though the SQLite-backed unit tests never need one.
+This is exactly the kind of dialect difference `contracts.py`'s coarse
+type categories (Section 12.2) exist to paper over at the *schema* level —
+this is the same class of issue showing up one level down, at the
+*driver's Python type mapping* level, which no amount of coarse-category
+schema comparison would have caught, because it isn't a schema mismatch at
+all.
+
+**Not yet executed:** an integration test exercising `check-stale-runs`
+against real Docker infrastructure end-to-end (CLI process → real
+Postgres) — there is no Docker daemon in this sandbox; the function-level
+logic above was verified against real Postgres directly, but the full
+`make check-stale-runs` CLI invocation itself remains a DESIGN
+EXPECTATION for the reader to confirm with `make up`.
+
+### 16.7 Failure Scenario
+
+**What happens if `max_runtime_minutes` is set too low relative to this
+pipeline's actual slowest legitimate run?**
+
+Concretely: suppose a full load of `clicks` genuinely takes 75 minutes
+once its row count grows large enough (Section 14's POC-simplified
+single-query extraction, per its own Production Considerations table, has
+no chunking — a big enough table means a long, memory-bound, single scan),
+and `check-stale-runs` runs on a 60-minute threshold. At minute 61 of a
+perfectly healthy, still-executing run, `check-stale-runs` reports it as
+stale — a false positive. If this is wired into paging (Section 16's
+"Production Considerations" below), an on-call engineer gets woken up for
+nothing, investigates, finds the run is fine, and — the real cost — starts
+trusting this alert less the next time it fires. This is precisely why
+16.3's Design Decision names the threshold as a tuned operational
+parameter, not a fixed constant: it must be set above the pipeline's
+actual p99 run duration under realistic load, with margin, and revisited
+as data volume grows. The heartbeat/lock alternatives from 16.3 don't have
+this specific failure mode (they detect "still alive" directly, rather
+than inferring it from elapsed time) — this is the sharpest, most concrete
+way to state what this design decision actually costs.
+
+**The inverse also matters:** a threshold set too *high* delays detecting
+a genuinely crashed run — the stale row sits unnoticed for longer, and
+whatever depended on this table's freshness (a downstream dashboard, in
+Phase 2+) stays silently stale for that much longer too. There's no value
+of `max_runtime_minutes` that's simply "correct" — only a value that's
+appropriately tuned to this specific pipeline's actual behavior, which is
+exactly the kind of judgment call a principal engineer is expected to make
+explicitly rather than leave at a framework's default.
+
+### 16.8 Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| Staleness detection | Elapsed-time threshold, one manual `check-stale-runs` invocation | Same threshold *and* a heartbeat for long-running jobs, to eliminate the false-positive failure mode above |
+| Alerting | None wired up — `check-stale-runs`'s exit code is the entire interface | A monitoring cron (or Airflow sensor) runs `check-stale-runs` on a schedule and pages on-call on a non-zero exit |
+| Auto-remediation | None — a stale row sits until a human runs `check-stale-runs` and investigates | Some shops auto-mark a sufficiently-stale `running` row as `failed` after alerting fires, so a retry can be scheduled automatically without waiting on a human |
+| Threshold tuning | A single global default (60 minutes), overridable per invocation via `--max-runtime-minutes` | Tuned per pipeline/table, ideally derived from observed p99 run duration rather than a guessed constant |
+| Scope | This repo's own `ingestion_metadata` only | A real platform often centralizes checkpoint/run-state across many pipelines in one place (e.g. Airflow's own metadata database, or a dedicated observability platform) rather than one table per pipeline |
+
+### Principal Data Engineer Perspective
+
+The judgment call worth being able to defend here is naming the exact
+condition under which the chosen detection mechanism gives a wrong answer
+— not claiming it never does. Section 16.7's false-positive scenario is
+the single most likely way this exact code, deployed as-is, would produce
+a bad on-call experience in a real environment; a principal engineer
+ships the elapsed-time threshold (it's the right choice for this project's
+current scale, per 16.3's trade-off table) *and* writes down, in the same
+breath, what would have to be true for it to misfire and what the fix
+would look like when that day comes (a heartbeat, or at minimum a
+per-pipeline threshold instead of one global default). The second thing
+worth flagging: this is a genuinely small function — one query, no new
+infrastructure — precisely because the checkpoint mechanism it builds on
+(`start_run`/`finish_run_success`/`finish_run_failure`) was already
+correct from Section 14 onward. Closing an operational gap ("no
+stale-run alerting") cheaply, by adding a query over data that was already
+being durably recorded for other reasons, rather than by retrofitting new
+instrumentation everywhere, is exactly the payoff of building the
+metadata layer correctly and completely on day one (Section 13.3's stated
+reasoning) instead of adding fields to it piecemeal as each new need
+arises.
+
+### 16.9 Principal Engineer Interview Questions
+
+**Q: "Your staleness check uses a fixed time threshold. What's the
+specific failure mode of that approach, and how would you detect it in
+production before it causes a false alert?"**
+
+*What's tested:* whether the candidate can reason about a monitoring
+mechanism's own failure modes, not just describe what it detects when
+working correctly.
+
+*What a weak answer looks like:* "It might not be perfectly accurate" —
+true but not specific enough to show real understanding.
+
+*What a strong answer covers:* a threshold-based check cannot distinguish
+a genuinely slow-but-healthy run from a crashed one — if the threshold is
+set below the pipeline's actual worst-case legitimate duration, every
+sufficiently slow run gets misreported as stale. Detecting this in
+production: track actual run durations for `status='success'` rows over
+time (this repo's `ingestion_metadata` already has `started_at` and
+`completed_at` for exactly this), alert if the threshold is within some
+margin of the observed p99, and prefer a heartbeat mechanism once a
+pipeline's duration variance gets large enough that no single fixed
+threshold cleanly separates "slow" from "crashed."
+
+*Concepts:* liveness detection, false positives vs. false negatives in
+monitoring, threshold tuning from observed data rather than a guess.
+
+*Expected follow-up:* "Why not just use a heartbeat from the start?" —
+Because it's real added complexity (every long-running process needs to
+write its own liveness signal) that this project's current scale doesn't
+yet justify; see 16.3's full trade-off reasoning.
+
+*Common mistake:* answering only "make the threshold bigger" without
+naming the corresponding cost (slower detection of a genuinely crashed
+run) — treating this as a knob with no trade-off, rather than a real
+one.
+
+**Q: "Why is the checkpoint row written *before* extraction starts,
+rather than only once at the end with the final status?"**
+
+*What's tested:* whether the candidate understands what a checkpoint
+mechanism is actually for — specifically, why "was this ever attempted"
+needs to be observable independently of "did it succeed."
+
+*What a weak answer looks like:* "So you can log that it started" — not
+wrong, but misses the actual point.
+
+*What a strong answer covers:* if the row were only written at the end, a
+process crashing mid-run would leave **no record at all** that anything
+was attempted — not even a `'failed'` row, since nothing survives to write
+one. Writing `status='running'` before any real work begins turns "no
+information" into "a fact, even in the crash case": a row that never
+transitions out of `'running'` *is itself* the evidence of a crash. This
+is precisely what makes `find_stale_running_runs` possible at all — it has
+nothing to query if the checkpoint's initial write never happened.
+
+*Concepts:* observability of failure, not just success; the specific
+value of writing intent durably before doing risky work.
+
+*Expected follow-up:* "What if the `start_run` INSERT itself fails or the
+process crashes between opening a connection and committing it?" — Then
+there's genuinely no record, which is an acceptable, narrower gap than the
+one this design closes: it requires the crash to happen in a much smaller
+window (before a single `INSERT` commits) than "anywhere during the
+entire extraction and write").
+
+*Common mistake:* conflating "the checkpoint mechanism" with "logging" —
+a log line printed at the start of a run is not durable evidence the same
+way a committed database row is; a log line and its process can both
+disappear together in a real crash.
+
+---
+
+## 17. Idempotency ✅✅
+
+### 17.1 Concept
+
+An operation is **idempotent** if running it more than once, with the same
+inputs, produces the same result as running it exactly once — no
+duplicates, no double-counting, nothing left in a different state than a
+single successful run would have left it in. Sections 14 and 15 already
+built this: `build_bronze_key`/`build_bronze_incremental_key` compute a
+*deterministic* Bronze object key from a run's own inputs, so a rerun
+overwrites the same object rather than writing a new one. This section is
+the dedicated treatment of what idempotency is actually protecting against
+and, critically, two things it does *not* automatically guarantee on its
+own: (1) that the control plane's own record of what was written
+(`ingestion_metadata`) stays in sync with what's actually in Bronze, and
+(2) full coverage of every retry scenario — Section 15.7 already documents
+one residual edge case where idempotency's guarantee narrows. This
+section adds the `bronze_key` column and `reconciliation.py`, which
+together close the "does the record match reality" half of the gap.
+
+### Why does this exist?
+
+Retries are unavoidable in any real pipeline — a network blip, a
+transient MinIO error, an orchestrator retrying a failed task
+automatically. Without idempotency, every retry risks corrupting the
+result it's supposed to be fixing: a non-idempotent write on retry either
+duplicates data (two Bronze objects for what should be one run's output)
+or, worse, silently does the wrong thing depending on what state the
+first, failed attempt left behind. Idempotency turns "is it safe to just
+retry this?" from a case-by-case judgment call into a property that's true
+by construction, for every retry, without an operator needing to reason
+about exactly where the previous attempt failed.
+
+But idempotent *writes* alone don't guarantee the *system as a whole*
+never drifts — a manually uploaded object, a retried run that (per Section
+15.7) lands a non-overlapping duplicate, or an object deleted by something
+outside this pipeline entirely, can each cause `ingestion_metadata` and
+the real contents of the Bronze bucket to disagree with each other, even
+though every individual write was idempotent. Reconciliation — this
+section's second new piece — is the check that catches *that* kind of
+drift, which idempotent writes alone were never designed to catch.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+A generic "safe retry" example: an API endpoint that creates an order.
+`POST /orders` with no idempotency key: retrying a request that actually
+succeeded, but whose response was lost to a network error, creates a
+*second* order — a real, costly bug (the customer gets charged twice).
+The fix: the client sends a client-generated `idempotency_key` with every
+request; the server checks "have I already processed this exact key?"
+before creating anything, and if so, returns the *original* result instead
+of creating a duplicate. The deterministic Bronze key in this repo plays
+exactly the `idempotency_key`'s role — except here, the key is derived
+from the request's own content (`table_name`, date or watermark range)
+rather than being a separately generated token, because this pipeline's
+retries are always exact reruns of the same logical unit of work, not
+independent client requests that happen to repeat.
+
+### URL Shortener Example
+
+`build_bronze_key("clicks", run_date)` returns
+`bronze/clicks/ingestion_date=2026-09-19/clicks.parquet` — the exact same
+string no matter how many times `make ingest-full` runs today. A retry
+after a transient MinIO error, or a deliberate manual rerun, calls
+`put_object` with that same key again; S3-compatible object storage
+treats a `PUT` to an existing key as a plain overwrite, so the *object
+itself* is exactly as if only the last successful write had ever
+happened. What's new in *this* section: since this increment,
+`finish_run_success` also records that exact key on the `ingestion_metadata`
+row (`bronze_key` column, `sql/source/003_ingestion_metadata.sql`) — so
+the control plane doesn't just idempotently *write* the object, it also
+durably *remembers* what it wrote, which is the piece reconciliation
+depends on.
+
+### 17.2 Architecture
+
+```
+ run_full_load() / run_incremental_load()
+        │
+        ├─▶ key = build_bronze_key(...) / build_bronze_incremental_key(...)
+        │        (deterministic -- same inputs, same key, every time)
+        │
+        ├─▶ s3_client.put_object(Key=key, ...)     ──▶  Bronze (MinIO/S3)
+        │        (overwrite-safe: a retry with the same key clobbers
+        │         cleanly instead of duplicating)
+        │
+        └─▶ metadata.finish_run_success(..., bronze_key=key)
+                 (NEW this increment -- durably records the key on the
+                  ingestion_metadata row itself, not just written to
+                  Bronze and then "trusted" to have happened)
+
+ reconciliation.reconcile_bronze(engine, s3_client, bucket, pipeline_name)
+        │
+        ├─▶ actual  = object_store.list_bronze_keys(s3_client, bucket)
+        │              (what's REALLY in the bucket right now)
+        │
+        ├─▶ known   = metadata.list_successful_bronze_keys(engine, ...)
+        │              (what ingestion_metadata BELIEVES was written)
+        │
+        ├─▶ orphaned = actual - known   (exists, nobody recorded writing it)
+        └─▶ missing  = known - actual   (recorded as written, doesn't exist)
+```
+
+Idempotent writes (the top block) and reconciliation (the bottom block)
+are deliberately separate mechanisms, checked at different times, for
+different failure classes: the top block makes a *single run's own retry*
+safe; the bottom block detects drift that accumulates from *anything
+else* — a manual object upload, an out-of-band deletion, or the Section
+15.7 edge case where two runs' outputs legitimately don't collide but one
+of them still didn't get recorded correctly.
+
+### 17.3 Design Decision: store the Bronze key explicitly, don't recompute it
+
+**Context:** reconciliation needs to know, for every successful run, what
+key it wrote to Bronze — but `ingestion_metadata` never stored this before
+this increment. **Decision:** add a `bronze_key` column, set explicitly by
+`finish_run_success(..., bronze_key=key)` at the moment a run succeeds.
+**Alternatives considered:** recompute the expected key later, on demand,
+from `source_table`, `started_at` (for a full load — reusing
+`build_bronze_key`'s date-only granularity) and `watermark_start`/
+`watermark_end` (for an incremental load — reusing
+`build_bronze_incremental_key`). **Trade-offs:** recomputation needs no
+new column and would work *today* — but it depends on the exact key-building
+logic never changing behavior for historical rows (`build_bronze_key`
+already changing its date-formatting convention, for instance, would
+silently break reconciliation for every run recorded before the change),
+and would additionally require persisting `watermark_start` too, which
+`ingestion_metadata` also didn't store before this increment — so
+"cheaper, no new column" wasn't actually true once traced through
+fully. Storing the key explicitly instead means "what actually
+happened" is what's compared, always, regardless of how the key-building
+functions evolve later — a strictly more robust invariant, at the cost of
+one new nullable column. **Consequences:** `bronze_key` is `NULL` for a
+run that succeeded but wrote nothing (the no-op incremental path — see
+Section 15's empty-batch handling) — `list_successful_bronze_keys`
+explicitly filters `WHERE bronze_key IS NOT NULL`, so a no-op success is
+correctly never treated as "should exist in Bronze but doesn't."
+
+### Alternatives
+
+Covered above. A third, more minor alternative also considered and
+rejected: making `bronze_key` a required (`NOT NULL`) column with a
+sentinel value for no-op runs, instead of a genuinely nullable one —
+rejected because a sentinel string is a magic value a future reader has to
+learn the meaning of, where SQL `NULL` already means exactly "no value" by
+construction, and `list_successful_bronze_keys`'s `IS NOT NULL` filter
+reads as self-explanatory.
+
+### Trade-offs
+
+| | Store explicitly (chosen) | Recompute on demand |
+|---|---|---|
+| Correctness if key-building logic changes later | Unaffected — every row remembers its own actual key | Silently wrong for every historical row once the logic changes |
+| Schema cost | One new nullable column | None |
+| Needs `watermark_start` persisted too | No | Yes, for incremental runs (also not previously stored) |
+| Conceptual model | "What actually happened" | "What should have happened, assuming today's logic always applied" |
+
+### 17.4 Implementation
+
+---
+
+**CREATE:** (edit) `sql/source/003_ingestion_metadata.sql`,
+`ingestion/src/url_shortener_analytics/metadata.py` — `bronze_key` column
+and its plumbing
+
+**PURPOSE:** Durably record the exact object key a successful run wrote,
+so reconciliation has a real, per-run source of truth to compare storage
+against.
+
+**DEPENDENCIES:** none new.
+
+**IMPLEMENTATION GUIDE (write it yourself):** add `bronze_key VARCHAR(512)`
+to `ingestion_metadata`'s `CREATE TABLE` — and, since this table may
+already exist in a running dev database from an earlier increment (this
+sandbox's own local Postgres included), also add an idempotent-safe
+`ALTER TABLE ingestion_metadata ADD COLUMN IF NOT EXISTS bronze_key
+VARCHAR(512);` right after it (a fresh `docker compose up` picks up the
+`CREATE TABLE` version automatically; an already-running database needs
+the `ALTER TABLE` instead, since `docker-entrypoint-initdb.d` scripts only
+ever run once, on first container init). Then thread a new optional
+`bronze_key: str | None = None` keyword argument through
+`finish_run_success`, add it to the `UPDATE ... SET` statement, and update
+both `run_full_load` and `run_incremental_load`'s *successful, non-empty*
+call sites to pass `bronze_key=key`. Leave the no-op incremental path's
+call (`rows_read=0, rows_written=0`) unchanged — it must default to
+`None`, since nothing was written.
+
+**REFERENCE IMPLEMENTATION:**
+
+```python
+# ingestion/src/url_shortener_analytics/metadata.py (excerpt)
+
+def finish_run_success(
+    engine: Engine, run_id: str, *, rows_read: int, rows_written: int,
+    watermark_end: int | None = None, bronze_key: str | None = None,
+) -> None:
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE ingestion_metadata
+            SET status = 'success', rows_read = :rows_read, rows_written = :rows_written,
+                watermark_end = :watermark_end, bronze_key = :bronze_key, completed_at = :completed_at
+            WHERE run_id = :run_id
+        """), {"run_id": run_id, "rows_read": rows_read, "rows_written": rows_written,
+                "watermark_end": watermark_end, "bronze_key": bronze_key,
+                "completed_at": datetime.now(UTC)})
+```
+
+```sql
+-- sql/source/003_ingestion_metadata.sql (excerpt)
+ALTER TABLE ingestion_metadata ADD COLUMN IF NOT EXISTS bronze_key VARCHAR(512);
+```
+
+Full files: [`metadata.py`](../ingestion/src/url_shortener_analytics/metadata.py),
+[`003_ingestion_metadata.sql`](../sql/source/003_ingestion_metadata.sql),
+[`extract_full.py`](../ingestion/src/url_shortener_analytics/extract_full.py),
+[`extract_incremental.py`](../ingestion/src/url_shortener_analytics/extract_incremental.py).
+
+**RUN:** `make ingest-full` or `make ingest`, then inspect the row it
+created.
+
+**VERIFY:** `psql "$DATABASE_URL" -c "SELECT source_table, status,
+bronze_key FROM ingestion_metadata ORDER BY started_at DESC LIMIT 5;"`
+
+**EXPECTED:** every `status='success'` row for a *non-empty* run has a
+non-`NULL` `bronze_key` matching the object actually written; a no-op
+incremental success has `bronze_key IS NULL`.
+
+**TEST:** `test_metadata.py` (bronze-key persistence and its `NULL`
+default), `test_extract_full.py`/`test_extract_incremental.py` (bronze-key
+recorded end-to-end, including staying `NULL` on the no-op path).
+
+---
+
+**CREATE:** (edit) `ingestion/src/url_shortener_analytics/object_store.py`
+— `list_bronze_keys`
+
+**PURPOSE:** The object store's own, independent view of what actually
+exists — the other half of what reconciliation compares.
+
+**IMPLEMENTATION GUIDE (write it yourself):** one call to
+`s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)`, returning
+`[obj["Key"] for obj in response.get("Contents", [])]` — use `.get(...,
+[])` rather than indexing `["Contents"]` directly, since an empty
+prefix/bucket omits the `"Contents"` key from the response entirely rather
+than returning it as an empty list.
+
+**REFERENCE IMPLEMENTATION:**
+
+```python
+# ingestion/src/url_shortener_analytics/object_store.py (excerpt)
+
+def list_bronze_keys(s3_client: BaseClient, bucket: str, prefix: str = "bronze/") -> list[str]:
+    """POC SIMPLIFICATION: a single list_objects_v2 call, capped at 1,000
+    keys (S3's per-call limit) -- no pagination. Production equivalent:
+    paginate with s3_client.get_paginator("list_objects_v2")."""
+    response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+    return [obj["Key"] for obj in response.get("Contents", [])]
+```
+
+**TEST:** `test_object_store.py` — two new tests (keys returned correctly;
+empty-prefix case returns `[]` rather than raising a `KeyError`).
+
+---
+
+**CREATE:** `ingestion/src/url_shortener_analytics/reconciliation.py`
+
+**PURPOSE:** Compare `ingestion_metadata`'s record of what this pipeline
+wrote against what actually exists in Bronze, surfacing exactly two kinds
+of drift.
+
+**DEPENDENCIES:** `metadata.list_successful_bronze_keys`,
+`object_store.list_bronze_keys`/`head_object`.
+
+**IMPLEMENTATION GUIDE (write it yourself):** two set-difference functions
+and one that combines them. `find_orphaned_bronze_objects`: `actual =
+set(list_bronze_keys(...))`, `known =
+set(metadata.list_successful_bronze_keys(...))`, return `sorted(actual -
+known)` — objects storage has that no successful run claims to have
+written. `find_missing_bronze_objects`: for every key
+`list_successful_bronze_keys` returns, call `head_object` and keep the
+ones where it returns `None` — keys the database believes exist but
+storage doesn't have. `reconcile_bronze`: call both, return them together
+in a small result object with a `clean` property (`True` only when both
+lists are empty). Resist the urge to make this one function that also
+*fixes* the drift it finds — detecting drift and deciding how to remediate
+it are different responsibilities; see Section 17.6's Failure Scenario for
+why automatic remediation here would be actively dangerous.
+
+**REFERENCE IMPLEMENTATION:**
+
+```python
+# ingestion/src/url_shortener_analytics/reconciliation.py (excerpt)
+
+@dataclass
+class ReconciliationResult:
+    orphaned_objects: list[str] = field(default_factory=list)
+    missing_objects: list[str] = field(default_factory=list)
+
+    @property
+    def clean(self) -> bool:
+        return not self.orphaned_objects and not self.missing_objects
+
+
+def find_orphaned_bronze_objects(engine, s3_client, bucket, pipeline_name=None, prefix="bronze/") -> list[str]:
+    actual_keys = set(list_bronze_keys(s3_client, bucket, prefix))
+    known_keys = set(metadata.list_successful_bronze_keys(engine, pipeline_name))
+    return sorted(actual_keys - known_keys)
+
+
+def find_missing_bronze_objects(engine, s3_client, bucket, pipeline_name=None) -> list[str]:
+    known_keys = metadata.list_successful_bronze_keys(engine, pipeline_name)
+    return sorted(key for key in known_keys if head_object(s3_client, bucket, key) is None)
+
+
+def reconcile_bronze(engine, s3_client, bucket, pipeline_name=None) -> ReconciliationResult:
+    return ReconciliationResult(
+        orphaned_objects=find_orphaned_bronze_objects(engine, s3_client, bucket, pipeline_name),
+        missing_objects=find_missing_bronze_objects(engine, s3_client, bucket, pipeline_name),
+    )
+```
+
+Full file: [`reconciliation.py`](../ingestion/src/url_shortener_analytics/reconciliation.py).
+
+**TEST:** new `test_reconciliation.py` — nine tests: the result object's
+`clean` property in both states, orphan detection, missing detection, and
+`reconcile_bronze` combining both, all against a mocked S3 client and the
+`sqlite_engine` fixture.
+
+---
+
+**CREATE:** (edit) `ingestion/src/url_shortener_analytics/cli.py` —
+`reconcile_bronze_command` / `reconcile-bronze` subcommand
+
+**PURPOSE:** Make reconciliation something an operator (or a scheduled
+job) can actually invoke.
+
+**REFERENCE IMPLEMENTATION:**
+
+```python
+# ingestion/src/url_shortener_analytics/cli.py (excerpt)
+
+def reconcile_bronze_command(config_path: Path = DEFAULT_PIPELINE_CONFIG) -> int:
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    config = _load_pipeline_config(config_path)
+    engine = engine_from_settings(settings)
+    s3_client = get_s3_client(settings)
+
+    result = reconcile_bronze(engine, s3_client, settings.minio_bucket, config["pipeline_name"])
+    for key in result.orphaned_objects:
+        logger.warning("orphaned bronze object", extra={"key": key})
+    for key in result.missing_objects:
+        logger.warning("missing bronze object", extra={"key": key})
+    if not result.clean:
+        logger.error("bronze reconciliation found drift",
+                      extra={"orphaned": len(result.orphaned_objects), "missing": len(result.missing_objects)})
+        return 1
+    logger.info("bronze reconciliation clean")
+    return 0
+```
+
+**RUN:** `make reconcile-bronze`
+
+**VERIFY:** manually upload a stray object to the bucket (`aws --endpoint
+... s3 cp` or the MinIO console) or delete one that `ingestion_metadata`
+recorded, then rerun `make reconcile-bronze`.
+
+**EXPECTED:** a stray, unrecorded object is reported under "orphaned
+bronze object"; a recorded-but-deleted object under "missing bronze
+object"; exit code 1 in either case, 0 when clean.
+
+**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections
+17.7/17.9.
+
+---
+
+### Hands-on Challenge (implement-yourself)
+
+Before LAB 13 below, try this without looking at `reconciliation.py`:
+using only `psql` and the MinIO console (or `aws s3 --endpoint-url ...
+ls`), *manually* find every orphaned and missing Bronze object for one
+table, by eye, comparing `SELECT bronze_key FROM ingestion_metadata WHERE
+status='success'` against the bucket listing. Time yourself. Then run
+`make reconcile-bronze` and compare. The point isn't that the manual
+version is hard for a handful of objects — it's that this exact by-hand
+comparison is what an operator would otherwise have to do, repeatedly,
+forever, without this section's code; automating a genuinely tedious,
+error-prone manual check is most of this feature's actual value.
+
+### 17.5 Hands-on Exercise
+
+**LAB 13 — Manufacture drift and detect it with `reconcile-bronze`.**
+
+Prerequisites: real MinIO reachable (`make up`), since this lab needs a
+real bucket to manually tamper with — this specific lab was **not**
+runnable in this sandbox (no MinIO here; see 17.6 below for what *was*
+genuinely verified instead).
+
+```bash
+make ingest-full                     # produces known, recorded Bronze objects
+make reconcile-bronze                # step 1: confirm clean -- exit 0
+
+# Manufacture an ORPHAN: upload a stray object nothing recorded
+aws --endpoint-url http://localhost:9000 s3 cp \
+  some_local_file.parquet s3://analytics-lake/bronze/clicks/manual-upload.parquet
+
+make reconcile-bronze                # step 2: reports the orphan, exit 1
+
+# Manufacture a MISSING object: delete a key ingestion_metadata still
+# believes exists
+aws --endpoint-url http://localhost:9000 s3 rm \
+  s3://analytics-lake/bronze/urls/ingestion_date=2026-09-19/urls.parquet
+
+make reconcile-bronze                # step 3: reports the orphan AND the
+                                      # missing object together, exit 1
+```
+
+*(DESIGN EXPECTATION for LAB 13's exact commands and output — run it
+yourself with real MinIO; see Section 17.6 for what this guide verified
+directly instead, against the underlying functions with a mocked S3
+client and real Postgres.)*
+
+### 17.6 How to test
+
+```bash
+make test                # unit: SQLite + mocked S3, no Docker needed
+```
+
+The full unit suite — 59 tests, genuinely run in this environment
+(`PYTHONPATH=ingestion/src python3 -m pytest ingestion/tests/unit -q`) —
+passed. ACTUAL OBSERVED:
+
+```
+59 passed in 6.96s
+```
+
+`test_reconciliation.py` specifically exercises `find_orphaned_bronze_objects`,
+`find_missing_bronze_objects`, and `reconcile_bronze` against a mocked S3
+client (scripted `list_objects_v2`/`head_object` responses) and the real
+`sqlite_engine` fixture — genuinely running the real reconciliation logic,
+just against a fake object store rather than real MinIO.
+
+`ruff check ingestion/` was also run against every file touched this
+increment (`metadata.py`, `object_store.py`, `reconciliation.py`,
+`cli.py`, plus every edited test file) and passed cleanly — ACTUAL
+OBSERVED: `All checks passed!`
+
+**What this sandbox could NOT verify (no MinIO/Docker here):** LAB 13's
+full end-to-end scenario against a real bucket. What it genuinely could,
+and did, verify against real infrastructure instead: `bronze_key`
+persistence and `find_stale_running_runs`/`list_successful_bronze_keys`
+against this sandbox's real, locally installed Postgres 16 (Section 16.6)
+— including applying the new `ALTER TABLE ... ADD COLUMN IF NOT EXISTS
+bronze_key` statement to that already-running database and confirming the
+column appears via `\d ingestion_metadata`. The S3-touching half of this
+section's code (`list_bronze_keys`, `head_object`, and therefore
+`reconciliation.py`'s two find-functions) is covered by genuine unit tests
+against a mocked `boto3` client, but has never executed against a real S3-
+compatible endpoint in this environment — that remains a DESIGN
+EXPECTATION, same as every other MinIO-touching path in this guide (Section
+14.6, 15.6's equivalent notes).
+
+### 17.7 Failure Scenario
+
+**What happens if `reconcile-bronze` finds an orphaned object — should it
+just delete it automatically?**
+
+This is worth answering explicitly rather than leaving implicit, because
+"automatically clean up what it finds" is the natural next feature to want
+— and it's the wrong default. An orphaned object (exists in storage, no
+successful run recorded writing it) has more than one honest
+explanation: it could genuinely be leftover garbage (a failed run's
+partial write that somehow still landed, or a stray manual upload) — safe
+to delete. But it could just as easily be a **legitimate** write this
+guide's own `ingestion_metadata` simply doesn't know about yet — a
+concurrent run still in flight whose `finish_run_success` hasn't committed
+yet at the exact moment `reconcile-bronze` ran, or (closer to home) exactly
+the Section 15.7 residual edge case: a retried incremental run that landed
+a second, non-overlapping-but-superset object, which is redundant but
+still contains real, correct data. Auto-deleting on the second case would
+be a genuine, silent data-loss bug introduced by a "cleanup" feature. This
+is why `reconcile_bronze` deliberately **only detects and reports** —
+remediation is left as a human decision, consistent with this repo's
+broader "don't overstate the guarantee" posture (Section 15.7's own
+honesty about its residual gap; ADR-007's stance on never deleting Bronze
+data automatically).
+
+**What about a missing object — is that recoverable?** Not by this
+pipeline alone: a `bronze_key` recorded as successfully written but no
+longer present in storage means the *only* record of that data was the
+object itself (Bronze's row-level content isn't duplicated anywhere else
+in this repo's Phase 1 design). Recovery means re-running the original
+extraction against OLTP — which is possible only if the source data still
+exists there unchanged, and re-derives the *current* state of the source
+table, not necessarily bit-for-bit what was originally captured if OLTP
+has since changed. This is exactly why ADR-007 treats Bronze as
+effectively the system of record for historical raw data, and why a real
+production deployment (Section 17.8, below) needs a retention/backup
+story for the bucket itself, not just for `ingestion_metadata`.
+
+### 17.8 Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| Reconciliation cadence | Manual (`make reconcile-bronze`) | Scheduled (daily/hourly cron or orchestrator step), with the same non-zero-exit-code alerting pattern as `check-stale-runs` |
+| Remediation | None — detection only, by design (see 17.7) | A documented runbook per drift type; orphan cleanup requires explicit human sign-off, missing-object recovery triggers a backfill/re-extraction workflow |
+| Listing scale | `list_bronze_keys`: single `list_objects_v2` call, capped at 1,000 keys | Paginated listing (`get_paginator`) once any table's object count could plausibly exceed 1,000 |
+| Bucket durability | MinIO's own default settings, no explicit backup/versioning configured | S3 versioning and/or cross-region replication, so a missing-object drift is itself often preventable rather than only detectable after the fact |
+| Coverage | Bronze layer only | A mature platform reconciles at every layer (Bronze, Silver, Gold — Phase 2+), not just the ingestion boundary |
+
+### Principal Data Engineer Perspective
+
+The judgment call worth defending here is resisting the tempting shortcut
+of building reconciliation *and* auto-remediation as one feature. It would
+have been less code, in the moment, to have `reconcile_bronze` just delete
+every orphan it finds — and it would have been a real, if rare, latent
+data-loss bug, for exactly the reason named in Section 17.7 (a legitimate,
+recently-completed write that simply hasn't landed in `ingestion_metadata`
+yet, or Section 15.7's documented redundant-but-correct duplicate). A
+principal engineer separates "detect and report" from "decide what to do
+about it" as a matter of course when the two have meaningfully different
+risk profiles — not because remediation could never be automated safely,
+but because automating it safely requires more context (how fresh is
+"fresh enough to not be a false orphan," what's this specific object's
+provenance) than a reconciliation pass alone has available. The second
+thing worth flagging: this section's two new pieces — a persisted
+`bronze_key` and a reconciliation job — exist specifically because Section
+15.8's Production Considerations table already named "a periodic
+reconciliation job comparing `ingestion_metadata` against actual Bronze
+object listings" as a gap, two increments ago. Treating a documented gap
+in an earlier section as a concrete backlog item, and coming back to close
+it explicitly rather than letting it quietly age out of the guide, is
+itself a habit worth calling out — it's the same discipline a real
+platform team applies to its own tech-debt tracking.
+
+### 17.9 Principal Engineer Interview Questions
+
+**Q: "You've built idempotent writes to Bronze. Does that alone guarantee
+`ingestion_metadata` and the actual bucket contents can never disagree?
+Why or why not?"**
+
+*What's tested:* whether the candidate distinguishes "this specific
+write is safe to retry" from "the system as a whole never drifts" — two
+related but genuinely different guarantees that are easy to conflate.
+
+*What a weak answer looks like:* "Yes, idempotent writes mean it's always
+consistent" — conflates the two guarantees.
+
+*What a strong answer covers:* no. Idempotency guarantees that *retrying
+the exact same logical write* is safe and produces the same end state —
+it says nothing about a manual out-of-band upload, an object deleted by
+something outside this pipeline, or (concretely, in this repo) the
+documented Section 15.7 edge case where a retry under changed conditions
+computes a *different* key and lands a second, non-colliding object.
+Detecting that kind of drift needs an independent check — comparing the
+control plane's record against the actual storage listing — which is what
+reconciliation is for, and which idempotent writes alone were never
+designed to provide.
+
+*Concepts:* the difference between write-level idempotency and
+system-level consistency; drift as a category of bug distinct from
+duplicate-write bugs.
+
+*Expected follow-up:* "How would you detect drift caused by something
+completely outside this pipeline — say, someone manually deleting an
+object in the AWS console?" — Exactly `find_missing_bronze_objects`:
+it doesn't know or care *why* a recorded key is gone, only that it is.
+
+*Common mistake:* describing reconciliation as "redundant" with
+idempotent writes, rather than as covering a genuinely different failure
+class that idempotent writes structurally cannot cover.
+
+**Q: "Your reconciliation job only detects drift, it doesn't fix
+anything. Isn't that half-finished? Why not auto-delete orphans it
+finds?"**
+
+*What's tested:* risk judgment — whether the candidate can articulate a
+concrete scenario where the "obvious" next feature (auto-remediation)
+would actually be dangerous, not just assert a general preference for
+caution.
+
+*What a weak answer looks like:* "Deleting data automatically is risky" —
+true, but generic; doesn't show the candidate has actually thought through
+*this* system's specific failure mode.
+
+*What a strong answer covers:* a concrete false-positive: a run that just
+completed and wrote its Bronze object successfully, whose
+`finish_run_success` UPDATE hasn't committed yet (or committed a moment
+after `reconcile-bronze`'s query ran) looks *identical*, from
+reconciliation's point of view, to a truly orphaned stray object — both
+are "in storage, not yet recorded as known." Auto-deleting on that
+signal alone would delete a legitimate, just-written object purely
+because of a race with normal, expected latency between a write
+completing and its checkpoint committing. Detection-only, with
+remediation left to a human who can check additional context (how old is
+this object, is there a run for it still in flight), avoids this
+specific failure entirely, at the cost of needing a human step before
+drift actually gets cleaned up.
+
+*Concepts:* race conditions between a write and its own metadata commit;
+separating detection from remediation when they have different risk
+profiles; designing for the false-positive case, not just the true-positive
+case.
+
+*Expected follow-up:* "How would you eventually automate remediation
+safely, if the manual step became a real operational burden?" — Add an
+age threshold (only ever auto-remediate an orphan older than some safe
+margin past any plausible in-flight run duration — directly reusing
+Section 16's `max_runtime_minutes` reasoning), and require the run that
+"should have" recorded it to be conclusively ruled out first, not just
+absent from a single query.
+
+*Common mistake:* treating "detection only" as an unfinished MVP rather
+than as a deliberate scope boundary chosen because the alternative has a
+real, specific failure mode — the interview signal is in naming *why*,
+concretely, not just agreeing caution is generally good.
+
+---
+
 ## 28. Architectural Principles
 
 Introduced here, demonstrated incrementally as more of Phase 1 is built.
@@ -3881,84 +5041,85 @@ contract-checked — a named gap, not a silent one (Section 12.7).
 
 ## 33. Phase 1 Summary (so far)
 
-**What we've built in this increment:** the full analytics requirements
-and data modeling layer — a metrics catalog grounded in the real
-application's own stated requirement (Section 7); an explicit fact-table
-grain decision (Section 8); a formalized source data model
-(`schemas/source/users.md`, `clicks.md`, joining the pre-existing
-`urls.md`); a designed and DDL-implemented star schema (`dim_date`,
-`dim_url`, `dim_user`, `dim_device`, `fact_clicks` — schema only, not yet
-populated) with a from-scratch Kimball-style Unknown-member design for
-anonymous clicks (Section 10.3); a star-vs-snowflake decision with real
-DDL (Section 11); and a genuinely new code component, formal data
-contracts (`contracts/source/*.yaml` plus `contracts.py`'s validator,
-`make validate-contracts`), covered by 11 new unit tests. Combined with
-the ingestion pipeline from prior increments (full load, incremental
-load, both idempotent and checkpointed): 38 passing unit tests total plus
-integration tests runnable against real infrastructure; this guide.
+**What we've built in this increment:** the dedicated deep-dive on
+Checkpointing (Section 16) and Idempotency (Section 17) — the two
+sections the TOC had flagged since Section 15 as "the mechanism exists,
+still awaits its own dedicated deep-dive." Two genuinely new pieces of
+code, not just new prose around existing code: `metadata.find_stale_running_runs`,
+closing the "no automated stale-`running`-row alerting" gap Section 15.8
+named two increments ago; and a full `reconciliation.py` module
+(`find_orphaned_bronze_objects`, `find_missing_bronze_objects`,
+`reconcile_bronze`), closing the "periodic reconciliation job" gap that
+same table named. Both are backed by a new `bronze_key` column on
+`ingestion_metadata` (`sql/source/003_ingestion_metadata.sql`), storing
+the exact object key each successful run wrote rather than recomputing it
+later (Section 17.3's Design Decision). Both are wired into the CLI
+(`check-stale-runs`, `reconcile-bronze`) and the `Makefile`. 21 new unit
+tests (38 → 59), plus a genuine, ACTUAL OBSERVED run of the new
+`metadata.py` functions against this sandbox's real, locally installed
+Postgres 16 — not just SQLite.
 
-**A note on this increment specifically:** Sections 7-12 were written at
-full teaching-template depth from the start (the same 16-part structure
-established for Sections 1, 2, 14, and 15) — this is the first increment
-where an entire multi-section block of the curriculum (six sections) landed
-together, rather than one section at a time, because the six are tightly
-interdependent (grain depends on requirements; the analytical model
-depends on grain; the star schema DDL depends on the analytical model
-design; contracts depend on the source model) and reviewing them as a
-connected whole was judged more valuable than splitting an already-coupled
-design across six separate increments.
+**A note on this increment specifically:** unlike Sections 7-12 (six
+interdependent sections landing together), 16 and 17 were written as two
+sections building on a large amount of *already-committed* prior work —
+most of Section 16's and 17's subject matter (the checkpoint state
+machine, deterministic Bronze keys) was implemented as early as Sections
+14-15; this increment's actual new code surface is comparatively small
+(one new module, one new function, one new column) precisely because the
+underlying mechanism was already correct. That's a deliberate contrast
+worth naming: not every "deep-dive" section is really about new code —
+some are about finishing the operational story around code that already
+works.
 
 **Concepts taught so far, at full depth:** the real application's
 architecture and schema, OLTP vs. OLAP, full load and incremental-load
-ingestion (watermarks, idempotency, checkpointing), and now the entire
-data modeling layer: a requirements-first metrics catalog with an honest
-requirements-traceability table; grain as the first and most consequential
-fact-table decision; the three-artifact split between human documentation
-(`schemas/source/*.md`), enforced schema (`sql/`), and machine-checked
-contracts (`contracts/`); Kimball dimensional modeling (fact vs.
-dimension, conformed dimensions, SCD Type 1 vs. 2, the NOT-NULL-foreign-key
-Unknown-member pattern worked through in full); star vs. snowflake
-schema design; and data contract validation (coarse type categories,
-violations vs. warnings, and why both decisions were made deliberately,
-not by default). Checkpointing and idempotency's own dedicated deep-dive
-sections (16, 17) still await their pass.
+ingestion (watermarks, idempotency, checkpointing), the entire data
+modeling layer (Sections 7-12: requirements, grain, source model,
+dimensional model, star-vs-snowflake, data contracts), and now
+checkpointing and idempotency's own dedicated treatment: staleness
+detection via an elapsed-time threshold and its specific false-positive
+failure mode (Section 16); the difference between write-level idempotency
+and system-level consistency, and why reconciliation deliberately detects
+drift without auto-remediating it (Section 17).
 
-**Known limitations, stated honestly:** no scheduler yet (runs are
-manual, via `make ingest`); `ingestion_metadata` has no automated
-stale-`running`-row alerting; incremental load is insert-only by
-construction (Section 15.9); a retried failed incremental run can, in one
-specific ordering, produce a redundant Bronze object (Section 15.7); the
-star schema is designed and DDL-committed but **not yet populated** —
-Phase 2's transform does that, and every dimension/fact table is
-genuinely empty (beyond `dim_date`'s generated calendar and `dim_user`'s
-single Unknown-member row) until then; data contracts cover the source
-layer only — the analytical layer (`sql/analytics/`) has no contract yet
-(Section 12.7); no PII classification section yet, though `clicks.hashed_ip`
-and `dim_user`'s email exclusion already avoid the worst of it by
-construction; no benchmarks have been run yet (Sections 19-20,
-`benchmarks/`); this sandbox has no Docker daemon, so nothing here was
-verified through `docker-compose.yml` itself — but it does have a real,
-locally installed Postgres 16, and every piece of new SQL and the
-contract validator were genuinely run against it while writing this
-increment: all five `sql/analytics/*.sql` files applied cleanly
-(`dim_date` really does hold 4,018 rows; `dim_user` really does hold its
-one Unknown-member row); the `fact_clicks.user_key NOT NULL` constraint
-really does reject a `NULL` insert with the exact predicted error; all
-three source contracts really do pass `validate-contracts` against the
-real schema, and really do fail — with the exact predicted violation
-message — after a deliberately broken `ALTER TABLE`. Every such result in
-Sections 10-12 is labeled ACTUAL OBSERVED, not DESIGN EXPECTATION,
-specifically because it was. What's still genuinely unverified: anything
-requiring MinIO (not available here) or Docker Compose itself
-specifically (as opposed to the same Postgres reached directly) — those
-steps remain labeled DESIGN EXPECTATION, for the reader to run.
+**Known limitations, stated honestly:** no scheduler yet (runs, and now
+`check-stale-runs`/`reconcile-bronze`, are all manual); the elapsed-time
+staleness threshold has a named false-positive failure mode for
+legitimately slow runs (Section 16.7) with no heartbeat mechanism to fall
+back on yet; reconciliation detects drift but never remediates it, by
+deliberate design (Section 17.7) — a human still has to act on what it
+finds; incremental load is insert-only by construction (Section 15.9); a
+retried failed incremental run can, in one specific ordering, produce a
+redundant Bronze object (Section 15.7); the star schema is designed and
+DDL-committed but **not yet populated**; data contracts cover the source
+layer only (Section 12.7); no PII classification section yet; no
+benchmarks have been run yet (Sections 19-20). This sandbox still has no
+Docker daemon and no MinIO, so LAB 13 (reconciliation against a real
+bucket) and the S3-touching half of this increment's code
+(`list_bronze_keys`, `head_object`, and therefore `reconciliation.py`'s
+find-functions) remain covered only by genuine unit tests against a
+mocked `boto3` client, never against a real S3-compatible endpoint — a
+DESIGN EXPECTATION for the reader to confirm with `make up`. What *was*
+genuinely verified against real (non-Docker) infrastructure this
+increment: applying the new `bronze_key` column to this sandbox's
+already-running local Postgres 16 via the same idempotent-safe `ALTER
+TABLE ... ADD COLUMN IF NOT EXISTS` statement a fresh `docker compose up`
+would also run, and then exercising `finish_run_success`,
+`find_stale_running_runs`, and `list_successful_bronze_keys` against it
+directly — bronze-key persistence, stale-run detection with a genuinely
+backdated `started_at`, and pipeline-name filtering all behaved exactly as
+designed. One genuine, previously-undiscovered finding came out of that
+verification: a Postgres `uuid` column round-trips as a Python `uuid.UUID`
+object, while the SQLite unit-test fixture round-trips the same logical
+value as a plain `str` — a real cross-dialect wrinkle, now noted in
+Section 16.6, that no amount of unit testing against SQLite alone would
+ever have surfaced.
 
-**Immediate next increment:** a deep-dive pass on Checkpointing and
-Idempotency (Sections 16-17, mechanisms already built and demonstrated
-across both load types — now due their own dedicated treatment), or
-Object Storage/Parquet/Partitioning (Sections 18-20) as groundwork before
-Phase 2's transform needs them — whichever the reader wants to tackle
-next.
+**Immediate next increment:** Object Storage/Parquet/Partitioning
+(Sections 18-20) as groundwork before Phase 2's transform needs them, or
+Ingestion Metadata's own deep-dive (Section 22, now that `ingestion_metadata`
+carries a `bronze_key` column and two new query functions worth teaching
+in their own right) — whichever the reader wants to tackle next.
 
 ---
 
@@ -3977,19 +5138,19 @@ next.
 | Full ingestion implemented | ✅ Done | `extract_full.py`, LAB 1 | — |
 | Incremental ingestion implemented | ✅ Done | `extract_incremental.py`, LAB 2/3, Section 15 | — |
 | Watermark implemented | ✅ Done | `metadata.get_last_watermark`, wired into `extract_incremental.run_incremental_load`, Section 15 | — |
-| Checkpoint implemented | ✅ Done | `metadata.py`, `ingestion_metadata` table, exercised by both load types | Deep-dive section (16) still to write |
-| Idempotency implemented | ✅ Done | `object_store.build_bronze_key` / `build_bronze_incremental_key`, integration tests for both load types | Deep-dive section (17); one documented residual edge case, Section 15.7 |
+| Checkpoint implemented | ✅ Done | `metadata.py`, `ingestion_metadata` table, exercised by both load types; stale-run detection (`find_stale_running_runs`, `check-stale-runs`), Section 16 | — |
+| Idempotency implemented | ✅ Done | `object_store.build_bronze_key` / `build_bronze_incremental_key`; `bronze_key` persistence and Bronze reconciliation (`reconciliation.py`, `reconcile-bronze`), Section 17 | One documented residual edge case, Section 15.7; reconciliation detects drift but doesn't remediate it, by design, Section 17.7 |
 | MinIO configured | ✅ Done | `docker-compose.yml`, `object_store.py` | — |
 | Parquet implemented | ✅ Done | `object_store.write_bronze` / `write_bronze_incremental` | Benchmark vs CSV/JSON not yet run (Section 19) |
 | Partitioning implemented | ⏳ Not started (only date/watermark-scoped keys, not true multi-file partitioning) | — | Section 20 |
 | PII identified | ⏳ Not started | `clicks.hashed_ip` already avoids raw IPs by construction | Formal classification table, Section 23 |
-| Tests implemented | ✅ Done (unit + partial integration) | 38 passing unit tests; the contracts integration test genuinely passed against a real (non-Docker) local Postgres in this sandbox | Full-load and incremental-load integration tests still need real MinIO, not available here — user should run `make up && make test-integration` locally for the complete suite |
+| Tests implemented | ✅ Done (unit + partial integration) | 59 passing unit tests (up from 38); the contracts integration test, and this increment's `metadata.py` additions, genuinely passed against a real (non-Docker) local Postgres in this sandbox | Full-load, incremental-load, and reconciliation integration tests still need real MinIO, not available here — user should run `make up && make test-integration` locally for the complete suite |
 | Failure scenarios tested | ✅ Partial | Sections 7-12 (data modeling), 14.7, 15.7 (8 of 10) | Remaining 2, Section 25 |
 | Performance benchmark completed | ⏳ Not started | — | Section 26, `benchmarks/` |
 | Architecture diagrams completed | ✅ Partial | 10 diagrams so far, including the full star schema ER diagram (Section 10.1) | More land with later sections (data lifecycle, failure/recovery, final architecture) |
-| ADRs documented | ✅ 10 of 10+ planned | Section 29 | ADR-005/006 now implemented; new ADR-010 (contract validation strategy) added this increment |
-| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9 | Remaining categories not yet covered, Section 31 |
-| Hands-on labs completed | ✅ Partial | LAB 1-11 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation) | LAB 12+ |
+| ADRs documented | ✅ 10 of 10+ planned | Section 29 | ADR-005/006 now implemented; ADR-010 (contract validation strategy) from the prior increment; a bronze-key-storage-vs-recompute decision is documented in Section 17.3 but not yet promoted to its own numbered ADR |
+| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9 | Remaining categories not yet covered, Section 31 |
+| Hands-on labs completed | ✅ Partial | LAB 1-13 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation) | LAB 14+ |
 | README updated | ✅ Done | `README.md` | — |
 | Git repository clean | ✅ Done | Section 35 | — |
 | No secrets committed | ✅ Done | `.gitignore`, `.env.example` reviewed | — |

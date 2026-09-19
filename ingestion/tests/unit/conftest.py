@@ -34,6 +34,7 @@ def sqlite_engine() -> Engine:
                 watermark_end   INTEGER,
                 rows_read       INTEGER,
                 rows_written    INTEGER,
+                bronze_key      TEXT,
                 started_at      TIMESTAMP NOT NULL,
                 completed_at    TIMESTAMP,
                 error_message   TEXT

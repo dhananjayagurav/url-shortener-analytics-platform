@@ -1,4 +1,4 @@
-.PHONY: venv install up down logs ps db-shell ingest ingest-full create-analytics-schema validate-contracts test test-integration lint fmt seed
+.PHONY: venv install up down logs ps db-shell ingest ingest-full create-analytics-schema validate-contracts check-stale-runs reconcile-bronze test test-integration lint fmt seed
 
 venv:
 	python3.12 -m venv .venv
@@ -41,6 +41,14 @@ create-analytics-schema:
 
 validate-contracts:
 	python -m url_shortener_analytics.cli validate-contracts
+
+# See docs/analytics-engineering-guide.md Section 16.
+check-stale-runs:
+	python -m url_shortener_analytics.cli check-stale-runs
+
+# See docs/analytics-engineering-guide.md Section 17.
+reconcile-bronze:
+	python -m url_shortener_analytics.cli reconcile-bronze
 
 test:
 	pytest -v
