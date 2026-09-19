@@ -1,0 +1,53 @@
+# Data contract for the source `urls` table. Validated against the real
+# table shape by ingestion/src/url_shortener_analytics/contracts.py --
+# see docs/analytics-engineering-guide.md, Section 12.
+#
+# `type` values are coarse categories, not exact SQL types -- see
+# contracts.py's module docstring for why exact cross-dialect type
+# comparison was rejected.
+
+table: urls
+version: 1
+owner: analytics-platform-team
+description: >
+  Real schema, mirrored from the url-shortener application. See
+  schemas/source/urls.md for the full column-by-column narrative.
+freshness_sla: "extracted at least once per pipeline run (full load; see ingestion/configs/pipelines.yaml)"
+
+columns:
+  - name: id
+    type: integer
+    nullable: false
+    description: Surrogate PK, autoincrement.
+  - name: short_code
+    type: text
+    nullable: true
+    description: Unique, indexed. Nullable due to id-first generation strategy.
+  - name: original_url
+    type: text
+    nullable: false
+    description: The destination URL.
+  - name: created_at
+    type: timestamp
+    nullable: false
+    description: Set at insert.
+  - name: expires_at
+    type: timestamp
+    nullable: true
+    description: Present in schema; not enforced anywhere in application code.
+  - name: user_id
+    type: integer
+    nullable: true
+    description: Unenforced reference to users.id -- no FK constraint.
+  - name: is_active
+    type: boolean
+    nullable: false
+    description: Default true.
+  - name: deleted_at
+    type: timestamp
+    nullable: true
+    description: Soft-delete marker.
+
+quality_rules:
+  - "short_code is unique when not null"
+  - "id is monotonically increasing (BIGSERIAL)"

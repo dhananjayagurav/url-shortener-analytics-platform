@@ -1,4 +1,4 @@
-.PHONY: venv install up down logs ps db-shell ingest ingest-full test test-integration lint fmt seed
+.PHONY: venv install up down logs ps db-shell ingest ingest-full create-analytics-schema validate-contracts test test-integration lint fmt seed
 
 venv:
 	python3.12 -m venv .venv
@@ -30,6 +30,17 @@ ingest:
 
 ingest-full:
 	python -m url_shortener_analytics.cli full-load
+
+# Not run by `make up` (unlike sql/source/) -- analytical-layer schema is
+# applied explicitly. See docs/analytics-engineering-guide.md Section 11.
+create-analytics-schema:
+	@for f in sql/analytics/*.sql; do \
+		echo "applying $$f"; \
+		docker compose exec -T postgres psql -U $${POSTGRES_USER:-urlshortener} -d $${POSTGRES_DB:-urlshortener} -f - < $$f; \
+	done
+
+validate-contracts:
+	python -m url_shortener_analytics.cli validate-contracts
 
 test:
 	pytest -v

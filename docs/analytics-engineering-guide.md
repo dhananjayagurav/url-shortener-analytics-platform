@@ -75,13 +75,13 @@ with the exact command to produce the real result yourself.
 5. [Git Workflow](#5-git-workflow) ✅
 6. [Environment Setup](#6-environment-setup) ✅
 
-**Data Modeling** ⏳ *(next increments)*
-7. Analytics Requirements & Business Metrics
-8. Data Grain
-9. Source Data Model (formalized data contracts)
-10. Analytical Data Model (fact/dimension design)
-11. Star Schema vs. Normalized Model
-12. Data Contracts
+**Data Modeling**
+7. [Analytics Requirements & Business Metrics](#7-analytics-requirements--business-metrics-) ✅✅
+8. [Data Grain](#8-data-grain-) ✅✅
+9. [Source Data Model](#9-source-data-model-) ✅✅
+10. [Analytical Data Model (Fact/Dimension Design)](#10-analytical-data-model-factdimension-design-) ✅✅
+11. [Star Schema vs. Normalized Model](#11-star-schema-vs-normalized-model-) ✅✅
+12. [Data Contracts](#12-data-contracts-) ✅✅
 
 **Ingestion**
 13. [Batch Ingestion Design](#13-batch-ingestion-design) ✅
@@ -107,8 +107,8 @@ with the exact command to produce the real result yourself.
 **Reference**
 28. [Architectural Principles](#28-architectural-principles) ✅ *(introduced now, extended as more are demonstrated)*
 29. [Architecture Decision Records](#29-architecture-decision-records) ✅
-30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — see [Section 14.5](#145-hands-on-exercise); LAB 2, LAB 3 — see [Section 15.5](#155-hands-on-exercise))*
-31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see [Section 14.9](#149-principal-engineer-interview-questions) and [Section 15.9](#159-principal-engineer-interview-questions))*
+30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6)*
+31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, and 15.9)*
 32. Principal-Level Scenarios ⏳
 33. [Phase 1 Summary](#33-phase-1-summary-so-far) (running, updated each increment)
 34. [Phase 1 Completion Checklist](#34-phase-1-completion-checklist)
@@ -753,6 +753,1822 @@ serves `minio/minio` or `minio/mc` at all (both repositories were pulled).
 This repo's `docker-compose.yml` pulls from `quay.io/minio/minio` and
 `quay.io/minio/mc` instead, pinned to specific release tags rather than
 `:latest`, both verified against MinIO's own GitHub release history.
+
+---
+
+## 7. Analytics Requirements & Business Metrics ✅✅
+
+### Concept
+
+**Analytics requirements** are the specific business questions a platform
+must be able to answer, written down and agreed on *before* any dimension
+or fact table is designed. A **metric** is one such question turned into a
+precise, computable definition: what's being counted or measured, at what
+grain, from which columns, with what filters.
+
+### Why does this exist?
+
+Skipping straight from "we have a `clicks` table" to "let's build a star
+schema" is how projects end up with a dimensional model that's elegant but
+answers the wrong questions — or worse, one where two different analysts
+compute "daily active users" two different ways because no one wrote down
+what it actually means. Requirements-first isn't paperwork for its own
+sake: every design decision in Sections 8-11 (the fact table's grain,
+which dimensions exist, what gets pre-computed vs. left to query time)
+follows directly from the metrics catalog below. Skipping this step
+doesn't remove the decisions — it just makes them implicitly, one query at
+a time, usually inconsistently.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+Imagine a small e-commerce team is asked to "add an orders dashboard."
+Without requirements, three engineers build three different things: one
+computes "revenue" including tax, one excludes it, one excludes refunded
+orders and the other two don't. All three are defensible in isolation —
+the disagreement was never resolved because no one wrote "revenue = sum of
+`order_total` for orders where `status != 'refunded'`, tax included" down
+anywhere before the dashboards shipped. A five-minute requirements
+conversation would have prevented three incompatible numbers from ever
+reaching a stakeholder meeting.
+
+### URL Shortener Example
+
+The real `url-shortener` application's own `docs/01-requirements.md`
+already states an explicit v1 functional requirement: "basic analytics:
+click count, timestamp, coarse geo/device info per short code" (quoted
+already in Section 1.5 and ADR-008). That's a starting point, not a
+complete spec — it names *what kind* of thing is wanted without defining a
+single metric precisely enough to implement. This section turns it into
+the actual metrics catalog this platform's dimensional model (Sections
+9-11) is designed to serve.
+
+### 7.1 Metrics Catalog
+
+| Metric | Definition | Grain | Source |
+|---|---|---|---|
+| Total clicks per URL | `COUNT(*)` (or `SUM(click_count)`) grouped by `short_code` | Per URL | `fact_clicks` |
+| Clicks over time | `COUNT(*)` grouped by `date_key` (optionally + `short_code`) | Per day (per URL) | `fact_clicks` + `dim_date` |
+| Clicks by device type | `COUNT(*)` grouped by `device_type` | Per device category | `fact_clicks` + `dim_device` |
+| Top N URLs by clicks | `total clicks per URL`, ordered descending, limited to N | Per URL | `fact_clicks` + `dim_url` |
+| Anonymous vs. attributed click share | `COUNT(*)` grouped by `dim_user.is_known` | Per click | `fact_clicks` + `dim_user` |
+| Clicks by plan type | `COUNT(*)` grouped by `dim_user.plan_type` (known users only) | Per plan | `fact_clicks` + `dim_user` |
+| Clicks by destination domain | `COUNT(*)` grouped by `dim_url.original_url_domain` | Per domain | `fact_clicks` + `dim_url` |
+| Active vs. inactive URL click share | `COUNT(*)` grouped by `dim_url.is_active` | Per URL status | `fact_clicks` + `dim_url` |
+
+Every metric above is expressible as a `GROUP BY` over `fact_clicks`
+joined to at most one dimension — a direct consequence of the grain
+decision in Section 8 and the star schema shape in Section 11. None of
+them require a self-join, a window function, or a pre-aggregated rollup
+table to compute correctly at this project's current scale; Section 26
+(Performance, planned) is where that stops being true and pre-aggregation
+gets evaluated.
+
+### Design Decision
+
+**Every metric in the catalog above is derived, at query time, from
+`fact_clicks`' atomic grain — none are pre-aggregated into a separate
+summary table in Phase 1.** This mirrors Section 8's grain decision and is
+recorded together with it, not as a separate, independent choice — see
+Section 8's Design Decision for the reasoning; the two decisions have to
+be made together, since a coarser fact grain would have made some of the
+metrics above (e.g. clicks by device type) unanswerable without the raw
+event detail.
+
+### Alternatives
+
+1. **No formal metrics catalog — build the star schema first, work out
+   metrics from whatever it supports (rejected).** This is the failure
+   mode described in the Simple Example: the "requirements" end up being
+   whatever the schema happens to allow, discovered ad hoc, rather than
+   deliberately designed for.
+2. **A pre-aggregated metrics/summary table per metric (rejected for
+   Phase 1).** Would make each dashboard query trivially fast at read
+   time, at the cost of a transformation pipeline to maintain every
+   summary table's freshness — real complexity this project hasn't earned
+   yet at 5,000 seeded click rows. Revisit once Section 26's benchmarks
+   show `fact_clicks` queries are actually slow.
+3. **A written metrics catalog, computed live from an atomic-grain fact
+   table (chosen).** Slower per-query than pre-aggregation, at a scale
+   that doesn't matter yet; keeps every metric's definition traceable to
+   one row of raw fact data, which is worth more during Phase 1's
+   correctness-first stage than query speed is.
+
+### Trade-offs
+
+| | Live query over atomic grain (chosen) | Pre-aggregated summary tables |
+|---|---|---|
+| Correctness / traceability | High — every number traces to individual `fact_clicks` rows | Lower — a bug in the aggregation job silently poisons every downstream number until caught |
+| Query latency at scale | Degrades as `fact_clicks` grows | Stays flat — the point of pre-aggregating |
+| New metric, same source data | Free — just a new `GROUP BY` | Requires a new aggregation job, or reprocessing history |
+| Operational complexity | None beyond the fact/dim tables themselves | An extra pipeline stage to build, schedule, and monitor |
+
+### 7.2 Requirements Traceability
+
+| Requirement source | What it says | Where it's addressed |
+|---|---|---|
+| `url-shortener`'s `docs/01-requirements.md`, functional requirement #5 | "basic analytics: click count, timestamp, coarse geo/device info per short code" | Click count → row 1 of the catalog; timestamp → `dim_date`/`occurred_at`; device info → row 3; "coarse geo" is explicitly **not** implemented (no geo column exists anywhere in this project's schema — see the Known Limitations note this introduces into Section 33) |
+| This project's own curriculum (Section 7's own existence) | Analytics requirements should be defined before the analytical model | This catalog, Section 8 (grain), Sections 9-11 (model design) |
+
+**Stated honestly:** "coarse geo info" from the real requirement is
+explicitly out of scope for this catalog — there's no IP-geolocation step
+anywhere in this pipeline (`clicks.hashed_ip` is hashed specifically to
+avoid needing to resolve real IPs to locations; see Section 23, PII,
+planned), and adding it would mean a new source column, a new dimension,
+and a defensible privacy story, none of which this increment builds. It's
+named here rather than silently dropped, matching this project's
+established pattern (compare Section 33's other honestly-stated gaps).
+
+### 7.3 Hands-on Exercise
+
+**LAB 6 — Trace one requirement to one query.**
+
+Pick "Total clicks per URL" from the catalog above. Without looking ahead
+to Section 11's DDL, write down (in plain SQL, on paper or in a scratch
+file) what you'd expect the query to look like once `fact_clicks` and
+`dim_url` exist and are populated:
+
+```sql
+SELECT du.short_code, COUNT(*) AS total_clicks
+FROM fact_clicks fc
+JOIN dim_url du ON fc.url_key = du.url_key
+GROUP BY du.short_code
+ORDER BY total_clicks DESC;
+```
+
+Then read Section 11's actual `fact_clicks`/`dim_url` DDL and check
+whether every column your query needs actually exists with the name and
+join key you assumed. (It should — the DDL was designed *from* this
+catalog, not the other way around. If you find a mismatch, that's the
+exercise working: it means either the catalog or the DDL needs to change,
+and Section 12's Failure Scenario discusses exactly this kind of
+requirements-vs-schema drift.)
+
+### Failure Scenario
+
+**What happens if a metric's definition is ambiguous and two people
+implement it differently?**
+
+Concretely: "clicks by device type" could mean `GROUP BY device_type` over
+every click (including anonymous ones, correct per this catalog) or
+`GROUP BY device_type` filtered to only clicks with a known `user_id`
+(a plausible but *different* metric someone might build without checking
+the catalog). Both produce a table with the same column names and shape —
+nothing about the output alone reveals which definition was used. This is
+the requirements-ambiguity failure mode named in the Simple Example, now
+concrete: without a catalog entry stating explicitly that this metric
+includes anonymous clicks, two dashboards can disagree with no error, no
+alert, and no obvious way to tell which one is "right" without re-deriving
+both definitions from scratch. **Production implication:** every metric
+in a real metrics catalog needs enough precision that two engineers
+implementing it independently would produce identical SQL — the catalog
+above is written to that standard (e.g. "known users only" is stated
+explicitly on the one row where it applies, and left off everywhere else
+on purpose).
+
+### Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| Catalog format | A Markdown table in this guide | Often a dedicated metrics layer/semantic tool (e.g. a metrics-definition YAML consumed by a BI semantic layer) so the definition is enforced in code, not just documented |
+| Ownership | Implicit (this project) | Each metric has a named business owner who signs off on its definition |
+| Change management | None — this is Phase 1 | A metric definition change is itself a reviewable, versioned change, since dashboards built against the old definition silently drift otherwise |
+| Ambiguity detection | Manual review (this section) | Automated: a metrics layer that only allows one definition per metric name, compile-time |
+
+### Principal Data Engineer Perspective
+
+The judgment call worth naming here: a metrics catalog is cheap to write
+and easy to skip, and skipping it never produces an error — it produces a
+project that *looks* done (dashboards render, numbers appear) while
+quietly carrying unresolved ambiguity that surfaces only when two numbers
+disagree in front of a stakeholder. A principal engineer treats "we have
+dashboards" and "we have agreed-upon metric definitions" as two different
+claims, and doesn't let the first one stand in for the second — this
+section exists specifically so Sections 8-11's design decisions have
+something concrete to be *for*, rather than being justified purely by
+internal modeling elegance.
+
+### Principal Engineer Interview Questions
+
+**Q: "Someone asks you why the dashboard's 'clicks per URL' number doesn't
+match a number a colleague pulled from the raw event table. Walk through
+how you'd debug that."**
+
+*What's tested:* whether the candidate defaults to a data-quality
+investigation (checking the pipeline for bugs) or first checks whether the
+two numbers are even supposed to match.
+
+*What a weak answer looks like:* immediately assuming a bug in the
+ingestion or transform pipeline and starting to trace data lineage.
+
+*What a strong answer covers:* start by comparing the two *definitions*,
+not the two pipelines — ask what filter conditions, date ranges, and
+grain each query used before assuming either is "wrong." In this
+project's own catalog, the most likely culprit for exactly this
+disagreement is the anonymous-clicks question from this section's Failure
+Scenario: one query included anonymous clicks, the other implicitly
+excluded them via an inner join to a users table. Only after confirming
+the definitions are supposed to match does a genuine data-quality bug
+become the next hypothesis.
+
+*Concepts:* metric definition ambiguity vs. data-quality defects — two
+different failure classes that produce identical symptoms (numbers don't
+match) and need different debugging approaches.
+
+*Expected follow-up:* "How would you prevent this from happening again?" —
+A written, precise metrics catalog (this section), ideally enforced by a
+semantic layer rather than left to convention.
+
+*Common mistake:* treating every numeric discrepancy as a pipeline bug by
+default, without first checking whether the two queries were ever
+computing the same thing.
+
+---
+
+## 8. Data Grain ✅✅
+
+### Concept
+
+The **grain** of a fact table is a precise statement of what a single row
+represents — "one row per X." Every fact table needs exactly one grain
+statement, decided before a single column is designed, because grain
+determines which measures are valid (additive at that grain or not) and
+which dimensions can join to it cleanly.
+
+### Why does this exist?
+
+Grain is, by wide consensus in dimensional modeling (Kimball's own stated
+"first and most important" decision when designing a fact table), the
+decision every other fact-table decision depends on. Pick a grain that's
+too coarse (e.g. "one row per URL per day") and you permanently lose the
+ability to answer device-type or hour-of-day questions without
+re-extracting from source. Pick a grain that's ambiguous (some rows are
+per-click, others are pre-aggregated) and *no* measure in the table is
+safely additive anymore, because summing across rows of different grains
+double-counts or under-counts depending on which rows you happen to
+include.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+A retail chain's "sales" fact table could be grained at "one row per
+individual item scanned at checkout," "one row per checkout transaction
+(receipt)," or "one row per store per day." All three are legitimate fact
+tables — they just answer different questions. The item-level grain can
+answer "what's our best-selling SKU" but is enormous; the daily-store
+grain is compact but can never answer "what did this specific customer
+buy in one visit," because that information was discarded before the
+table was even built. Once a grain is chosen and loaded, there is no SQL
+query that recovers detail the grain didn't keep.
+
+### URL Shortener Example
+
+`clicks` (Section 1.5, ADR-008) already exists at the finest grain this
+project's schema can produce: one row per redirect event. Section 7's
+metrics catalog was built assuming that grain is preserved all the way
+into the analytical layer — "clicks by device type" and "clicks by hour"
+both require row-level detail that a pre-aggregated "clicks per URL per
+day" fact table would have already thrown away.
+
+### 8.1 Design Decision
+
+**`fact_clicks`' grain is one row per click event — identical to the
+source `clicks` table's own grain.** No pre-aggregation happens between
+Bronze and the analytical layer in Phase 1. This is stated here as its own
+decision, separate from (but paired with) Section 7's requirements
+decision, because grain is a big enough decision in dimensional modeling
+to warrant being named and defended on its own, independent of which
+specific metrics happen to be in the current catalog — a *future* metric
+this project hasn't thought of yet is far more likely to be answerable if
+the grain stayed atomic than if it didn't.
+
+### Alternatives
+
+1. **Daily grain: one row per (`short_code`, day) (rejected).** Would
+   answer "clicks per URL per day" directly and compactly, but permanently
+   loses device-type, anonymous-vs-known, and hour-of-day detail — three
+   of Section 7's eight catalog metrics become unanswerable without
+   re-extracting from Bronze.
+2. **Hourly grain: one row per (`short_code`, hour) (rejected).**
+   Recovers hour-of-day answerability but still loses device-type and
+   anonymous-vs-known detail — same fundamental problem, one level less
+   severe.
+3. **Atomic grain: one row per click (chosen).** Every metric in Section
+   7's catalog — including hypothetical future ones not yet in the
+   catalog — is answerable by aggregating up from this grain. The cost is
+   size: `fact_clicks` has as many rows as `clicks` itself, which is
+   exactly the volume Section 15's incremental load already exists to
+   manage the extraction cost of.
+
+### Trade-offs
+
+| | Atomic (event) grain (chosen) | Pre-aggregated (daily/hourly) grain |
+|---|---|---|
+| Answerable questions | Any aggregation the raw data supports, including ones not yet in the catalog | Limited to whatever was decided at design time — permanently |
+| Row count | Grows with total click volume | Grows much more slowly (bounded by distinct URL × time-bucket combinations) |
+| Query cost for coarse questions (e.g. "clicks this month") | Higher — must aggregate many rows at query time | Lower — the aggregation is already done |
+| Reversibility | Fully reversible — any coarser grain can be derived from this one later | Not reversible — detail lost at load time can't be recovered |
+
+### 8.2 Architecture
+
+```mermaid
+flowchart LR
+    subgraph Source["clicks (source, grain = 1 row/click)"]
+        C[(clicks)]
+    end
+    subgraph Bronze["Bronze (Section 14/15, grain preserved)"]
+        B[(bronze/clicks/...<br/>Parquet, 1 row/click)]
+    end
+    subgraph Analytics["fact_clicks (Section 10/11, grain preserved)"]
+        F[(fact_clicks<br/>1 row/click)]
+    end
+
+    C -->|full + incremental extract| B
+    B -->|Phase 2 transform, not yet built| F
+```
+
+Grain is preserved end to end, deliberately — nothing between source and
+the analytical layer ever aggregates. Aggregation, when it's needed, is
+Section 7's live `GROUP BY` at query time, not a load-time transformation
+step.
+
+### 8.3 Hands-on Exercise
+
+**LAB 7 — Prove a grain violation would break additivity.**
+
+Without running any code, work through this on paper: suppose
+`fact_clicks` were instead grained at one row per (`short_code`, day),
+with a `click_count` column holding that day's total. Now suppose a
+second, *separate* process also inserted one row per individual click
+(perhaps someone added "detailed" rows later without changing the design).
+`SUM(click_count)` over the table now double-counts every day that has
+both a daily rollup row and its underlying detail rows — and there is
+nothing in the table's schema that would catch this, because both kinds
+of rows look identical (same columns, same table). Write down, in your own
+words, what a `NOT NULL` grain-identifying column (e.g. a `grain` flag)
+would need to look like to make this mistake structurally
+impossible instead of merely undocumented. (This is exactly why
+`fact_clicks` is committed to a single, explicit grain rather than trying
+to serve multiple grains "flexibly" in one table.)
+
+### Failure Scenario
+
+**What happens if a future contributor, trying to speed up a slow
+dashboard, adds a second set of pre-aggregated rows directly into
+`fact_clicks` instead of creating a separate summary table?**
+
+Every existing query that does `SUM(click_count)` or `COUNT(*)` over
+`fact_clicks` silently starts producing inflated numbers the moment mixed
+grain rows exist together, with no error, no constraint violation, and no
+visible signal beyond "the totals look too high" — exactly the ambiguous-
+grain failure from the Simple Example, now made concrete for this
+project's own table. **Recovery:** requires identifying and removing the
+wrongly-inserted rows, which is only possible if there's *some*
+distinguishing signal (a load-batch id, a `source` column, or — better —
+never having mixed grains in the same table in the first place).
+**Production implication:** this is precisely why the correct fix for "the
+dashboard is slow" is a *separate*, explicitly-named summary table (e.g. a
+future `agg_clicks_daily`) rather than rows-with-a-different-grain
+appended into `fact_clicks` — see Section 7's rejected Alternative #2 for
+where that summary table would fit if the performance need becomes real.
+
+### Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| Grain enforcement | None beyond code review / this document | Often a `CHECK` constraint or a dedicated grain-identifying column when a table's grain is even slightly ambiguous; better still, physically separate tables per grain (this project's own choice) |
+| Aggregation strategy | Live `GROUP BY` at query time (Section 7) | Same for ad hoc analysis; materialized/pre-aggregated views or a separate summary fact table for known, high-frequency queries once volume justifies it |
+| Grain changes over time | Not expected to change in Phase 1 | A grain change is effectively a new fact table — real systems version fact tables (e.g. `fact_clicks_v2`) rather than silently reinterpreting an existing one |
+
+### Principal Data Engineer Perspective
+
+Grain is the decision most likely to be gotten wrong quietly, because a
+table with the wrong or ambiguous grain still runs, still returns numbers,
+and still *looks* like a working fact table right up until someone sums
+the wrong column and gets a number nobody catches as implausible. The
+discipline worth internalizing here isn't "pick atomic grain always" —
+sometimes a coarser grain is the right call, e.g. when source volume makes
+atomic-grain storage genuinely infeasible — it's that the grain decision
+must be made explicitly, once, stated in one sentence per fact table
+("`fact_clicks`: one row per click event"), and never silently violated
+by a later addition. Kimball's own framing — grain first, before a single
+column is designed — is echoed directly in how this section precedes
+Section 10's actual column-by-column design.
+
+### Principal Engineer Interview Questions
+
+**Q: "You're handed an existing fact table with no documentation. How do
+you determine its grain?"**
+
+*What's tested:* whether the candidate has a concrete, repeatable method,
+versus a hand-wavy "look at the columns."
+
+*What a weak answer looks like:* "I'd look at the column names and guess"
+— unreliable; column names don't reliably reveal grain (a table can have a
+`click_count` column at either atomic or aggregated grain).
+
+*What a strong answer covers:* find the smallest set of columns that,
+together, uniquely identify a row (in this project, `click_id` alone
+already does that) — if no single-column or small combination of columns
+is unique, the table's grain is ambiguous or the data itself violates its
+own intended grain, which is itself a serious finding. Cross-check by
+sampling: pick one dimension value (e.g. one `short_code`) and manually
+verify the row count and values make sense for the grain you've
+hypothesized (e.g. "does this URL's row count roughly match how many times
+I'd expect it to have been clicked, not how many days it's existed").
+
+*Concepts:* grain identification via candidate key discovery, sanity-
+checking a hypothesis against sampled data rather than trusting column
+names alone.
+
+*Expected follow-up:* "What would make you suspect the table's grain is
+actually mixed or violated?" — Duplicate values in what should be a unique
+identifying column, or measures that don't sum sensibly when grouped by an
+attribute that should partition the data cleanly.
+
+*Common mistake:* assuming a `COUNT`-like column name (e.g. `click_count`)
+proves the grain is pre-aggregated, without checking whether that column
+is simply always `1` at an atomic grain (as `fact_clicks.click_count` is
+in this project — see Section 10.5).
+
+---
+
+## 9. Source Data Model ✅✅
+
+### Concept
+
+The **source data model** is a formal, column-by-column description of
+exactly what's being extracted from — every table, every column's type
+and nullability, every quirk worth knowing before writing a query against
+it. It's documentation, but of a specific and narrow kind: not "how the
+application works" (Section 1) and not "what the analytical layer looks
+like" (Section 10) — specifically, precisely, "what does the data this
+pipeline reads actually look like, right now."
+
+### Why does this exist?
+
+Section 1 already covered the real application's architecture and the
+honest gaps in its schema at a narrative level. This section exists
+because narrative understanding and a *formal, per-column reference* serve
+different purposes: Section 1 is read once, to understand the system;
+this section (and the files it's built from) is referenced constantly,
+every time someone writes a query, designs a dimension, or debugs a
+contract violation (Section 12). Without it, that per-column detail lives
+only in people's heads or has to be re-derived from `\d table_name` every
+time — exactly the kind of tribal knowledge a data platform should never
+depend on.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+A new engineer joins a team and is asked to write a query against a
+`payments` table. Without a source data model, they run `\d payments`,
+see a `status` column, and guess it's a free-text field — only to
+discover, after a failed join, that `status` is actually a foreign key to
+a `payment_statuses` lookup table with five specific values, one of which
+means "reversed, do not count as revenue." A five-minute read of a
+documented source data model would have surfaced that before the wrong
+query ever ran; instead it was discovered by getting a wrong number and
+working backwards.
+
+### URL Shortener Example
+
+This project's source data model already exists as three files:
+[`schemas/source/urls.md`](../schemas/source/urls.md),
+[`schemas/source/users.md`](../schemas/source/users.md), and
+[`schemas/source/clicks.md`](../schemas/source/clicks.md) — one per
+table, each with a full column table, an explicit grain statement, and a
+"known quirks" section calling out exactly the kind of trap the Simple
+Example describes (e.g. `clicks.md`'s note that `occurred_at` is business
+time while Bronze's `ingestion_date=`/`watermark_start=...` partitioning
+is processing time — two different clocks that are easy to conflate).
+This guide doesn't repeat their content here; it explains *why* they exist
+as their own artifacts and how they relate to everything else in this
+project.
+
+### 9.1 Design Decision
+
+**The source data model lives as three standalone Markdown files under
+`schemas/source/`, one per table, formalized to a consistent structure
+(column table, grain, known quirks) — not as prose embedded in this
+guide, and not merged into one document per source system.** Kept
+separate from this guide because these files are referenced far more
+often, by far more specific queries ("what's the exact nullability of
+`urls.expires_at`?"), than the guide's own narrative sections are — a
+reference document optimized for lookup reads differently than a document
+optimized for a linear read. Kept one-file-per-table, rather than one
+combined file, so a change to `clicks`' documented shape (e.g. adding a
+new column later) touches exactly one file, not a section carved out of a
+larger one.
+
+### Alternatives
+
+1. **No formal source data model — rely on Section 1's narrative writeup
+   alone (rejected).** Section 1 already explains urls' gaps and the
+   users/clicks hypothetical-table decision at a conceptual level, but
+   doesn't give a queryable, glanceable per-column reference — exactly the
+   gap the Simple Example illustrates.
+2. **One combined `schemas/source/README.md` covering all three tables
+   (rejected).** Would centralize everything in one place, at the cost of
+   every table's documentation competing for space and growing awkward as
+   more tables are added (a real concern once Phase 2+ potentially
+   extracts from more source tables).
+3. **Per-table files, formalized structure, cross-linked from this guide
+   and from `contracts/source/*.yaml` (chosen).** Scales cleanly with the
+   number of source tables and keeps each file focused.
+
+### Trade-offs
+
+| | Per-table Markdown files (chosen) | Inline in this guide |
+|---|---|---|
+| Discoverability for "what does column X look like" | High — one file, one table, `Ctrl+F` | Lower — buried inside a much longer document |
+| Guide length / focus | This guide stays focused on concepts and design narrative | Guide would grow by hundreds of lines of pure reference material |
+| Risk of drift from `contracts/source/*.yaml` (Section 12) | Two artifacts to keep in sync (mitigated: contracts are machine-checked against the real DB; these files aren't, yet) | Same risk, just harder to spot in a longer document |
+
+### 9.2 How the pieces fit together
+
+| Artifact | Purpose | Checked how |
+|---|---|---|
+| `schemas/source/*.md` | Human-readable, narrative-plus-table reference per source table | Manually reviewed; not machine-checked |
+| `sql/source/*.sql` | The actual DDL — ground truth for what Postgres will create | Applied for real by `make up` |
+| `contracts/source/*.yaml` | Machine-checked contract — declares the expected shape and validates it against the live database | `make validate-contracts` (Section 12) |
+
+Three artifacts, three different jobs — a human reading to understand, a
+database enforcing structure, and an automated check catching drift
+between the two. Section 12 covers the third in depth.
+
+### 9.3 Hands-on Exercise
+
+**LAB 8 — Find a documented quirk before it bites you.**
+
+Without looking at `object_store.py` or `extract_incremental.py` again,
+open `schemas/source/clicks.md` and answer: which column does Section
+15's watermark actually use, and which column would a newcomer likely
+*guess* it uses if they only looked at the table's column names without
+reading the "known quirks" section? (Expected answer: the watermark uses
+`id`, not `occurred_at` — despite `occurred_at` being the column that
+*sounds* like the natural choice for anything watermark/time-related. This
+is precisely the kind of mismatch between intuition and actual behavior a
+source data model's "known quirks" section exists to catch before it
+causes a bug.)
+
+### Failure Scenario
+
+**What happens if `sql/source/002_hypothetical_users_and_clicks.sql`
+changes (say, a column is added) but `schemas/source/clicks.md` is never
+updated to match?**
+
+Nothing enforces the two stay in sync — `schemas/source/*.md` files are
+plain Markdown, not validated against the database the way
+`contracts/source/*.yaml` is (Section 12). The documented model silently
+becomes stale: a reader trusts `clicks.md`'s column table, writes a query
+or a contract assuming it's complete, and either misses the new column
+entirely or — worse — doesn't know a *new* quirk exists because nothing
+was written about it. **Production implication:** this is exactly the gap
+`contracts/source/*.yaml` closes for the machine-checkable subset of this
+information (column existence, type, nullability) — Section 12's
+validator would catch a schema drift the Markdown docs can't. What it
+*wouldn't* catch: a change to a quirk's underlying behavior that doesn't
+change the schema at all (e.g. if `occurred_at` started being set by a
+different, less reliable process) — that class of drift still depends on
+someone updating the prose by hand, which is a real, named limitation, not
+a hidden one.
+
+### Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| Sync with real schema | Manual — a human updates `schemas/source/*.md` when `sql/source/*.sql` changes | Often generated or partially generated from the database itself (e.g. a script that diffs documented vs. actual columns and flags drift) |
+| Ownership | Implicit (this project) | Each source table's documentation typically owned by whichever team owns the system of record |
+| Versioning | Git history only | Sometimes paired with a formal schema registry, especially once multiple downstream consumers depend on the same source |
+
+### Principal Data Engineer Perspective
+
+The distinction worth holding onto from this section: a source data model
+and a data contract (Section 12) look similar — both describe a table's
+shape — but serve fundamentally different roles. The source data model is
+optimized for a *human* deciding how to use the data (nullability quirks,
+business-vs-processing-time distinctions, "don't guess, read this
+first"); the contract is optimized for a *machine* catching drift
+automatically. A principal engineer keeps both, deliberately, rather than
+trying to make one artifact serve both jobs — a YAML contract could
+technically hold prose explanations too, but cramming human-readable
+nuance into a file whose primary job is automated comparison makes both
+jobs worse.
+
+### Principal Engineer Interview Questions
+
+**Q: "What's the difference between documenting a table's schema and
+defining a data contract for it? Why would a team need both?"**
+
+*What's tested:* whether the candidate sees documentation and contracts as
+distinct tools with different failure modes, or treats them as the same
+thing with different formatting.
+
+*What a weak answer looks like:* "A contract is just documentation in
+YAML instead of Markdown" — misses the core distinction (one is checked
+automatically, one isn't).
+
+*What a strong answer covers:* documentation is written for a human to
+read once and internalize; a contract is written to be checked by a
+machine, continuously, against the live system, specifically to catch the
+moment documentation (or the schema itself) silently drifts from what a
+downstream consumer expects. A team needs both because they catch
+different failures: documentation prevents a human from making a wrong
+assumption (this project's `occurred_at`-vs-`id` watermark quirk); a
+contract prevents an *undetected* schema change from silently breaking
+every downstream consumer that assumed the old shape.
+
+*Concepts:* the human-readable vs. machine-checked distinction; schema
+drift as a class of failure documentation alone cannot catch.
+
+*Expected follow-up:* "How would you keep the two from drifting apart from
+each other?" — Either generate one from the other where possible, or treat
+updating both as part of the same change's definition of done (a review
+checklist item, not a separate follow-up task).
+
+*Common mistake:* conflating "well-documented" with "safe from schema
+drift" — documentation quality says nothing about whether anyone would
+notice if the documentation stopped being true.
+
+---
+
+## 10. Analytical Data Model (Fact/Dimension Design) ✅✅
+
+### Concept
+
+**Dimensional modeling** (Kimball-style) organizes analytical data into
+**fact tables** (the measurable events — "what happened, how many times,
+how much") and **dimension tables** (the descriptive context those events
+are analyzed by — "who, what, when, where"). A **fact table** holds
+numeric measures at a defined grain (Section 8) plus foreign keys into
+dimensions; a **dimension table** holds descriptive attributes, one row
+per distinct real-world entity, with a surrogate key the fact table joins
+on.
+
+### Why does this exist?
+
+The source schema (Section 9) is optimized for the OLTP application's own
+needs — fast single-row lookups and writes, third-normal-form-ish
+structure, no redundancy. That shape is actively bad for analytical
+queries: answering "clicks by device type, by plan, by day" against a
+normalized OLTP schema means joining several tables per query, every
+query, at read time. A dimensional model restructures the same
+information around how it's actually *queried* — one central fact table,
+a handful of dimensions, most analytical questions answerable with one or
+two joins — trading write-optimized normalization for read-optimized
+predictability. This is the direct sequel to Section 2 (OLTP vs. OLAP):
+that section explained *why* the two shapes differ in principle; this
+section is where this project's own OLAP shape gets designed.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+A normalized OLTP schema for a video-streaming service might spread "what
+did this viewer watch" across `sessions`, `session_events`, `titles`,
+`title_genres`, and `viewers` — five tables, several joins, to answer "how
+many hours of comedy did premium subscribers watch last month." A
+dimensional model for the same question puts one row per viewing event in
+a `fact_views` table (with `viewer_key`, `title_key`, `date_key`,
+`minutes_watched`) and denormalizes genre directly onto a `dim_title`
+dimension — the same question becomes one fact table joined to two small
+dimensions, filtered and grouped, no multi-hop join chain required.
+
+### URL Shortener Example
+
+This project's OLTP mirror (`urls`, `users`, `clicks`) is small enough
+that the normalization cost is barely noticeable today — but Section 7's
+metrics catalog was written assuming a dimensional shape (`GROUP BY
+device_type`, `GROUP BY plan_type`, joined to a fact table each time), not
+the source schema's own shape. This section designs exactly that: `dim_date`,
+`dim_url`, `dim_user`, `dim_device`, and `fact_clicks` — full reference in
+[`schemas/analytics/dimensional-model.md`](../schemas/analytics/dimensional-model.md),
+DDL in [`sql/analytics/`](../sql/analytics/).
+
+### 10.1 Architecture
+
+```mermaid
+erDiagram
+    dim_date ||--o{ fact_clicks : date_key
+    dim_url ||--o{ fact_clicks : url_key
+    dim_user ||--o{ fact_clicks : user_key
+    dim_device ||--o{ fact_clicks : device_key
+```
+
+(Full column-level diagram, with every field: `schemas/analytics/dimensional-model.md`.)
+A classic **star schema** shape — one fact table at the center, each
+dimension joined to it directly, never to each other. Section 11 covers
+*why* this shape (vs. a normalized/snowflake alternative) in depth; this
+section covers what's *in* each table and why.
+
+### 10.2 `dim_date`: a conformed dimension, not derived from source
+
+`dim_date` is the one table in this model with **no source table at
+all** — it's generated once, at DDL time, via `generate_series` for a
+fixed calendar range (`sql/analytics/001_dim_date.sql`). This is standard
+Kimball practice, not a shortcut specific to this project: a date
+dimension's content (day-of-week, month name, quarter, is-weekend) is
+calendar math, not business data, so there's nothing to "extract" — only
+something to generate once and reuse everywhere. It's also this project's
+first **conformed dimension**: built independent of any one fact table,
+so a future second fact table can join to the exact same `dim_date`
+without redefining what a date means.
+
+### 10.3 Design Decision: `fact_clicks.user_key` is never `NULL`
+
+This is the single most consequential decision in this dimensional model,
+worth its own callout. `clicks.user_id` is nullable at the source — about
+70% of seeded clicks are anonymous. The naive translation would leave
+`fact_clicks.user_key` nullable too, with `NULL` meaning "anonymous." This
+is a well-known Kimball anti-pattern: most SQL tools and BI clients
+generate an `INNER JOIN` by default when joining a fact to a dimension,
+and an `INNER JOIN` silently **drops every row with a `NULL` foreign
+key** — a dashboard built against `fact_clicks JOIN dim_user` would
+silently under-count total clicks by exactly the anonymous share, with no
+error and no obviously wrong-looking result (the numbers would just be
+quietly too low). **The chosen design:** `dim_user` includes a designated
+**Unknown member row** — `user_key = -1`, `is_known = false` — and every
+anonymous click's `fact_clicks.user_key` resolves to `-1` instead of
+`NULL`. `user_key` becomes `NOT NULL` in the DDL (`sql/analytics/005_fact_clicks.sql`),
+and an `INNER JOIN` now returns every row, correctly, with the Unknown
+member's attributes (`plan_type = 'UNKNOWN'`) standing in for "no
+attributed user" instead of silently vanishing.
+
+### Alternatives
+
+1. **Nullable `user_key`, `NULL` means anonymous (rejected).** Matches the
+   source data's own nullability most literally, at the cost of the
+   silent-undercount failure mode above — the option every dimensional
+   modeling reference explicitly warns against.
+2. **`LEFT JOIN` everywhere instead of fixing the data (rejected).**
+   Technically avoids the undercount, but only if every single query
+   author remembers to use `LEFT JOIN` instead of the tool's default —
+   fixing this once, in the data, is far more reliable than fixing it
+   correctly in every query, forever.
+3. **A designated Unknown/Not-Applicable member row, `NOT NULL` foreign
+   key (chosen).** Standard Kimball technique for exactly this situation;
+   makes the safe behavior (`INNER JOIN`, the default) also the *correct*
+   behavior.
+
+### Trade-offs
+
+| | Unknown-member row, NOT NULL FK (chosen) | Nullable FK, NULL = anonymous |
+|---|---|---|
+| Default `INNER JOIN` behavior | Correct — every row included | Silently wrong — anonymous rows vanish |
+| Query author has to remember anything special | No | Yes — must always `LEFT JOIN` `dim_user` |
+| Schema honesty | `dim_user` explicitly models "no known user" as a real, queryable value | `NULL` is overloaded to mean "unknown" with no queryable attributes attached |
+| Extra row per dimension | One (the Unknown member) | None |
+
+### 10.4 Design Decision: `dim_user` excludes `email`
+
+`dim_user` deliberately does **not** carry `users.email` through to the
+analytical layer. Section 7's entire metrics catalog only ever needs
+`plan_type` — no metric groups or filters by individual user identity —
+so there is no analytical requirement pulling `email` into this model at
+all. Given that, keeping it out is the conservative default: every column
+that reaches the analytical layer is one more place PII (Section 23,
+planned) has to be tracked, access-controlled, and eventually governed;
+not including a column nothing needs is simpler than including it and
+then having to justify, audit, and restrict it later. This is a "shaped by
+actual requirements" decision, in the same spirit as Section 7's
+insistence that the model be built for known questions, not
+speculative future ones.
+
+### 10.5 `fact_clicks.click_count`: measure design
+
+`click_count` is always `1` at this grain — every row is exactly one
+click. Kimball calls this pattern a **factless-fact-adjacent** measure:
+technically redundant with `COUNT(*)`, but included explicitly for two
+concrete reasons. First, consistency: once a second additive measure ever
+gets added to this fact table (e.g. a future "time to redirect" duration),
+`SUM(click_count)` and `SUM(new_measure)` read identically in every query
+— nobody has to remember "this one measure is `COUNT(*)`, that one is
+`SUM(column)`." Second, portability: `SUM(click_count)` behaves
+identically whether the query engine is Postgres, a Phase 3 analytical
+warehouse, or a BI tool's own aggregation layer, whereas `COUNT(*)`
+semantics can subtly differ across engines when combined with certain
+join patterns. `short_code` and `occurred_at` are **degenerate
+dimensions/attributes** — see [`schemas/analytics/dimensional-model.md`](../schemas/analytics/dimensional-model.md)
+for the full reasoning on both.
+
+### 10.6 Hands-on Challenge (implement-yourself)
+
+Before reading Section 11's DDL, try this: **design `dim_url`'s columns
+yourself**, using only Section 7's metrics catalog and
+`schemas/source/urls.md` as inputs — don't look at
+`sql/analytics/002_dim_url.sql` yet. Which source columns does the
+catalog actually need? (Hint: check every catalog row that mentions a URL
+attribute.) Would you include `deleted_at`? `expires_at`? Then compare
+your answer against the committed DDL and this section's design
+decisions — where they differ, ask whether your version serves a
+requirement the committed one misses, or whether the committed version
+deliberately left something out that you included on reflex (a common
+outcome: reflexively including every source column "just in case," which
+is exactly the anti-pattern Section 10.4's PII decision pushes back
+against).
+
+### 10.7 Hands-on Exercise
+
+**LAB 10 — Prove the Unknown member resolves a real join, not just an
+insert.**
+
+*(Requires `make up` and `make create-analytics-schema` — DESIGN
+EXPECTATION, not yet executed in this sandbox; see Section 11's How to
+test for what genuinely was run.)*
+
+```sql
+-- dim_user has exactly one row (the Unknown member) before Phase 2 runs.
+SELECT user_key, user_id, plan_type, is_known FROM dim_user;
+-- Expected: exactly one row -- (-1, -1, 'UNKNOWN', false).
+
+-- Confirm an INNER JOIN against dim_user, even with zero "real" rows
+-- loaded yet, still has a member for user_key=-1 to resolve against --
+-- the whole point of Section 10.3's design decision.
+SELECT du.plan_type, COUNT(*)
+FROM (SELECT -1 AS user_key) AS simulated_anonymous_click
+INNER JOIN dim_user du ON du.user_key = simulated_anonymous_click.user_key
+GROUP BY du.plan_type;
+-- Expected: one row, plan_type = 'UNKNOWN', count = 1 -- an INNER JOIN
+-- that would have silently dropped this row entirely had user_key been
+-- NULL instead of -1.
+```
+
+What to observe: the second query is a stand-in for exactly what a BI
+tool's default `INNER JOIN` would do against a real `fact_clicks` row for
+an anonymous click — and it returns a row, correctly, instead of silently
+excluding it. This is Section 10.3's entire design decision, made
+concrete and checkable rather than just argued for in prose.
+
+### Failure Scenario
+
+**What happens if a new anonymous-click-heavy source (say, a public API
+integration) is added later, and someone forgets the Unknown-member
+convention when writing its transform?**
+
+If a new transform path inserts `fact_clicks` rows with `user_key = NULL`
+directly (bypassing the Unknown-member lookup), the `NOT NULL` constraint
+on `fact_clicks.user_key` (Section 10.3, enforced in
+`sql/analytics/005_fact_clicks.sql`) rejects the insert outright — a loud,
+immediate failure at load time, not a silent under-count discovered
+months later in a dashboard. **This is the entire point of making it a
+database-level constraint rather than a convention documented only in
+this guide**: a convention can be forgotten; a `NOT NULL` constraint
+cannot be silently violated. **Production implication:** every new
+data-loading path into a fact table with this pattern must resolve
+unknown/missing dimension keys to the designated Unknown member *before*
+the insert, and the constraint exists specifically to make skipping that
+step impossible rather than merely discouraged.
+
+### Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| SCD strategy | Type 1 (overwrite) for `dim_url`/`dim_user` — no history tracked | Type 2 (versioned rows with valid-from/valid-to) once change history has real analytical value, and once the source has reliable change-detection (an `updated_at` column, or CDC) |
+| Unknown-member pattern | One Unknown row per dimension that needs it (`dim_user`) | Same pattern, applied consistently across every dimension with nullable source foreign keys — a real anti-pattern audit checks for exactly this |
+| Schema evolution | Manual DDL changes, reviewed by hand | Often paired with a schema registry / migration tool, and contract validation (Section 12) extended to cover the analytical layer too (explicitly not done yet — see Section 12's Production Considerations) |
+| Surrogate key generation | Postgres `SERIAL` | Same idea at any scale; distributed systems sometimes use a dedicated key-generation service instead of a single sequence |
+
+### Principal Data Engineer Perspective
+
+The Unknown-member decision (10.3) is a good example of what
+distinguishes a dimensional model that merely *works* from one that's
+*correct under the tool's own defaults*. A junior implementation nullable
+`user_key` design would pass every test that doesn't specifically check
+join behavior — it would load, it would query, it would look done. The
+failure only appears the moment someone (very possibly not the original
+author) opens a BI tool, drags `fact_clicks` and `dim_user` onto a canvas,
+and lets the tool's default join type quietly discard 70% of the
+anonymous-click rows from every report built on top of it. A principal
+engineer designs for the *tool's default behavior*, not just for what a
+carefully-written test suite happens to exercise — which is exactly why
+Section 10.3 treats "what does an `INNER JOIN` do by default" as a design
+input, not an afterthought.
+
+### Principal Engineer Interview Questions
+
+**Q: "Why does `fact_clicks.user_key` reference a designated 'Unknown'
+row instead of allowing `NULL` for anonymous clicks?"**
+
+*What's tested:* whether the candidate knows this specific, well-known
+dimensional-modeling pattern and can explain the failure it prevents, not
+just recite that "NULLs are bad."
+
+*What a weak answer looks like:* "NULLs are generally best avoided in
+databases" — true in general, but doesn't explain *this specific*
+mechanism or why it matters here more than anywhere else.
+
+*What a strong answer covers:* most SQL clients and BI tools default to
+`INNER JOIN` when joining a fact table to a dimension; a `NULL` foreign
+key is excluded by an `INNER JOIN` by definition, so every report built
+with the tool's default join silently loses every anonymous-click row —
+not an error, just a quietly wrong (too-low) total. A designated Unknown
+member row with a `NOT NULL` foreign key makes the default, unthinking
+behavior also the correct one.
+
+*Concepts:* the "fact table foreign keys should never be NULL" Kimball
+principle; default join semantics as a design constraint, not just a
+query-writing concern.
+
+*Expected follow-up:* "How would you retrofit this onto an existing fact
+table that already has NULL foreign keys in production?" — Add the
+Unknown member row, backfill existing NULLs to reference it, then add the
+`NOT NULL` constraint — in that order, since adding the constraint before
+the backfill would simply fail.
+
+*Common mistake:* treating this as a generic "NULLs are bad practice"
+talking point without connecting it to the concrete, silent-undercount
+failure mode it specifically prevents in a star schema.
+
+---
+
+## 11. Star Schema vs. Normalized Model ✅✅
+
+### Concept
+
+A **star schema** is a dimensional model where every dimension joins
+directly to the fact table, never to another dimension — the shape Section
+10 already designed. A **normalized model** (third normal form, roughly
+what `urls`/`users`/`clicks` already are) eliminates data redundancy by
+splitting attributes into their own tables, related by foreign keys,
+however many hops deep that takes. A **snowflake schema** is a middle
+ground: a star schema where some dimensions are further normalized into
+sub-dimensions.
+
+### Why does this exist?
+
+Section 10 designed `fact_clicks` and its dimensions without stopping to
+justify the star *shape* itself — this section closes that gap
+explicitly, because "star vs. normalized" is a decision every analytical
+data model has to make once, and the two shapes trade off correctness
+guarantees and storage efficiency (normalized) against query simplicity
+and read performance (star) in ways worth understanding on their own
+terms, not just inheriting by convention.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+A normalized `dim_url`-equivalent might split "destination domain" into
+its own `domains` table, referenced by `url_id`, to avoid repeating domain
+strings across rows (classic normalization: eliminate redundancy). A star
+schema instead denormalizes `original_url_domain` directly onto `dim_url`
+itself — some repeated text, but "clicks by domain" becomes a single join
+to `fact_clicks` instead of two. At OLTP write-heavy scale, normalization
+wins (less duplicated data to keep consistent on update); at OLAP
+read-heavy analytical scale, the star schema usually wins (fewer joins per
+query, and dimension tables are small enough that the storage cost of
+denormalization is negligible).
+
+### URL Shortener Example
+
+This project's own `urls`/`users`/`clicks` OLTP schema is *already*
+essentially normalized (Section 2's OLTP vs. OLAP distinction, applied
+concretely) — `user_id` on `urls` and `clicks` is a foreign key, not a
+duplicated `plan_type` string. Section 10's `dim_url`/`dim_user`/`dim_device`
+design deliberately denormalizes: `fact_clicks` carries `short_code`
+directly (Section 10.5's degenerate-dimension decision), and `dim_user`
+flattens `plan_type` directly onto each user row rather than referencing a
+separate `plans` lookup table — a snowflake alternative this section
+explicitly considers and rejects below.
+
+### 11.1 Design Decision
+
+**This project uses a pure star schema — no snowflaking.** `dim_user`
+keeps `plan_type` as a plain column rather than a foreign key to a
+separate `plans` dimension; `dim_url` keeps `original_url_domain` as a
+plain derived column rather than a foreign key to a `domains` dimension.
+Every dimension in this model joins directly to `fact_clicks` and to
+nothing else.
+
+### Alternatives
+
+1. **Fully normalized analytical layer — reuse the OLTP shape as-is,
+   analytical queries join across `urls`/`users`/`clicks` directly
+   (rejected).** No transformation pipeline needed at all, but every
+   metric in Section 7's catalog requires multiple joins, and the
+   OLTP tables aren't optimized for the read patterns analytical queries
+   actually have (Section 2's entire argument, applied here).
+2. **Snowflake schema — normalize `plan_type` into its own `dim_plan`
+   table, `original_url_domain` into its own `dim_domain` table
+   (rejected for Phase 1).** Would eliminate the small amount of
+   redundancy a plain-column `plan_type`/`domain` carries (only 2 distinct
+   plan values, a modest number of distinct domains in the seeded data),
+   at the cost of one more join for every query that needs those
+   attributes — not worth it at this cardinality. Worth reconsidering only
+   if a dimension's low-cardinality attribute set grows large and
+   genuinely shared across multiple fact tables.
+3. **Pure star schema (chosen).** Every catalog metric in Section 7 is
+   answerable with `fact_clicks` joined to at most one dimension — the
+   simplest shape that fully serves the known requirements, per Section
+   7's own "build for known questions" principle.
+
+### Trade-offs
+
+| | Star schema (chosen) | Normalized / snowflake |
+|---|---|---|
+| Joins per typical query | One (fact → one dimension) | Two or more (fact → dimension → sub-dimension, or fact → several OLTP tables) |
+| Storage redundancy | Some (e.g. `plan_type` repeated once per `dim_user` row — negligible at this scale) | Minimal — every value stored once |
+| Write complexity | N/A in Phase 1 (this schema isn't written to yet — Phase 2 builds the transform) | N/A here for the same reason, but normalized models generally make single-row updates cheaper |
+| Query simplicity for analysts / BI tools | High — matches how most BI tools expect a model to look | Lower — more joins to configure correctly in every tool |
+
+### 11.2 Implementation
+
+The DDL for all five tables is committed at
+[`sql/analytics/`](../sql/analytics/), one file per table, applied
+in filename order (`001_dim_date.sql` through `005_fact_clicks.sql` — the
+numeric prefix encodes dependency order: `dim_date`/`dim_user`/`dim_device`
+before `fact_clicks`, which references all of them via foreign key).
+
+**Implementation Guide vs. Reference Implementation:** if you want the
+hands-on version, read the *Implementation Guide* below, close this
+guide, and write the DDL yourself from
+`schemas/analytics/dimensional-model.md`'s column reference — then
+compare against the committed files. If you want to study the finished
+schema directly, the excerpts below are exactly what's committed.
+
+---
+
+**CREATE:** `sql/analytics/001_dim_date.sql` through `005_fact_clicks.sql`
+
+**PURPOSE:** Define the star schema (Section 10's design, made real) —
+schema only in Phase 1; Phase 2's transform is what actually populates
+`dim_url`, `dim_device`'s usage, and `fact_clicks` from Bronze.
+
+**DEPENDENCIES:** A running Postgres (`make up`); no Python dependency —
+this is pure DDL, applied with `psql`.
+
+**IMPLEMENTATION GUIDE (write it yourself):** start from
+`schemas/analytics/dimensional-model.md`'s column tables. For `dim_date`,
+the only real design choice is the key encoding — use `YYYYMMDD` as an
+`INTEGER` (Kimball convention: sorts and joins cheaply, human-readable
+without a join), and populate it with one `INSERT ... SELECT` over
+`generate_series` for a fixed range, rather than a loop or an external
+script — Postgres can generate an entire decade of dates in one
+statement. For `dim_user`, remember Section 10.3's constraint: the Unknown
+member row (`user_key = -1`) must be inserted as part of the DDL itself
+(`ON CONFLICT DO NOTHING` makes the insert idempotent across reruns), not
+left for the transform to create later — a `fact_clicks` row referencing
+`user_key = -1` must always be able to resolve, even before Phase 2's
+transform has ever run. For `fact_clicks`, use `click_id` (the source
+`clicks.id`) directly as the primary key rather than a separate surrogate
+— at this grain, the natural key is already unique and stable, so a
+surrogate key would add nothing (contrast this with `dim_url`/`dim_user`,
+where a surrogate key genuinely earns its keep across SCD changes). Make
+every foreign key `NOT NULL`.
+
+**REFERENCE IMPLEMENTATION:**
+
+```sql
+-- sql/analytics/001_dim_date.sql (excerpt -- full file already committed)
+CREATE TABLE IF NOT EXISTS dim_date (
+    date_key     INTEGER PRIMARY KEY,      -- YYYYMMDD
+    full_date    DATE NOT NULL UNIQUE,
+    day_of_week  SMALLINT NOT NULL,
+    is_weekend   BOOLEAN NOT NULL
+    -- ... day_name, month, month_name, quarter, year (see full file)
+);
+
+INSERT INTO dim_date (date_key, full_date, day_of_week, is_weekend, ...)
+SELECT CAST(to_char(d, 'YYYYMMDD') AS INTEGER), d, EXTRACT(DOW FROM d)::SMALLINT,
+       EXTRACT(ISODOW FROM d) IN (6, 7), ...
+FROM generate_series(DATE '2020-01-01', DATE '2030-12-31', INTERVAL '1 day') AS d
+ON CONFLICT (date_key) DO NOTHING;
+```
+
+```sql
+-- sql/analytics/003_dim_user.sql (excerpt)
+CREATE TABLE IF NOT EXISTS dim_user (
+    user_key   SERIAL PRIMARY KEY,      -- -1 reserved for the Unknown member
+    user_id    BIGINT NOT NULL UNIQUE,  -- natural key; -1 for the Unknown member
+    plan_type  VARCHAR(16) NOT NULL,
+    is_known   BOOLEAN NOT NULL
+);
+
+INSERT INTO dim_user (user_key, user_id, plan_type, is_known)
+VALUES (-1, -1, 'UNKNOWN', false)
+ON CONFLICT (user_key) DO NOTHING;
+```
+
+```sql
+-- sql/analytics/005_fact_clicks.sql (excerpt)
+CREATE TABLE IF NOT EXISTS fact_clicks (
+    click_id     BIGINT PRIMARY KEY,     -- natural key, source clicks.id
+    date_key     INTEGER NOT NULL REFERENCES dim_date (date_key),
+    url_key      INTEGER NOT NULL REFERENCES dim_url (url_key),
+    user_key     INTEGER NOT NULL REFERENCES dim_user (user_key),
+    device_key   INTEGER NOT NULL REFERENCES dim_device (device_key),
+    short_code   VARCHAR(16) NOT NULL,
+    occurred_at  TIMESTAMPTZ NOT NULL,
+    click_count  SMALLINT NOT NULL DEFAULT 1
+);
+```
+
+Full files: [`sql/analytics/`](../sql/analytics/).
+
+**RUN:**
+
+```bash
+make up
+make create-analytics-schema
+```
+
+**VERIFY:**
+
+```bash
+make db-shell
+\dt                      -- confirm dim_date, dim_url, dim_user, dim_device, fact_clicks exist
+SELECT COUNT(*) FROM dim_date;   -- expect 4,018 (2020-01-01 through 2030-12-31, inclusive)
+SELECT * FROM dim_user WHERE user_key = -1;  -- confirm the Unknown member exists
+SELECT * FROM dim_device;        -- expect exactly 4 rows: mobile, desktop, tablet, unknown
+```
+
+**EXPECTED:** five tables exist; `dim_date` has one row per calendar day
+in the generated range; `dim_user` has exactly one row (the Unknown
+member) until Phase 2's transform runs; `dim_device` has exactly its four
+seeded rows; `dim_url` and `fact_clicks` are empty until Phase 2.
+
+**ACTUAL OBSERVED result:** this sandbox has no Docker daemon, but it
+does have a real, locally installed Postgres 16 — all five DDL files were
+applied against it directly (`psql`, not through `docker-compose.yml`,
+since that specifically needs Docker) while writing this section:
+
+```
+=== applying sql/analytics/001_dim_date.sql ===
+CREATE TABLE
+COMMENT
+INSERT 0 4018
+=== applying sql/analytics/002_dim_url.sql ===
+CREATE TABLE
+COMMENT
+CREATE INDEX
+=== applying sql/analytics/003_dim_user.sql ===
+CREATE TABLE
+COMMENT
+INSERT 0 1
+=== applying sql/analytics/004_dim_device.sql ===
+CREATE TABLE
+COMMENT
+INSERT 0 4
+=== applying sql/analytics/005_fact_clicks.sql ===
+CREATE TABLE
+COMMENT
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+```
+
+`dim_date` really does hold exactly 4,018 rows (verified computationally:
+`(date(2030,12,31) - date(2020,1,1)).days + 1 == 4018`, then confirmed
+with `SELECT COUNT(*) FROM dim_date` against the real table); `dim_user`
+holds exactly the one Unknown-member row; `dim_device` holds exactly its
+four seeded rows. This is genuinely run, not projected — the one gap
+still open is validating it through `docker-compose.yml` and
+`make create-analytics-schema` specifically, since this sandbox can apply
+the DDL directly but can't run Docker.
+
+**TEST:** no automated test yet exercises this DDL directly (it's pure
+schema, no Python code to unit test) — Section 12's contract validator is
+the mechanism that will eventually catch drift here too, once the
+analytical layer is added to its scope (see Section 12's Production
+Considerations for why that's explicitly not done in Phase 1).
+
+**PRODUCTION CONSIDERATIONS:** see Section 10's Production Considerations
+table — the same SCD/schema-evolution concerns apply here, since this IS
+that schema.
+
+**INTERVIEW QUESTIONS:** see this section's own, below.
+
+---
+
+### Hands-on Challenge (implement-yourself)
+
+Before reading further, try this: **write the DDL for a hypothetical
+`dim_plan` table** (the snowflake alternative rejected in this section's
+Alternatives), and the corresponding change to `dim_user` (replacing
+`plan_type VARCHAR(16)` with `plan_key INTEGER REFERENCES dim_plan`).
+Then write the query for "clicks by plan type" against *both* versions of
+the schema — the current star-schema one and your snowflaked one — and
+count the joins each requires. This is the entire star-vs-snowflake
+trade-off, made concrete in one exercise: how much duplicate data (2
+repeated `plan_type` strings per distinct value across every `dim_user`
+row) is worth avoiding, against how much query complexity that avoidance
+costs.
+
+### 11.3 Hands-on Exercise
+
+**LAB 9 — Confirm the Unknown member resolves correctly.**
+
+After `make create-analytics-schema`:
+
+```sql
+-- Simulates what a Phase 2 transform's insert would look like for one
+-- anonymous click, without Phase 2 actually existing yet.
+INSERT INTO fact_clicks (click_id, date_key, url_key, user_key, device_key, short_code, occurred_at)
+VALUES (999999, 20260919, 1, -1, 1, 'test01', now());
+-- This should succeed -- user_key=-1 resolves to the Unknown member.
+
+INSERT INTO fact_clicks (click_id, date_key, url_key, user_key, device_key, short_code, occurred_at)
+VALUES (999998, 20260919, 1, NULL, 1, 'test02', now());
+-- This should FAIL -- user_key is NOT NULL. Expected error: null value in
+-- column "user_key" violates not-null constraint.
+```
+
+*(This exercise requires `dim_url` to have at least one row with
+`url_key = 1` and `dim_device` a row with `device_key = 1` to satisfy the
+other foreign keys — insert placeholder rows first if testing this before
+Phase 2 populates them for real.)*
+
+**ACTUAL OBSERVED result:** this sandbox turned out to have a local
+Postgres 16 available after all (not Docker, but real Postgres) — this
+exact exercise was run against it while writing this section. The first
+insert succeeded; the second failed with exactly the predicted error:
+
+```
+ERROR:  null value in column "user_key" of relation "fact_clicks" violates not-null constraint
+DETAIL:  Failing row contains (999998, 20260919, 1, null, 1, test02, 2026-09-19 17:49:53.775691+00, 1, 2026-09-19 17:49:53.775691+00).
+```
+
+### Failure Scenario
+
+**What happens if Phase 2's transform is written against a snowflaked
+schema (say, someone "improves" `dim_user` into `dim_user` + `dim_plan`
+without updating this section or `schemas/analytics/dimensional-model.md`)?**
+
+Every existing query written against the star-schema assumption (`dim_user.plan_type`
+as a plain column, per Section 7's catalog) breaks — not silently, since
+`plan_type` would no longer exist on `dim_user` at all and every such
+query would fail with an explicit "column does not exist" error. This is
+actually the *good* version of a schema-shape failure (loud, not silent) —
+contrast with Section 10.3's Unknown-member scenario, where the failure
+mode without a constraint would have been silent. **Production
+implication:** a schema-shape decision like star-vs-snowflake, once
+downstream queries and dashboards depend on it, is a breaking change to
+reverse — exactly why this section documents the decision explicitly
+rather than leaving it as an implicit consequence of however Phase 2 ends
+up being written.
+
+### Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| Schema shape | Pure star, no snowflaking | Same principle at scale; snowflaking reconsidered only for genuinely large, genuinely shared low-cardinality attribute sets |
+| Query tooling assumptions | None yet (Phase 3 builds analytical serving) | BI tools generally assume and are optimized for star schemas specifically — a snowflake schema often needs explicit join configuration per tool |
+| Schema versioning | Numeric filename prefixes (`001_`, `002_`, ...), applied in order | Often a formal migration tool (e.g. Alembic, Flyway) once the schema changes after initial creation, rather than idempotent `CREATE TABLE IF NOT EXISTS` files |
+
+### Principal Data Engineer Perspective
+
+Star vs. snowflake is one of the rare dimensional-modeling decisions where
+the "textbook-correct" answer is genuinely context-dependent rather than
+universal — Kimball's own guidance favors stars for BI-tool
+compatibility, but a genuinely large, genuinely shared dimension attribute
+set (imagine hundreds of thousands of `plan_type`-equivalent rows shared
+across a dozen fact tables) can make snowflaking the more defensible
+choice. What matters, and what this section tries to model, is having an
+explicit, cardinality-and-requirements-based reason for the choice made —
+"we chose star because our dimension attributes are low-cardinality and
+this data model only currently has one fact table" is a defensible,
+revisitable decision; "we chose star because that's just what dimensional
+models look like" is not a decision at all, just an unexamined default.
+
+### Principal Engineer Interview Questions
+
+**Q: "When would you choose a snowflake schema over a pure star schema?
+Give a concrete scenario, not just a definition."**
+
+*What's tested:* whether the candidate can reason about the trade-off
+contextually, versus reciting that "star schemas are simpler, snowflakes
+save space."
+
+*What a weak answer looks like:* "Snowflake schemas normalize dimensions
+to save space" — a correct definition that stops short of saying *when*
+that trade is actually worth making.
+
+*What a strong answer covers:* a concrete scenario where a dimension's
+attribute has high enough cardinality, and is shared across enough
+distinct fact tables, that keeping it denormalized would mean repeating
+large amounts of the same data redundantly in every dimension row across
+every one of those fact tables — e.g. a `dim_product` with a
+deeply-nested category hierarchy (thousands of categories, shared across
+sales, returns, and inventory fact tables) is a much stronger snowflaking
+case than this project's `dim_user.plan_type` (two values, one fact
+table).
+
+*Concepts:* cardinality and fan-out as the actual deciding factors, not a
+blanket rule; conformed dimensions shared across multiple fact tables as
+the scenario where normalization's benefit compounds.
+
+*Expected follow-up:* "What does snowflaking cost you, concretely, in
+query terms?" — One additional join per snowflaked attribute, in every
+query that needs it, and additional complexity configuring that join
+correctly in whatever BI tool sits on top.
+
+*Common mistake:* treating "star schema" and "snowflake schema" as a
+binary style preference rather than a decision driven by the actual
+cardinality and fan-out of the specific data being modeled.
+
+---
+
+## 12. Data Contracts ✅✅
+
+### Concept
+
+A **data contract** is a formal, versioned, machine-checkable agreement
+about a table's shape — its columns, their types, their nullability — plus
+metadata a human needs (an owner, a freshness expectation, a plain-English
+description) that a schema alone doesn't carry. The defining feature that
+separates a contract from documentation (Section 9) is that a contract is
+*validated automatically* against the real, live system, not just read and
+trusted.
+
+### Why does this exist?
+
+Section 9 named this gap directly: `schemas/source/*.md` is accurate right
+up until the moment `sql/source/*.sql` changes and nobody updates the
+Markdown to match — nothing catches that drift. A data contract closes
+exactly that gap for the machine-checkable subset of what a source data
+model documents (columns, types, nullability) by making "does the real
+table still match what I expect" a command you can run, not a question you
+have to trust a human kept current.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+A downstream analytics team builds a dashboard against an `orders` table,
+assuming `discount_pct` is always populated. Months later, the upstream
+team (unaware anyone downstream cares) makes the column nullable to
+support a new order type that has no discount. Nothing breaks loudly —
+the dashboard just starts silently producing `NULL`-related gaps wherever
+that assumption held. A data contract, checked automatically on every
+upstream deploy, would have caught the nullability change *before* it
+shipped, by comparing the new schema against the contract the downstream
+team had implicitly been relying on — turning a silent, discovered-weeks-later
+break into a loud, caught-at-deploy-time one.
+
+### URL Shortener Example
+
+This project's contracts —
+[`contracts/source/urls.yaml`](../contracts/source/urls.yaml),
+[`users.yaml`](../contracts/source/users.yaml), and
+[`clicks.yaml`](../contracts/source/clicks.yaml) — declare exactly the
+shape `schemas/source/*.md` describes in prose, plus an owner, a
+freshness SLA, and explicit quality rules (e.g. `clicks.yaml`'s "rows are
+never UPDATEd or DELETEd after insert," which is precisely the assumption
+Section 15.9's interview question is built around). `ingestion/src/url_shortener_analytics/contracts.py`
+validates them against the real, connected database; `make validate-contracts`
+runs it.
+
+### 12.1 Architecture
+
+```mermaid
+flowchart LR
+    subgraph Contracts["contracts/source/*.yaml"]
+        C1[urls.yaml]
+        C2[users.yaml]
+        C3[clicks.yaml]
+    end
+    subgraph Validator["contracts.py"]
+        LD[load_contract]
+        VC[validate_contract]
+    end
+    subgraph DB["Real Postgres"]
+        T[(urls / users / clicks)]
+    end
+
+    C1 & C2 & C3 -->|yaml.safe_load| LD
+    LD --> VC
+    DB -->|sqlalchemy.inspect| VC
+    VC -->|ContractValidationResult<br/>violations + warnings| CLI[cli.py validate-contracts]
+```
+
+### 12.2 Design Decision: coarse type categories, not exact SQL types
+
+Contracts declare `type: integer` / `text` / `boolean` / `timestamp` /
+`numeric` — never `BIGINT` or `VARCHAR(16)` specifically. This project's
+own unit tests validate contracts against SQLite (via the `sqlite_engine`
+fixture) while integration tests and real usage validate against Postgres
+— two dialects whose reflected column types don't share an exact-string
+vocabulary (SQLite reports its own affinity-inferred type names; Postgres
+reports its native ones). Comparing exact type strings would force a
+choice between contracts that only work against one dialect, or
+duplicate per-dialect contract files — either way, more complexity than
+this project's actual correctness needs justify. `contracts.py`'s
+`_categorize_type` function normalizes both dialects' reflected types
+into the same five coarse categories via `isinstance` checks against
+SQLAlchemy's *generic* type hierarchy (`sqltypes.Integer`, `sqltypes.String`,
+etc.), which both dialects' reflection maps into consistently.
+
+### 12.3 Design Decision: violations vs. warnings, and a result object instead of an exception
+
+A contract check reports **all** violations found, not just the first
+one — implemented as `validate_contract` returning a
+`ContractValidationResult` (a list of violations and a list of warnings)
+rather than raising on the first mismatch. This mirrors a real test
+suite's own reporting convention deliberately: a CI test run that stopped
+at the first failing assertion and hid every other failure until the next
+run would be far less useful than one that reports every failure in one
+pass. `ContractError` (a real exception) is reserved for cases where
+validation genuinely can't be attempted at all — a malformed contract
+file, or a table that doesn't exist — as distinct from cases where
+validation *runs* and finds the table doesn't match. **Violations vs.
+warnings** is a second, related decision: a *missing* contracted column,
+a *type* mismatch, or a *nullability* mismatch are violations (the
+contract makes a promise the real table breaks); an *extra* column the
+real table has but the contract doesn't declare is only a warning. This
+matches how most real schema-evolution policies treat additive,
+backward-compatible changes (a new column nothing downstream depends on
+yet) as safe, while treating a removed or changed column as breaking.
+
+### Alternatives
+
+1. **Exact SQL type comparison (rejected).** More precise, but forces
+   either a single validation dialect (breaking the SQLite-backed unit
+   test strategy established since Section 14) or duplicate per-dialect
+   contracts — complexity this project's actual risk (catching a
+   genuinely wrong column type or an accidentally-dropped column) doesn't
+   need exact types to catch.
+2. **Raise on the first violation found (rejected).** Faster to
+   implement, much less useful in practice — see Section 12.3's reasoning
+   above; matches this project's own established "report everything, then
+   let the caller decide severity" pattern from Section 15's checkpoint
+   design.
+3. **Treat every mismatch, including extra columns, as a violation
+   (rejected).** Would make adding *any* new column to a source table —
+   even one nothing downstream needs yet — a breaking contract failure,
+   which actively discourages safe, additive schema evolution.
+4. **Coarse type categories, violations vs. warnings split, result-object
+   return (chosen).** Balances catching genuine breaking changes against
+   not blocking safe, additive ones, and reports everything in one pass.
+
+### Trade-offs
+
+| | Coarse type categories + violation/warning split (chosen) | Exact types, all-mismatches-are-violations |
+|---|---|---|
+| Cross-dialect portability | Works against SQLite and Postgres unchanged | Requires per-dialect contracts, or Postgres-only validation |
+| Tolerates safe schema evolution | Yes — new columns are warnings | No — any new column fails the check |
+| Catches a genuinely wrong type (e.g. a column silently becoming `TEXT` instead of `INTEGER`) | Yes, at the category level (integer vs. text) | Yes, more precisely (e.g. `BIGINT` vs `INT` would also be caught) |
+| False positives from irrelevant precision differences | Low | Higher — e.g. `VARCHAR(16)` vs `VARCHAR(32)` would fail a naive exact-type check even though neither breaks anything this project does |
+
+### 12.4 Implementation
+
+Already built and tested — see
+[`ingestion/src/url_shortener_analytics/contracts.py`](../ingestion/src/url_shortener_analytics/contracts.py).
+
+---
+
+**CREATE:** `ingestion/src/url_shortener_analytics/contracts.py`
+
+**PURPOSE:** Load a YAML contract, reflect a real table's actual shape via
+SQLAlchemy, and report every difference between them as either a
+violation (breaking) or a warning (safe).
+
+**DEPENDENCIES:** `pyyaml` (already a project dependency, used by
+`cli.py` for `pipelines.yaml`), a SQLAlchemy `Engine`, this package's
+`exceptions` module (for `ContractError`).
+
+**IMPLEMENTATION GUIDE (write it yourself):** three functions. `load_contract(path)`
+should `yaml.safe_load` the file inside a `try/except` catching `OSError`
+and `yaml.YAMLError`, re-raising as `ContractError`; also raise
+`ContractError` if the parsed result is missing the `table` or `columns`
+keys — a contract file that doesn't even declare what table it's for
+can't be validated against anything. `_categorize_type(sa_type)` should
+`isinstance`-check the reflected column type against SQLAlchemy's generic
+type classes (`sqltypes.Boolean`, `sqltypes.Integer`, `sqltypes.DateTime`,
+`sqltypes.Numeric`, `sqltypes.String`, in that order — order matters where
+hierarchies could otherwise overlap) and return one of this project's five
+category strings, or `"unknown"` if nothing matches. `validate_contract(engine, contract)`
+is the core: use `sqlalchemy.inspect(engine)` to check `has_table` first
+(raise `ContractError` if the table doesn't exist at all — validation
+genuinely can't proceed), then `get_columns(table_name)` to get the real
+shape. Walk every column the *contract* declares: if it's missing from the
+real table, that's a `missing_column` violation; if present, compare
+categorized type and nullability, recording `type_mismatch` /
+`nullability_mismatch` violations as needed. Separately, walk every column
+the *real table* has: any not declared in the contract is an `extra_column`
+warning, not a violation. Return a `ContractValidationResult` collecting
+everything found — never raise for a structural mismatch.
+
+**REFERENCE IMPLEMENTATION:**
+
+```python
+# ingestion/src/url_shortener_analytics/contracts.py (excerpt -- full file
+# is already committed at this path)
+
+def _categorize_type(sa_type) -> str:
+    if isinstance(sa_type, sqltypes.Boolean):
+        return "boolean"
+    if isinstance(sa_type, sqltypes.Integer):
+        return "integer"
+    if isinstance(sa_type, sqltypes.DateTime):
+        return "timestamp"
+    if isinstance(sa_type, sqltypes.Numeric):
+        return "numeric"
+    if isinstance(sa_type, sqltypes.String):
+        return "text"
+    return "unknown"
+
+
+def validate_contract(engine, contract) -> ContractValidationResult:
+    table_name = contract["table"]
+    inspector = inspect(engine)
+    if not inspector.has_table(table_name):
+        raise ContractError(f"table '{table_name}' does not exist")
+
+    actual = {c["name"]: c for c in inspector.get_columns(table_name)}
+    declared = {c["name"]: c for c in contract["columns"]}
+    violations, warnings = [], []
+
+    for name, spec in declared.items():
+        if name not in actual:
+            violations.append(ContractViolation("missing_column", name, ...))
+            continue
+        if _categorize_type(actual[name]["type"]) != spec["type"]:
+            violations.append(ContractViolation("type_mismatch", name, ...))
+        if actual[name]["nullable"] != spec["nullable"]:
+            violations.append(ContractViolation("nullability_mismatch", name, ...))
+
+    for name in actual:
+        if name not in declared:
+            warnings.append(ContractWarning("extra_column", name, ...))
+
+    return ContractValidationResult(table=table_name, violations=violations, warnings=warnings)
+```
+
+Full file: [`ingestion/src/url_shortener_analytics/contracts.py`](../ingestion/src/url_shortener_analytics/contracts.py).
+CLI wiring: `cli.py`'s `validate-contracts` subcommand
+(`validate_contracts_command`) — loads every `*.yaml` in
+`contracts/source/`, runs `validate_all_contracts`, logs a pass/fail line
+per table plus every violation/warning, and exits `1` if any table has at
+least one violation.
+
+**RUN:**
+
+```bash
+make up
+make validate-contracts
+```
+
+**VERIFY:** the log output shows one `"contract passed"` or `"contract
+FAILED"` line per table (`urls`, `users`, `clicks`), plus any warnings
+(e.g. an extra column) logged individually.
+
+**EXPECTED:** all three contracts pass against a freshly-created database —
+`sql/source/*.sql` and `contracts/source/*.yaml` were written to match
+each other.
+
+**ACTUAL OBSERVED result:** run for real, against a real (locally
+installed, non-Docker) Postgres 16 in this sandbox, using
+`python -m url_shortener_analytics.cli validate-contracts` directly:
+
+```
+ts=2026-09-19T17:50:04+0000 level=INFO logger=__main__ msg="contract passed" table='clicks' warnings=0
+ts=2026-09-19T17:50:04+0000 level=INFO logger=__main__ msg="contract passed" table='urls' warnings=0
+ts=2026-09-19T17:50:04+0000 level=INFO logger=__main__ msg="contract passed" table='users' warnings=0
+ts=2026-09-19T17:50:04+0000 level=INFO logger=__main__ msg="all contracts passed"
+```
+
+**TEST:** `ingestion/tests/unit/test_contracts.py` — 11 tests, covering a
+passing contract, an extra-column warning that doesn't fail the result, a
+missing-column violation, a type-mismatch violation, a nullability
+violation, a nonexistent-table `ContractError`, contract-file loading
+(valid, missing, malformed YAML, missing required keys), and — notably —
+the **real, committed** `contracts/source/*.yaml` files validated against
+a hand-built SQLite schema matching them exactly.
+`ingestion/tests/integration/test_contracts_integration.py` proves the
+same real contracts against real Postgres — genuinely run in this
+sandbox (`pytest -m integration`, real Postgres, no MinIO needed for this
+particular test): `1 passed in 0.47s`, an ACTUAL OBSERVED result, not a
+projection. (This sandbox's Postgres isn't reached through
+`docker-compose.yml` the way `make up` would — see How to test below for
+the exact caveat.)
+
+**PRODUCTION CONSIDERATIONS:** see 12.6 below.
+
+**INTERVIEW QUESTIONS:** see 12.8 below.
+
+---
+
+### Hands-on Challenge (implement-yourself)
+
+Before reading further, try this: **without looking at `contracts.py`,
+write down what `_categorize_type` should return for a Postgres
+`TIMESTAMPTZ` column and for a SQLite column declared `TIMESTAMP`** —
+are they the same category? (They should be — both are timestamp-like,
+and `sqltypes.DateTime` is the generic SQLAlchemy base both dialects'
+reflected types subclass, which is exactly why the category-based
+comparison in Section 12.2 works across both without special-casing
+either dialect.) Then modify one of `contracts/source/*.yaml`'s column
+`type` values to something deliberately wrong (e.g. change `clicks.yaml`'s
+`id` column to `type: text`) and run `make test` — confirm
+`test_validate_all_contracts_against_the_real_contracts_directory` now
+fails, and read its failure output to see exactly how a violation is
+reported. Revert the change afterward.
+
+### 12.5 How to test
+
+```bash
+make test              # unit tests -- SQLite + mocked S3/contracts, no Docker required
+make up
+make test-integration   # requires `make up` first -- real Postgres + MinIO
+```
+
+The full unit suite (38 tests — 27 from Section 15 plus 11 new in
+`test_contracts.py`) was run in this environment while writing this
+section (Python 3.11, `PYTHONPATH=ingestion/src python3 -m pytest
+ingestion/tests/unit -q`) and genuinely passed — this is an ACTUAL
+OBSERVED result, not a projection:
+
+```
+38 passed in 6.78s
+```
+
+`ingestion/tests/integration/test_contracts_integration.py` was written,
+`ruff check`-clean, and **genuinely executed** in this sandbox against a
+real (non-Docker) local Postgres 16, using
+`pytest -m integration ingestion/tests/integration/test_contracts_integration.py`:
+
+```
+ingestion/tests/integration/test_contracts_integration.py::test_all_source_contracts_pass_against_the_real_schema PASSED
+1 passed in 0.47s
+```
+
+The other integration test files (full load, incremental load) still
+need real MinIO, which this sandbox genuinely doesn't have — those remain
+un-executed here; run them yourself with `make up && make
+test-integration` for the complete suite.
+
+### 12.6 Hands-on Exercise
+
+**LAB 11 — Watch a real contract violation, end to end.**
+
+```bash
+make up
+make validate-contracts   # baseline: all three contracts pass
+```
+
+Now deliberately break one, at the database level rather than the
+contract level (the more realistic direction — a schema migration lands
+without the matching contract update):
+
+```bash
+make db-shell
+ALTER TABLE clicks ALTER COLUMN device_type DROP NOT NULL;
+\q
+make validate-contracts
+```
+
+What to observe: `clicks`' result flips to `"contract FAILED"`, with one
+`nullability_mismatch` violation logged for `device_type` — the contract
+still says `nullable: false`, the real table now disagrees. The command
+exits `1`. Revert with
+`ALTER TABLE clicks ALTER COLUMN device_type SET NOT NULL;` and re-run to
+confirm it passes again.
+
+**ACTUAL OBSERVED result:** run for real in this sandbox (via `psql` and
+the CLI directly, not through `docker-compose.yml`/`make db-shell`, since
+this sandbox has no Docker daemon but does have a local Postgres):
+
+```
+=== after ALTER TABLE clicks ALTER COLUMN device_type DROP NOT NULL ===
+ts=2026-09-19T17:50:26+0000 level=ERROR logger=__main__ msg="contract FAILED" table='clicks' violations=1
+ts=2026-09-19T17:50:26+0000 level=ERROR logger=__main__ msg="violation" column='device_type' detail='contract expects nullable=False, actual column has nullable=True' kind='nullability_mismatch' table='clicks'
+ts=2026-09-19T17:50:26+0000 level=INFO logger=__main__ msg="contract passed" table='urls' warnings=0
+ts=2026-09-19T17:50:26+0000 level=INFO logger=__main__ msg="contract passed" table='users' warnings=0
+ts=2026-09-19T17:50:26+0000 level=ERROR logger=__main__ msg="contract validation finished with failures"
+(exit code: 1)
+
+=== after reverting with ALTER TABLE clicks ALTER COLUMN device_type SET NOT NULL ===
+ts=2026-09-19T17:50:27+0000 level=INFO logger=__main__ msg="contract passed" table='clicks' warnings=0
+ts=2026-09-19T17:50:27+0000 level=INFO logger=__main__ msg="contract passed" table='urls' warnings=0
+ts=2026-09-19T17:50:27+0000 level=INFO logger=__main__ msg="contract passed" table='users' warnings=0
+ts=2026-09-19T17:50:27+0000 level=INFO logger=__main__ msg="all contracts passed"
+(exit code: 0)
+```
+
+Matches the prediction exactly, including the exact violation detail
+message.
+
+### Failure Scenario
+
+**What happens if `sql/source/002_hypothetical_users_and_clicks.sql` is
+changed (say, `clicks.device_type` is widened from `VARCHAR(16)` to
+`TEXT`) but `contracts/source/clicks.yaml` is never updated?**
+
+Nothing breaks — `VARCHAR` and `TEXT` both categorize to `"text"` under
+this project's coarse-category comparison (Section 12.2's whole point).
+**Now consider the case that does break:** if `device_type` were instead
+changed from `NOT NULL` to nullable (a real, meaningful change — every
+downstream query that assumes `device_type` is always populated would
+need to know), `validate_contract` reports a `nullability_mismatch`
+violation immediately, `make validate-contracts` exits `1`, and the CI
+step (once one exists — not yet wired into this Phase 1 repo, see
+Production Considerations) would fail loudly. **This is the contrast
+worth internalizing**: a coarse-category type change (harmless, no
+violation) vs. a nullability change (meaningful, always a violation) are
+treated differently on purpose, matching which changes actually break a
+downstream consumer's assumptions and which don't. **Production
+implication:** the fix, in either direction, is to decide *which* artifact
+is wrong and update it — a real nullability change usually means the
+contract should be updated (the schema change was intentional); an
+accidental schema drift usually means the schema should be reverted (the
+contract was right, the migration was a mistake). The tool can't tell you
+which — it can only tell you they disagree.
+
+### 12.7 Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| When contracts are checked | Manually, via `make validate-contracts` | Automatically, in CI, on every migration/schema change PR — before it merges, not after |
+| Scope | Source tables only (`contracts/source/`) | Often extended to the analytical layer too (`sql/analytics/` — explicitly not contract-checked yet in this project; a real gap, named here rather than silently left) |
+| Violation response | Logged, exit code 1 | Often paired with an alerting/paging system, and a documented escalation path (who gets notified, who decides schema-vs-contract is wrong) |
+| Contract ownership | Implicit (this project) | Each contract typically owned by the team that owns the source system, with the downstream consuming teams as reviewers on any contract change |
+| Quality rules (`quality_rules:` in each YAML) | Documented, not enforced by `contracts.py` | A mature contract framework enforces these too (e.g. actual uniqueness checks, actual enum-membership checks) — not yet built here; see Alternatives below for why |
+
+### Principal Data Engineer Perspective
+
+The choice to leave `quality_rules:` as documentation rather than enforced
+checks (12.6) is a deliberate scope boundary, not an oversight, and it's
+worth being able to articulate the difference between *shape* validation
+(what this section builds: columns, types, nullability) and full *data
+quality* validation (row-level rules: uniqueness, referential integrity,
+value-set membership) as two related but genuinely different disciplines.
+Shape validation is cheap to run (a schema reflection call, milliseconds)
+and catches an entire class of breaking changes; row-level quality checks
+require scanning actual data (potentially expensive at scale) and catch a
+different, complementary class of problems (a duplicate `short_code`, an
+out-of-range `plan_type`). A principal engineer builds the cheap,
+high-leverage check first, ships it, and treats the more expensive
+discipline as a deliberate next increment — exactly the sequencing this
+project has followed since Section 13's "batch before streaming" framing.
+
+### 12.8 Principal Engineer Interview Questions
+
+**Q: "Why compare types by coarse category ('integer', 'text') instead of
+exact SQL type strings ('BIGINT', 'VARCHAR(16)')? Isn't that less
+precise?"**
+
+*What's tested:* whether the candidate can defend a deliberately
+lower-precision design choice on its actual merits, rather than assuming
+more precision is always strictly better.
+
+*What a weak answer looks like:* "Exact types would be more thorough, but
+this is just a POC so it's fine to be less precise" — treats it as a
+shortcut rather than a reasoned trade-off.
+
+*What a strong answer covers:* exact type comparison would either force
+validating against only one database dialect, or maintaining separate
+per-dialect contracts — real cost, for catching a class of difference
+(e.g. `VARCHAR(16)` vs `VARCHAR(32)`) that essentially never actually
+breaks a downstream consumer, while the coarse category still reliably
+catches the differences that *do* matter (a column silently changing from
+numeric to text, say). The right precision level for a check should match
+the cost of false positives against the value of what it actually
+catches, not just maximize precision for its own sake.
+
+*Concepts:* precision/recall trade-off applied to schema validation;
+cross-dialect portability as a real constraint, not an excuse.
+
+*Expected follow-up:* "Can you think of a real type change this approach
+would miss?" — Yes: a column narrowing from `BIGINT` to `INTEGER` (both
+categorize as "integer") could silently start truncating values the
+contract wouldn't flag — a genuine, named limitation of the coarse-category
+approach, worth stating rather than glossing over.
+
+*Common mistake:* assuming a validation check with lower precision is
+strictly worse, without weighing what it costs to get that precision
+against what it actually protects against.
+
+**Q: "Your contract validator finds an extra column in the real table that
+the contract doesn't declare. Should that fail the check? Why or why
+not?"**
+
+*What's tested:* whether the candidate understands additive vs. breaking
+schema changes as a real, load-bearing distinction, not an arbitrary
+choice.
+
+*What a weak answer looks like:* "Yes, anything different from the
+contract should fail — the contract is supposed to be the source of
+truth" — technically consistent, but ignores that this policy would make
+routine, safe schema evolution (adding a new column nothing depends on
+yet) indistinguishable from an actually breaking change.
+
+*What a strong answer covers:* an extra column is additive and
+backward-compatible — every existing query, every existing contract
+consumer, keeps working exactly as before; treating it as a failure would
+actively punish safe evolution and train teams to either avoid adding
+contract-checked tests, or to update the contract reflexively without
+review just to unblock a merge, defeating the contract's purpose. A
+*missing* or *changed* contracted column is different in kind: something
+a consumer was actively relying on has changed or disappeared, which is
+exactly the class of change a contract should catch.
+
+*Concepts:* schema evolution policy (additive/backward-compatible vs.
+breaking), designing a check's failure criteria around what actually harms
+a consumer rather than around "any difference at all."
+
+*Expected follow-up:* "What if a downstream consumer *does* eventually
+need to know about new columns proactively, not just tolerate them
+silently?" — That's a legitimate reason to promote "extra column" from a
+warning to something surfaced more visibly (e.g. a notification, not a
+failure) — still not a hard failure, but not silent either; a real
+contract framework often supports exactly this severity distinction.
+
+*Common mistake:* treating "matches the contract exactly" and "safe for
+consumers" as the same requirement, when in practice they diverge exactly
+at additive changes.
 
 ---
 
@@ -1968,12 +3784,23 @@ strategy (`ingestion/configs/pipelines.yaml`); the Bronze idempotency
 guarantee this decision depends on has one documented residual edge case
 — see [Section 15.7](#157-failure-scenario).
 
-### ADR-006: Dimensional analytical model *(planned, not yet implemented)*
+### ADR-006: Dimensional analytical model *(schema implemented; not yet populated)*
 
 **Context:** Bronze data is a direct mirror of OLTP structure — not shaped
-for analytical queries. **Decision (planned):** a star schema
-(fact/dimension) analytical layer. Recorded now; implemented in the
-planned Section 10.
+for analytical queries (Section 2). **Decision:** a pure star schema
+(fact/dimension) analytical layer — `dim_date`, `dim_url`, `dim_user`,
+`dim_device`, `fact_clicks` — designed in Sections 9-11, DDL committed at
+[`sql/analytics/`](../sql/analytics/). **Alternatives considered:** a
+fully normalized analytical layer (reusing the OLTP shape directly); a
+snowflake schema (normalizing `plan_type` and `original_url_domain` into
+their own dimensions). See Section 11's Alternatives/Trade-offs for the
+full reasoning on both. **Trade-offs:** a star schema trades some storage
+redundancy for query simplicity — the right trade at this project's
+current dimension cardinality (see Section 11.1). **Consequences:** the
+schema is committed and reviewable, but genuinely empty — no transform
+populates it yet; that's explicitly Phase 2's job ("Data Lake,
+Transformation & Data Quality"), not deferred silently but named as a
+current limitation in Section 33 and the Phase 1 Completion Checklist.
 
 ### ADR-007: Preserve Bronze data (immutability)
 
@@ -2025,67 +3852,113 @@ in a real production deployment, this pipeline would instead point
 Phase 1 development convenience, not a production design, and is
 documented as such in the README.
 
+### ADR-010: Data contract validation by coarse type category, not exact type
+
+**Context:** source tables need a machine-checkable contract (Section 12)
+that doesn't silently drift from the real schema the way
+`schemas/source/*.md` can (Section 9's named gap). This project validates
+contracts against SQLite in unit tests and Postgres in integration tests /
+production. **Decision:** contracts declare column types as one of five
+coarse categories (`integer`, `text`, `boolean`, `timestamp`, `numeric`),
+compared via `contracts.py`'s `_categorize_type`, which normalizes both
+dialects' reflected types through SQLAlchemy's generic type hierarchy —
+not exact SQL type strings. Structural mismatches are reported as a full
+`ContractValidationResult` (every violation and warning found), not raised
+on the first one; an extra, undeclared column is a warning, not a
+violation. **Alternatives considered:** exact SQL type comparison
+(Postgres-only, or duplicated per-dialect contracts); raising on the first
+violation found; treating every mismatch, including additive ones, as
+breaking. **Trade-offs:** coarse categories trade some precision (e.g. a
+`BIGINT`→`INTEGER` narrowing wouldn't be caught) for cross-dialect
+portability and tolerance of safe, additive schema evolution — see
+Section 12.2/12.3's full reasoning. **Consequences:** `make
+validate-contracts` and its unit/integration tests (`test_contracts.py`,
+`test_contracts_integration.py`) are the enforcement mechanism; the
+analytical layer (`sql/analytics/`) is explicitly **not** yet
+contract-checked — a named gap, not a silent one (Section 12.7).
+
 ---
 
 ## 33. Phase 1 Summary (so far)
 
-**What we've built in this increment:** the repository skeleton; the real
-(and clearly-labeled hypothetical) source schema, documented and
-mirrored locally; a full-load batch ingestion pipeline
-(`extract_full.py`, `object_store.py`, `metadata.py`, `cli.py`) for
-`urls`/`users`/`clicks`; an incremental, watermark-based ingestion path
-(`extract_incremental.py`, plus incremental support added to
-`object_store.py` and `cli.py`) for `clicks` specifically, dispatched
-automatically by `cli.py run` based on `pipelines.yaml`'s `load_type`
-per table; both load types idempotent, checkpointed, retried, and
-covered by 27 passing unit tests plus integration tests runnable against
-real infrastructure; this guide.
+**What we've built in this increment:** the full analytics requirements
+and data modeling layer — a metrics catalog grounded in the real
+application's own stated requirement (Section 7); an explicit fact-table
+grain decision (Section 8); a formalized source data model
+(`schemas/source/users.md`, `clicks.md`, joining the pre-existing
+`urls.md`); a designed and DDL-implemented star schema (`dim_date`,
+`dim_url`, `dim_user`, `dim_device`, `fact_clicks` — schema only, not yet
+populated) with a from-scratch Kimball-style Unknown-member design for
+anonymous clicks (Section 10.3); a star-vs-snowflake decision with real
+DDL (Section 11); and a genuinely new code component, formal data
+contracts (`contracts/source/*.yaml` plus `contracts.py`'s validator,
+`make validate-contracts`), covered by 11 new unit tests. Combined with
+the ingestion pipeline from prior increments (full load, incremental
+load, both idempotent and checkpointed): 38 passing unit tests total plus
+integration tests runnable against real infrastructure; this guide.
 
-**A note on this increment specifically:** this pass added real new code
-(`extract_incremental.py`, the incremental-key functions in
-`object_store.py`, the `run` CLI subcommand) *and* wrote Section 15 at
-full teaching-template depth from the start (Concept → Why → Simple
-Example → URL Shortener Example → Architecture → Design Decision →
-Alternatives → Trade-offs → Implementation → Code → How to Run → How to
-Verify → Hands-on Exercise → Failure Scenario → Production Considerations
-→ Principal Perspective → Interview Questions) — matching the depth
-established for Sections 1, 2, and 14 in the previous increment. Sections
-still marked ✅ (not ✅✅) in the table of contents still need that same
-upgrade pass — they're accurate, just not yet at full depth.
+**A note on this increment specifically:** Sections 7-12 were written at
+full teaching-template depth from the start (the same 16-part structure
+established for Sections 1, 2, 14, and 15) — this is the first increment
+where an entire multi-section block of the curriculum (six sections) landed
+together, rather than one section at a time, because the six are tightly
+interdependent (grain depends on requirements; the analytical model
+depends on grain; the star schema DDL depends on the analytical model
+design; contracts depend on the source model) and reviewing them as a
+connected whole was judged more valuable than splitting an already-coupled
+design across six separate increments.
 
 **Concepts taught so far, at full depth:** the real application's
-architecture and schema (with an explicit gaps/assumptions/recommended-
-changes breakdown), OLTP vs. OLAP, full load ingestion (with the exact
-CREATE/PURPOSE/IMPLEMENTATION/RUN/VERIFY/TEST format, plus an
-implement-yourself hands-on challenge), and now incremental load &
-watermarks (id-based vs. timestamp-based watermark design decision with a
-worked failure example, the watermark-scoped idempotency key design and
-its one honestly-documented residual edge case, the empty-result-is-not-
-an-error design point, and a Principal-level question on what an
-insert-only watermark structurally cannot capture). Batch ingestion
-design, checkpointing's existence, and idempotency's existence are
-introduced and now demonstrated for both load types, but still await
-their own dedicated deep-dive passes (Sections 13, 16, 17).
+architecture and schema, OLTP vs. OLAP, full load and incremental-load
+ingestion (watermarks, idempotency, checkpointing), and now the entire
+data modeling layer: a requirements-first metrics catalog with an honest
+requirements-traceability table; grain as the first and most consequential
+fact-table decision; the three-artifact split between human documentation
+(`schemas/source/*.md`), enforced schema (`sql/`), and machine-checked
+contracts (`contracts/`); Kimball dimensional modeling (fact vs.
+dimension, conformed dimensions, SCD Type 1 vs. 2, the NOT-NULL-foreign-key
+Unknown-member pattern worked through in full); star vs. snowflake
+schema design; and data contract validation (coarse type categories,
+violations vs. warnings, and why both decisions were made deliberately,
+not by default). Checkpointing and idempotency's own dedicated deep-dive
+sections (16, 17) still await their pass.
 
 **Known limitations, stated honestly:** no scheduler yet (runs are
 manual, via `make ingest`); `ingestion_metadata` has no automated
 stale-`running`-row alerting; incremental load is insert-only by
-construction — an update or delete to an already-ingested `clicks` row is
-never re-captured (Section 15.9); a retried failed incremental run can, in
-one specific ordering, produce a redundant (not wrong, just duplicated)
-Bronze object instead of a clean overwrite (Section 15.7); no formal data
-contracts yet; no PII classification section yet, though the hypothetical
-`clicks.hashed_ip` design already avoids storing raw IPs; no benchmarks
-have been run yet (Parquet/partitioning claims in this guide so far are
-conceptual, not benchmark-backed — that's explicitly what Sections 19-20
-and `benchmarks/` are for); most sections in the table of contents still
-need the full-depth pass already applied to Sections 1, 2, 14, and 15.
+construction (Section 15.9); a retried failed incremental run can, in one
+specific ordering, produce a redundant Bronze object (Section 15.7); the
+star schema is designed and DDL-committed but **not yet populated** —
+Phase 2's transform does that, and every dimension/fact table is
+genuinely empty (beyond `dim_date`'s generated calendar and `dim_user`'s
+single Unknown-member row) until then; data contracts cover the source
+layer only — the analytical layer (`sql/analytics/`) has no contract yet
+(Section 12.7); no PII classification section yet, though `clicks.hashed_ip`
+and `dim_user`'s email exclusion already avoid the worst of it by
+construction; no benchmarks have been run yet (Sections 19-20,
+`benchmarks/`); this sandbox has no Docker daemon, so nothing here was
+verified through `docker-compose.yml` itself — but it does have a real,
+locally installed Postgres 16, and every piece of new SQL and the
+contract validator were genuinely run against it while writing this
+increment: all five `sql/analytics/*.sql` files applied cleanly
+(`dim_date` really does hold 4,018 rows; `dim_user` really does hold its
+one Unknown-member row); the `fact_clicks.user_key NOT NULL` constraint
+really does reject a `NULL` insert with the exact predicted error; all
+three source contracts really do pass `validate-contracts` against the
+real schema, and really do fail — with the exact predicted violation
+message — after a deliberately broken `ALTER TABLE`. Every such result in
+Sections 10-12 is labeled ACTUAL OBSERVED, not DESIGN EXPECTATION,
+specifically because it was. What's still genuinely unverified: anything
+requiring MinIO (not available here) or Docker Compose itself
+specifically (as opposed to the same Postgres reached directly) — those
+steps remain labeled DESIGN EXPECTATION, for the reader to run.
 
-**Immediate next increment:** the analytics requirements / data modeling
-sections (7-12) — the next largest remaining gap now that both Phase 1
-ingestion load types are implemented and taught at full depth — or a
-deep-dive pass on checkpointing/idempotency (Sections 16-17), whichever
-the reader wants to tackle next.
+**Immediate next increment:** a deep-dive pass on Checkpointing and
+Idempotency (Sections 16-17, mechanisms already built and demonstrated
+across both load types — now due their own dedicated treatment), or
+Object Storage/Parquet/Partitioning (Sections 18-20) as groundwork before
+Phase 2's transform needs them — whichever the reader wants to tackle
+next.
 
 ---
 
@@ -2095,12 +3968,12 @@ the reader wants to tackle next.
 |---|---|---|---|
 | Existing application understood | ✅ Done | Section 1 | — |
 | OLTP vs OLAP understood | ✅ Done | Section 2 | — |
-| Analytics requirements defined | ⏳ Not started | — | Section 7 |
-| Metrics defined | ⏳ Not started | — | Section 7 |
-| Grain defined | ⏳ Not started | — | Section 8 |
-| Analytical model designed | ⏳ Not started | — | Sections 9-11 |
-| Star schema implemented | ⏳ Not started | — | Section 11, `sql/analytics/` |
-| Data contracts defined | ⏳ Not started | — | Section 12 |
+| Analytics requirements defined | ✅ Done | Section 7's metrics catalog (8 metrics) | — |
+| Metrics defined | ✅ Done | Section 7.1 | — |
+| Grain defined | ✅ Done | Section 8 (`fact_clicks`: one row per click) | — |
+| Analytical model designed | ✅ Done | Sections 9-10, `schemas/analytics/dimensional-model.md` | — |
+| Star schema implemented | ✅ Done (schema only) | Section 11, `sql/analytics/*.sql`, genuinely applied against real Postgres in this sandbox (4,018-row `dim_date`, Unknown-member `dim_user`, `NOT NULL` constraint proven) | Not yet populated — Phase 2's transform |
+| Data contracts defined | ✅ Done | Section 12, `contracts/source/*.yaml`, `contracts.py`, genuinely validated (pass and fail cases both) against real Postgres in this sandbox | Analytical-layer contracts not yet in scope (Section 12.7) |
 | Full ingestion implemented | ✅ Done | `extract_full.py`, LAB 1 | — |
 | Incremental ingestion implemented | ✅ Done | `extract_incremental.py`, LAB 2/3, Section 15 | — |
 | Watermark implemented | ✅ Done | `metadata.get_last_watermark`, wired into `extract_incremental.run_incremental_load`, Section 15 | — |
@@ -2110,13 +3983,13 @@ the reader wants to tackle next.
 | Parquet implemented | ✅ Done | `object_store.write_bronze` / `write_bronze_incremental` | Benchmark vs CSV/JSON not yet run (Section 19) |
 | Partitioning implemented | ⏳ Not started (only date/watermark-scoped keys, not true multi-file partitioning) | — | Section 20 |
 | PII identified | ⏳ Not started | `clicks.hashed_ip` already avoids raw IPs by construction | Formal classification table, Section 23 |
-| Tests implemented | ✅ Done (unit) | 27 passing unit tests, `ingestion/tests/unit/` | Integration tests written (full load + incremental load) but not yet run against live Docker in this environment (no Docker daemon available here — user should run `make test-integration` locally) |
-| Failure scenarios tested | ✅ Partial | Section 14.7, Section 15.7 (2 of 10) | Remaining 8, Section 25 |
+| Tests implemented | ✅ Done (unit + partial integration) | 38 passing unit tests; the contracts integration test genuinely passed against a real (non-Docker) local Postgres in this sandbox | Full-load and incremental-load integration tests still need real MinIO, not available here — user should run `make up && make test-integration` locally for the complete suite |
+| Failure scenarios tested | ✅ Partial | Sections 7-12 (data modeling), 14.7, 15.7 (8 of 10) | Remaining 2, Section 25 |
 | Performance benchmark completed | ⏳ Not started | — | Section 26, `benchmarks/` |
-| Architecture diagrams completed | ✅ Partial | 7 diagrams so far | More land with later sections (star schema, data lifecycle, failure/recovery, final architecture) |
-| ADRs documented | ✅ 9 of 8+ planned | Section 29 | ADR-005 now implemented; ADR-006 still recorded as planned, not yet implemented |
-| Interview questions reviewed | ✅ Partial | Section 14.9, Section 15.9 (Category C) | Remaining categories, Section 31 |
-| Hands-on labs completed | ✅ Partial | LAB 1, LAB 2, LAB 3, LAB 4/5 (compressed) | LAB 6-12 |
+| Architecture diagrams completed | ✅ Partial | 10 diagrams so far, including the full star schema ER diagram (Section 10.1) | More land with later sections (data lifecycle, failure/recovery, final architecture) |
+| ADRs documented | ✅ 10 of 10+ planned | Section 29 | ADR-005/006 now implemented; new ADR-010 (contract validation strategy) added this increment |
+| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9 | Remaining categories not yet covered, Section 31 |
+| Hands-on labs completed | ✅ Partial | LAB 1-11 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation) | LAB 12+ |
 | README updated | ✅ Done | `README.md` | — |
 | Git repository clean | ✅ Done | Section 35 | — |
 | No secrets committed | ✅ Done | `.gitignore`, `.env.example` reviewed | — |
@@ -2161,11 +4034,18 @@ not a claim of completeness.
 
 Not implemented here — Phase 2 builds directly on this exact repository
 and introduces: Spark for distributed transformation; a formal
-Bronze → Silver → Gold refinement pipeline; deduplication and cleansing
-logic; SCD Type 1 and Type 2 dimension handling; automated data quality
-and profiling checks; schema evolution handling; late-arriving-data
-reprocessing (the gap named in ADR-005); backfill tooling; small-file
-compaction; and tests for transformation logic specifically (distinct from
-this phase's ingestion tests). Phase 2 begins only when explicitly
-requested — consistent with how this repository has been built so far,
-one reviewed increment at a time.
+Bronze → Silver → Gold refinement pipeline that **populates the star
+schema Phase 1 already designed and committed** (`sql/analytics/` — see
+Sections 9-11), rather than designing a new one from scratch;
+deduplication and cleansing logic; genuine SCD Type 2 dimension handling
+(Phase 1 chose Type 1 deliberately for `dim_url`/`dim_user` — see Section
+10.2 — precisely because there's no reliable change-detection signal yet
+without a real transform reading Bronze's history); automated data
+quality and profiling checks, extending Section 12's contract validation
+to the analytical layer (a named Phase 1 gap — Section 12.7); schema
+evolution handling; late-arriving-data reprocessing (the gap named in
+ADR-005); backfill tooling; small-file compaction; and tests for
+transformation logic specifically (distinct from this phase's ingestion
+tests). Phase 2 begins only when explicitly requested — consistent with
+how this repository has been built so far, one reviewed increment at a
+time.

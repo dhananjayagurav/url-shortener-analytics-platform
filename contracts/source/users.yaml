@@ -1,0 +1,33 @@
+# Data contract for the source `users` table (HYPOTHETICAL -- see
+# schemas/source/users.md and ADR-008). See
+# docs/analytics-engineering-guide.md, Section 12.
+
+table: users
+version: 1
+owner: analytics-platform-team
+description: >
+  Hypothetical users table, standing in for the real application's
+  not-yet-built accounts feature. See schemas/source/users.md.
+freshness_sla: "extracted at least once per pipeline run (full load; see ingestion/configs/pipelines.yaml)"
+
+columns:
+  - name: id
+    type: integer
+    nullable: false
+    description: Surrogate PK, autoincrement.
+  - name: email
+    type: text
+    nullable: false
+    description: Unique. Never leaves Bronze in raw form in the analytical layer.
+  - name: plan_type
+    type: text
+    nullable: false
+    description: "FREE | PREMIUM. Not a database-level enum -- see quality_rules."
+  - name: created_at
+    type: timestamp
+    nullable: false
+    description: Set at insert.
+
+quality_rules:
+  - "email is unique"
+  - "plan_type in ('FREE', 'PREMIUM') -- not enforced at the database level; monitored, not guaranteed"

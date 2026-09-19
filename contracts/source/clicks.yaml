@@ -1,0 +1,45 @@
+# Data contract for the source `clicks` table (HYPOTHETICAL -- see
+# schemas/source/clicks.md and ADR-008). This is the table Section 15's
+# incremental load and Section 10's fact_clicks both depend on most
+# heavily. See docs/analytics-engineering-guide.md, Section 12.
+
+table: clicks
+version: 1
+owner: analytics-platform-team
+description: >
+  Hypothetical clicks table, standing in for the real application's
+  not-yet-built "basic analytics" requirement. See
+  schemas/source/clicks.md. Insert-only by contract -- see quality_rules.
+freshness_sla: "extracted at least once per pipeline run (incremental load; see ingestion/configs/pipelines.yaml and Section 15)"
+
+columns:
+  - name: id
+    type: integer
+    nullable: false
+    description: Surrogate PK, autoincrement, strictly insertion-ordered. Section 15's watermark column.
+  - name: short_code
+    type: text
+    nullable: false
+    description: Unenforced reference to urls.short_code -- no FK constraint.
+  - name: occurred_at
+    type: timestamp
+    nullable: false
+    description: Business time of the click. Not the watermark column -- see ADR-005.
+  - name: device_type
+    type: text
+    nullable: false
+    description: "mobile | desktop | tablet | unknown. Default 'unknown'."
+  - name: hashed_ip
+    type: text
+    nullable: true
+    description: SHA-256 hex digest. Never a raw IP, by construction.
+  - name: user_id
+    type: integer
+    nullable: true
+    description: NULL for anonymous clicks. Unenforced reference to users.id.
+
+quality_rules:
+  - "id is monotonically increasing (BIGSERIAL) -- required for Section 15's watermark to be correct"
+  - "rows are never UPDATEd or DELETEd after insert -- not enforced at the database level; Section 15.9 covers what breaks if this is violated"
+  - "device_type in ('mobile', 'desktop', 'tablet', 'unknown') -- matches dim_device's seeded members (sql/analytics/004_dim_device.sql)"
+  - "hashed_ip, if present, is a 64-character hex string (SHA-256) -- never a raw IP address"

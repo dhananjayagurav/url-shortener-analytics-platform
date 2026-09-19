@@ -17,16 +17,20 @@ flowchart LR
         PG[(Postgres<br/>urls / users / clicks)]
     end
     subgraph Ingestion["ingestion/ (Python)"]
-        EX[Full-load extractor]
+        EX[Full + incremental extractors]
         MD[(ingestion_metadata<br/>watermark + checkpoint)]
     end
     subgraph Storage["Object storage"]
-        MI[(MinIO<br/>bronze/table/ingestion_date=.../)]
+        MI[(MinIO<br/>bronze/table/...)]
+    end
+    subgraph Analytical["sql/analytics/ (schema only, Phase 1)"]
+        DM[(dim_date / dim_url / dim_user<br/>dim_device / fact_clicks)]
     end
 
-    PG -->|pd.read_sql_table| EX
+    PG -->|full + incremental| EX
     EX -->|Parquet, snappy| MI
     EX <-->|start/finish run| MD
+    MI -.->|Phase 2 transform, not yet built| DM
 ```
 
 Full write-up, with every diagram and design decision: **[`docs/analytics-engineering-guide.md`](docs/analytics-engineering-guide.md)**.
@@ -44,7 +48,8 @@ the guide for why Kafka/Spark/Airflow are deliberately not here yet.
 | `docs/analytics-engineering-guide.md` | The learning guide — concepts, architecture, ADRs, labs, interview prep. Start here. |
 | `ingestion/` | The Phase 1 ingestion package, its tests, and its config. |
 | `schemas/source/`, `sql/source/` | The real (and clearly-labeled hypothetical) source schema this platform extracts from. |
-| `schemas/analytics/`, `sql/analytics/` | The analytical (star schema) model — later Phase 1 increment. |
+| `schemas/analytics/`, `sql/analytics/` | The analytical (star schema) model — `dim_date`/`dim_url`/`dim_user`/`dim_device`/`fact_clicks`. Schema only; Phase 2 populates it. |
+| `contracts/` | Formal, machine-checked data contracts for the source tables — `make validate-contracts`. |
 | `scripts/` | One-off operator scripts (e.g. `seed_sample_data.py`), not part of the ingestion package itself. |
 | `benchmarks/` | Executable performance benchmarks (Parquet vs CSV, partitioned vs not). |
 | `sample_data/` | Convention-only landing spot for locally generated files; nothing here is committed. |
@@ -70,6 +75,9 @@ make seed            # seeds reproducible synthetic urls/users/clicks
 
 make ingest           # runs urls, users full load + clicks incremental load -> Bronze
 make ingest-full      # override: force a full load of every table (backfills/rebuilds)
+
+make create-analytics-schema   # applies the star schema DDL (dim_*, fact_clicks) -- schema only, Phase 2 populates it
+make validate-contracts        # checks contracts/source/*.yaml against the real database
 ```
 
 ## Testing

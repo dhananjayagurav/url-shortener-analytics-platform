@@ -25,3 +25,11 @@ class ObjectStoreWriteError(IngestionError):
 
 class MetadataError(IngestionError):
     """Raised when reading or writing ingestion_metadata fails."""
+
+
+class ContractError(IngestionError):
+    """Raised when a data contract file can't be loaded/parsed, or when the
+    table it describes can't be reached at all (e.g. it doesn't exist).
+    NOT raised for a structural mismatch between a contract and the real
+    table -- see contracts.py's module docstring for why those are
+    reported as data (ContractValidationResult), not exceptions."""
