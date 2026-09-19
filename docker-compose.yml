@@ -1,0 +1,62 @@
+# Phase 1 infrastructure: a standalone Postgres (mirroring the url-shortener
+# app's real schema, so this repo is clonable/runnable without also cloning
+# the app repo — see ADR-009 in docs/analytics-engineering-guide.md) plus
+# MinIO as the S3-compatible Bronze object store.
+#
+# Kafka, Spark, Airflow and Kubernetes are intentionally absent in Phase 1.
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: analytics-platform-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-analytics}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-analytics}
+      POSTGRES_DB: ${POSTGRES_DB:-analytics}
+    ports:
+      # 5433, not 5432 -- avoids clashing with a url-shortener Postgres
+      # already running on the same machine.
+      - "5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./sql/source:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-analytics}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: analytics-platform-minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-labadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-labpassword}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  createbuckets:
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-labadmin} ${MINIO_ROOT_PASSWORD:-labpassword} &&
+      mc mb --ignore-existing local/${MINIO_BUCKET:-analytics-lake}
+      "
+
+volumes:
+  pg_data:
+  minio_data:

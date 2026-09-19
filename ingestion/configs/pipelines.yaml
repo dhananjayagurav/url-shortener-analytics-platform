@@ -1,0 +1,18 @@
+# Which source tables this pipeline extracts, and how.
+#
+# This file exists so "which tables does the pipeline touch, and with what
+# load strategy" is a config change, not a code change -- see
+# docs/analytics-engineering-guide.md, Architectural Principles,
+# "Metadata-driven processing". Phase 1 only implements full load; the
+# `load_type: incremental` entries are read but not yet acted on -- see
+# ADR-005 and the guide's "What Phase 1 does not implement" note.
+
+pipeline_name: url_shortener_bronze_ingestion
+
+tables:
+  - name: urls
+    load_type: full
+  - name: users
+    load_type: full
+  - name: clicks
+    load_type: full     # becomes `incremental` once extract_incremental.py lands (Section 14 of the guide)
