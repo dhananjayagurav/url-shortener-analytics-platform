@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from datetime import UTC, date, datetime
+from unittest.mock import MagicMock, call
 
 import pandas as pd
 import pytest
@@ -11,8 +11,10 @@ from url_shortener_analytics.exceptions import ObjectStoreWriteError
 from url_shortener_analytics.object_store import (
     build_bronze_incremental_key,
     build_bronze_key,
+    get_bucket_stats,
     head_object,
     list_bronze_keys,
+    list_bronze_keys_for_date_range,
     write_bronze,
     write_bronze_incremental,
 )
@@ -161,3 +163,64 @@ def test_list_bronze_keys_returns_empty_list_when_the_prefix_has_no_objects() ->
     s3_client.list_objects_v2.return_value = {}  # no "Contents" key at all -- an empty bucket/prefix
 
     assert list_bronze_keys(s3_client, "test-bucket") == []
+
+
+def test_get_bucket_stats_sums_size_and_counts_objects() -> None:
+    s3_client = MagicMock()
+    s3_client.list_objects_v2.return_value = {
+        "Contents": [
+            {"Key": "bronze/clicks/a.parquet", "Size": 100},
+            {"Key": "bronze/clicks/b.parquet", "Size": 250},
+        ]
+    }
+
+    stats = get_bucket_stats(s3_client, "test-bucket")
+
+    assert stats == {"object_count": 2, "total_bytes": 350}
+    # No head_object calls -- the Size field from list_objects_v2 is reused directly.
+    s3_client.head_object.assert_not_called()
+
+
+def test_get_bucket_stats_is_zero_for_an_empty_prefix() -> None:
+    s3_client = MagicMock()
+    s3_client.list_objects_v2.return_value = {}
+
+    assert get_bucket_stats(s3_client, "test-bucket") == {"object_count": 0, "total_bytes": 0}
+
+
+def test_list_bronze_keys_for_date_range_issues_one_call_per_date_scoped_to_that_dates_prefix() -> None:
+    s3_client = MagicMock()
+    s3_client.list_objects_v2.side_effect = [
+        {"Contents": [{"Key": "bronze/urls/ingestion_date=2026-09-18/urls.parquet"}]},
+        {"Contents": [{"Key": "bronze/urls/ingestion_date=2026-09-19/urls.parquet"}]},
+        {},  # 2026-09-20: nothing written that day
+    ]
+
+    keys = list_bronze_keys_for_date_range(
+        s3_client, "test-bucket", "urls", date(2026, 9, 18), date(2026, 9, 20)
+    )
+
+    assert keys == [
+        "bronze/urls/ingestion_date=2026-09-18/urls.parquet",
+        "bronze/urls/ingestion_date=2026-09-19/urls.parquet",
+    ]
+    # Exactly one call per date, each scoped to that date's own prefix --
+    # not one call over the table's entire prefix.
+    assert s3_client.list_objects_v2.call_count == 3
+    s3_client.list_objects_v2.assert_has_calls([
+        call(Bucket="test-bucket", Prefix="bronze/urls/ingestion_date=2026-09-18/"),
+        call(Bucket="test-bucket", Prefix="bronze/urls/ingestion_date=2026-09-19/"),
+        call(Bucket="test-bucket", Prefix="bronze/urls/ingestion_date=2026-09-20/"),
+    ])
+
+
+def test_list_bronze_keys_for_date_range_single_day_issues_exactly_one_call() -> None:
+    s3_client = MagicMock()
+    s3_client.list_objects_v2.return_value = {"Contents": [{"Key": "bronze/urls/ingestion_date=2026-09-19/urls.parquet"}]}
+
+    keys = list_bronze_keys_for_date_range(
+        s3_client, "test-bucket", "urls", date(2026, 9, 19), date(2026, 9, 19)
+    )
+
+    assert keys == ["bronze/urls/ingestion_date=2026-09-19/urls.parquet"]
+    assert s3_client.list_objects_v2.call_count == 1

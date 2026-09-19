@@ -91,9 +91,9 @@ with the exact command to produce the real result yourself.
 17. [Idempotency](#17-idempotency-) ✅✅
 
 **Storage**
-18. Object Storage Fundamentals ⏳
-19. Parquet ⏳
-20. Partitioning ⏳
+18. [Object Storage Fundamentals](#18-object-storage-fundamentals-) ✅✅
+19. [Parquet](#19-parquet-) ✅✅
+20. [Partitioning](#20-partitioning-) ✅✅
 21. File Layout ⏳
 22. Ingestion Metadata (deep-dive) ⏳
 
@@ -107,8 +107,8 @@ with the exact command to produce the real result yourself.
 **Reference**
 28. [Architectural Principles](#28-architectural-principles) ✅ *(introduced now, extended as more are demonstrated)*
 29. [Architecture Decision Records](#29-architecture-decision-records) ✅
-30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6; LAB 12 — Section 16.5; LAB 13 — Section 17.5)*
-31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, 15.9, 16.9, and 17.9)*
+30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6; LAB 12 — Section 16.5; LAB 13 — Section 17.5; LAB 14 — Section 18.5; LAB 15 — Section 19.5; LAB 16 — Section 20.5)*
+31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, and 20.9)*
 32. Principal-Level Scenarios ⏳
 33. [Phase 1 Summary](#33-phase-1-summary-so-far) (running, updated each increment)
 34. [Phase 1 Completion Checklist](#34-phase-1-completion-checklist)
@@ -660,7 +660,7 @@ tell what happened without guessing.
 | `schemas/source/`, `sql/source/` | Documentation and DDL for the source schema (real + clearly-labeled hypothetical tables). |
 | `schemas/analytics/`, `sql/analytics/` | Reserved for the dimensional model — not yet populated. |
 | `scripts/` | One-off operator scripts (`seed_sample_data.py`). Not imported by the pipeline. |
-| `benchmarks/` | Reserved for executable performance benchmarks. |
+| `benchmarks/` | Executable performance benchmarks. `parquet_vs_csv_vs_json.py` (Section 19) genuinely run; extraction-time-at-scale benchmarks (Section 26) not yet built. |
 | `sample_data/` | Convention-only landing spot for local generated files; nothing here is committed. |
 | `tests/` (root) | Reserved for cross-phase end-to-end tests, once more than one phase's components exist. |
 
@@ -3035,7 +3035,7 @@ the retry logic in `write_bronze` retries *blindly*, without checking
 *why* the write failed — appropriate here because every retry is
 idempotent, but it's exactly the kind of blind retry that becomes
 dangerous the moment an operation *isn't* idempotent, which is precisely
-why Section 19 (Idempotency) treats this property as a prerequisite for
+why Section 17 (Idempotency) treats this property as a prerequisite for
 safe retries, not an independent nice-to-have.
 
 ### 14.9 Principal Engineer Interview Questions
@@ -4795,6 +4795,1255 @@ concretely, not just agreeing caution is generally good.
 
 ---
 
+## 18. Object Storage Fundamentals ✅✅
+
+### 18.1 Concept
+
+**Object storage** holds data as opaque, whole objects — each addressed by
+a flat `(bucket, key)` pair, written and read over HTTP verbs
+(`PUT`/`GET`/`HEAD`/`DELETE`/`LIST`), with no concept of in-place partial
+writes or a real directory tree underneath. This repo has been using
+object storage since Section 14 — every `write_bronze` call is a `PUT` to
+MinIO — but always in service of *landing Bronze data*, never taught as
+its own subject. This section is that dedicated treatment: what an object
+store actually is, structurally, and why its two most surprising
+properties for anyone coming from a filesystem — no partial-object edits,
+and no *real* directories, just key prefixes that merely *look* like
+them — shape almost every design decision already made in this codebase
+(deterministic whole-object keys in Section 14/15, `list_objects_v2`
+prefix scans in Sections 17/20).
+
+### Why does this exist?
+
+A relational database and a local filesystem both assume the caller wants
+to *modify* data: update a row in place, seek into a file and overwrite ten
+bytes in the middle. Object storage deliberately does not offer this — an
+object is replaced *wholesale* or not at all. That sounds like a
+limitation, and for OLTP-style workloads it would be. But for landing raw,
+append-mostly extraction output at scale, giving up in-place mutation buys
+something valuable in return: no locking, no partial-write corruption to
+reason about, effectively unlimited horizontal scale (a bucket doesn't run
+out of "disk"), and a uniform HTTP API that's become a de facto industry
+standard — the same `boto3` client code this repo writes against MinIO
+today works unchanged against real AWS S3, and largely unchanged against
+Google Cloud Storage's S3-compatible endpoint or Ceph's RGW. That
+portability is *why* ADR-002 chose it over, say, a second Postgres schema
+for raw data.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+A local filesystem: `open("data.csv", "r+")`, seek to byte 500,
+overwrite ten bytes, close — a genuine in-place partial edit, and
+`ls data/2026-09-19/` walks a real directory the operating system
+maintains. Object storage, generically: there is no `open(..., "r+")` at
+all — the SDK's primitive is `put_object(Bucket=..., Key=..., Body=...)`,
+which always writes the *entire* object; changing even one byte means
+re-uploading the whole thing under the same key. And `list_objects_v2(
+Prefix="data/2026-09-19/")` doesn't walk a directory — MinIO/S3 doesn't
+have directories at all; it string-matches every object's key against the
+prefix and returns whichever ones match. `data/2026-09-19/` "look" like a
+folder purely by convention (a `/` character in a key), not because the
+store tracks it as one.
+
+### URL Shortener Example
+
+`get_s3_client(settings)` builds a `boto3` S3 client pointed at
+`http://localhost:9000` (MinIO's S3 API port; `9001` is its separate web
+console), authenticated with the static access/secret key pair from
+`.env`. Every Bronze object this repo has ever written lives in one
+bucket, `analytics-lake`, under keys that *look* hierarchical
+(`bronze/clicks/ingestion_date=2026-09-19/clicks.parquet`) purely by the
+`/`-in-a-string convention described above — there is no
+`bronze/clicks/` directory MinIO is separately tracking; `list_bronze_keys`
+(Section 17) works precisely because it's a string-prefix match over a
+flat key space, not a directory walk.
+
+### 18.2 Architecture
+
+```
+ docker-compose.yml
+   ┌───────────┐   depends_on (healthy)   ┌──────────────┐
+   │   minio    │◀────────────────────────│ createbuckets │
+   │ (S3 API,   │                         │ (mc mb --...  │
+   │  port 9000;│                         │  ignore-exist)│
+   │  console,  │                         └──────────────┘
+   │  port 9001)│      runs once, on `docker compose up`,
+   └─────┬──────┘      creates the `analytics-lake` bucket
+         │             if it doesn't already exist
+         │  HTTP (S3 API): PUT / GET / HEAD / LIST / DELETE
+         │
+   ┌─────▼──────────────────────────────────────┐
+   │ boto3 S3 client (object_store.get_s3_client) │
+   │   endpoint_url = settings.minio_endpoint      │
+   │   signature_version = "s3v4"                  │
+   │   retries = {"max_attempts": 0}  (this repo's │
+   │     OWN retry loop in _put_parquet_with_retry │
+   │     handles retries -- boto3's built-in retry │
+   │     logic is deliberately disabled so exactly │
+   │     one retry policy is in effect, not two    │
+   │     stacked, hard-to-reason-about ones)        │
+   └─────┬──────────────────────────────────────┘
+         │
+         ▼
+   analytics-lake/
+     bronze/urls/ingestion_date=.../urls.parquet
+     bronze/users/ingestion_date=.../users.parquet
+     bronze/clicks/incremental/watermark_start=.../clicks.parquet
+     (flat key space -- the tree above is a READING convenience,
+      not a real filesystem MinIO maintains)
+```
+
+Disabling boto3's own retry logic (`retries={"max_attempts": 0}`) is worth
+calling out explicitly: `_put_parquet_with_retry` (Section 14.4) already
+implements a retry loop with its own backoff. Leaving boto3's built-in
+retrying *also* enabled would mean a transient error gets retried by two
+independent layers stacked on top of each other, with two different
+backoff schedules — harder to reason about and to tune, for no real
+benefit. One retry policy, owned by this codebase and fully visible in
+Section 14.4's code, beats two overlapping ones.
+
+### 18.3 Design Decision: one bucket, prefix-separated layers
+
+**Context:** Bronze exists today; Silver and Gold (Phase 2+) will need
+somewhere to land too, and that somewhere needs deciding now, since it
+shapes key-naming conventions everywhere in this codebase.
+**Decision:** one bucket, `analytics-lake`, with each layer as a top-level
+key prefix (`bronze/`, and later `silver/`, `gold/`) — not a separate
+bucket per layer. **Alternatives considered:** a bucket per layer
+(`analytics-lake-bronze`, `analytics-lake-silver`, `analytics-lake-gold`);
+a bucket per table. **Trade-offs:** separate buckets give cleaner
+per-layer IAM policies in a real AWS deployment (a bucket policy is a
+natural unit of access control — "Bronze readers can't touch Gold") and
+make a full-bucket lifecycle policy trivial to scope per layer. A single
+bucket with prefixes is simpler to provision (one `mc mb` command, one
+thing to create and tear down locally) and keeps `MINIO_BUCKET`, this
+repo's one piece of bucket-related configuration, a single value instead
+of three — the right trade for a Phase 1 POC's actual operational
+complexity, at the cost of that per-layer access-control convenience.
+**Consequences:** `MINIO_BUCKET`/`settings.minio_bucket` stays a single
+config value through Phase 2's Silver/Gold work; if a future need for
+per-layer IAM boundaries becomes real, migrating from prefixes to
+separate buckets is a genuine, non-trivial data-movement exercise (every
+existing key would need to move, not just be renamed) — worth knowing
+upfront rather than discovering only once Phase 2 is already underway.
+
+### Alternatives
+
+Covered above. A third, more minor alternative also considered: prefixing
+by *table* instead of by *layer* at the top level
+(`urls/bronze/...`, `clicks/bronze/...`) — rejected because most
+operational questions ("how big is Bronze right now," Section 18.4's
+`storage-stats`) are naturally scoped by layer, not by table, and
+layer-first prefixes make those the cheap, single-prefix queries while
+table-first prefixes would make them expensive, all-tables scans instead.
+
+### Trade-offs
+
+| | Single bucket, prefix layers (chosen) | Bucket per layer |
+|---|---|---|
+| Provisioning | One `mc mb` / one bucket to create | Three (or more) buckets to create and keep in sync |
+| Per-layer IAM boundary | Not directly possible — a bucket policy covers the whole bucket | Natural — a policy per bucket |
+| Config surface | One `MINIO_BUCKET` value | One bucket name per layer |
+| Migrating to per-layer boundaries later | Requires moving every object to a new bucket | N/A -- already separated |
+| Right fit for this project's current scale | Yes | Premature for a single-operator Phase 1 POC |
+
+### 18.4 Implementation
+
+---
+
+**CREATE:** (edit) `ingestion/src/url_shortener_analytics/object_store.py`
+— `get_bucket_stats`
+
+**PURPOSE:** A cheap, always-available capacity/growth signal — how many
+objects, how many bytes, under a given prefix — without needing a real
+observability platform wired up yet.
+
+**IMPLEMENTATION GUIDE (write it yourself):** `list_objects_v2`'s response
+already includes a `Size` field per object in `Contents` — resist the
+urge to loop over `list_bronze_keys`'s output and call `head_object` on
+each one to get its size; that's one HTTP round-trip per object where one
+round-trip *total* already has everything needed. Sum `Size` across
+`Contents`, count the entries, return both as a small dict.
+
+**REFERENCE IMPLEMENTATION:**
+
+```python
+# ingestion/src/url_shortener_analytics/object_store.py (excerpt)
+
+def get_bucket_stats(s3_client: BaseClient, bucket: str, prefix: str = "bronze/") -> dict[str, int]:
+    response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+    contents = response.get("Contents", [])
+    return {"object_count": len(contents), "total_bytes": sum(obj["Size"] for obj in contents)}
+```
+
+Full file: [`object_store.py`](../ingestion/src/url_shortener_analytics/object_store.py).
+
+**RUN:** `make storage-stats` (wraps `python -m url_shortener_analytics.cli
+storage-stats --prefix bronze/`)
+
+**VERIFY:** run `make ingest-full`, then `make storage-stats` twice in a
+row — the second run's `object_count`/`total_bytes` should match the
+first (full loads overwrite the same date-scoped keys — Section 14's
+idempotency guarantee — so re-running `ingest-full` without advancing to
+a new day must not grow these numbers).
+
+**EXPECTED:** `object_count` equal to the number of distinct
+`(table, ingestion_date)` and `(table, watermark_range)` combinations
+ever successfully written; `total_bytes` roughly tracking Section 19's
+per-format size numbers, times however many objects exist.
+
+**TEST:** `test_object_store.py` — two new tests (size/count summed
+correctly with no `head_object` calls; zero-object case).
+
+**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections
+18.8/18.9.
+
+---
+
+### Hands-on Challenge (implement-yourself)
+
+Before LAB 14 below, try this without looking at `object_store.py`: write
+a version of `get_bucket_stats` that *also* breaks the total down
+per-table (a dict of `{table_name: {"object_count": ..., "total_bytes":
+...}}`), using only `list_bronze_keys`'s existing output — no new S3 calls.
+Hint: the table name is the second path segment of every Bronze key
+(`bronze/{table}/...`) — you already have everything you need in the key
+strings themselves, entirely client-side, once you have the flat listing.
+
+### 18.5 Hands-on Exercise
+
+**LAB 14 — Watch Bronze storage grow, then confirm idempotent reruns
+don't grow it further.**
+
+Prerequisites: `make up`, `make seed`.
+
+```bash
+make storage-stats          # before anything: object_count=0, total_bytes=0
+make ingest-full            # writes urls.parquet, users.parquet
+make storage-stats          # object_count=2, total_bytes=<real total>
+
+make ingest                 # clicks: first incremental run, one more object
+make storage-stats          # object_count=3
+
+make ingest-full            # SAME day -- overwrites urls.parquet/users.parquet
+                             # in place (Section 14's idempotency guarantee)
+make storage-stats          # object_count STILL 3 -- not 5
+```
+
+What to observe: the last `storage-stats` call is the real proof this lab
+is after — a second `make ingest-full` on the same day does not grow
+`object_count`, because `build_bronze_key`'s deterministic, date-scoped
+keys mean the rerun overwrote the exact same two objects rather than
+creating new ones. *(DESIGN EXPECTATION for the exact numbers — run it
+yourself with real MinIO; this sandbox has none.)*
+
+### 18.6 How to test
+
+```bash
+make test
+```
+
+The full unit suite — 63 tests, up from 59 at the end of the Section
+16-17 increment (4 new: `get_bucket_stats` x2, `list_bronze_keys_for_date_range`
+x2 — the latter belongs to Section 20 below) — was genuinely run in this
+environment and passed. ACTUAL OBSERVED:
+
+```
+63 passed in 7.09s
+```
+
+`ruff check ingestion/ benchmarks/` was also run against every file this
+increment touched and passed cleanly — ACTUAL OBSERVED: `All checks
+passed!`
+
+One further, genuine check specifically for this section's Failure
+Scenario below: calling `get_bucket_stats` with a mocked S3 client whose
+`list_objects_v2` raises a `NoSuchBucket` `ClientError` was run directly
+in this sandbox (no real MinIO needed for this specific check, since it
+tests this function's own lack of error handling, not S3's real
+behavior) — confirmed the `ClientError` propagates completely uncaught.
+This is what Section 18.7 is about.
+
+### 18.7 Failure Scenario
+
+**What happens if `storage-stats` runs against a bucket that doesn't
+exist yet — say, before `docker compose`'s `createbuckets` service has
+finished, or after a typo'd `--prefix` pointed at an entirely different,
+nonexistent bucket via a misconfigured `MINIO_BUCKET`?**
+
+This is a real, currently-unaddressed gap in the code just written, found
+by reading it rather than assumed: unlike `run_full_load_command`/
+`run_command` (which wrap each table's work in `try/except Exception` and
+log a clean failure) or `validate_contracts_command` (which catches
+`ContractError` specifically), `storage_stats_command` — and, for that
+matter, `check_stale_runs_command` and `reconcile_bronze_command` from
+Section 16/17 — have **no** exception handling around their S3/database
+calls at all. A `list_objects_v2` call against a bucket that genuinely
+doesn't exist raises a `ClientError` with code `NoSuchBucket`, which this
+sandbox genuinely confirmed (Section 18.6) propagates straight out of
+`get_bucket_stats`, uncaught, all the way to a raw Python traceback on
+the operator's terminal instead of a clean logged error and a `1` exit
+code — a materially worse operator experience than every other command
+in this file provides, and inconsistent with this file's own established
+pattern. **This is a genuine, honestly-named gap, not a hypothetical
+one** — see Section 18.8's Production Considerations for what closing it
+would take, deliberately left undone here rather than silently patched
+in without calling it out as new scope.
+
+### 18.8 Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| Bucket/layer separation | One bucket, prefix-separated layers (18.3) | Same, or bucket-per-layer once per-layer IAM boundaries are a real requirement |
+| Capacity monitoring | Manual (`make storage-stats`) | Scraped on a schedule into a real metrics platform (Prometheus/CloudWatch), graphed over time, alerted on unexpected growth or a stall |
+| Error handling on the reporting/monitoring commands | None — see 18.7's named gap, uncaught `ClientError` on a missing bucket | Every operator-facing command wraps its own calls and returns a clean exit code, the same standard `run_command`/`validate_contracts_command` already meet |
+| Retry policy | This repo's own loop in `_put_parquet_with_retry`; boto3's built-in retries explicitly disabled to avoid two stacked policies (18.2) | Same principle, typically with jitter added to backoff and a circuit breaker once request volume is high enough for thundering-herd retries to matter |
+| Consistency model | Relies on S3/MinIO's modern strong read-after-write consistency (not the older "eventual consistency" S3 had years ago) | Same — but worth explicitly verifying for any non-AWS, non-MinIO S3-compatible store before depending on it, since "S3-compatible" doesn't always mean "S3-consistent" |
+
+### Principal Data Engineer Perspective
+
+The judgment call worth defending here is naming Section 18.7's gap
+explicitly rather than quietly working around it or, worse, not noticing
+it at all. It would have been easy to write `storage_stats_command`,
+watch it work against a bucket that already exists (which is all `make
+up` ever leaves this repo with), and never exercise the one code path
+where it breaks. Principal-level code review habitually asks "what
+happens when this specific call fails," not just "does this work for the
+input I tested" — and the honest answer here, confirmed by actually
+running the failure case rather than guessing about it, is that three of
+this file's six commands (`check-stale-runs`, `reconcile-bronze`,
+`storage-stats`) have real, currently-unpatched gaps in their own
+top-level error handling, inconsistent with the other three. Naming this
+plainly, as a known limitation rather than a silent one, is worth more to
+a reader evaluating this repository than quietly fixing it without
+comment would be — it demonstrates the review habit itself, not just its
+output. The second thing worth flagging: the single-bucket-with-prefixes
+decision (18.3) is a real, if modest, piece of technical debt being taken
+on deliberately — it trades away clean per-layer IAM boundaries for
+Phase 1's actual, current operational simplicity, and says so plainly
+rather than presenting "one bucket" as obviously, permanently correct.
+
+### 18.9 Principal Engineer Interview Questions
+
+**Q: "Someone asks you why S3 (or MinIO) can't just support editing ten
+bytes in the middle of a large object the way a local filesystem can.
+What would you tell them, and why does this repo's code look the way it
+does as a direct consequence?"**
+
+*What's tested:* whether the candidate understands object storage's core
+constraint as a deliberate architectural trade-off, not an arbitrary
+limitation — and can trace a concrete design consequence back to it.
+
+*What a weak answer looks like:* "Object storage just isn't built for
+that" — true but circular; doesn't explain *why not*, or connect it to
+anything concrete.
+
+*What a strong answer covers:* whole-object semantics are what let object
+storage scale the way it does — no per-object lock manager, no
+concurrent-writer coordination for partial updates, uniform HTTP
+semantics regardless of object size. The direct consequence in this
+codebase: `build_bronze_key`/`build_bronze_incremental_key` (Sections
+14-15) are deterministic specifically *because* the only way to safely
+"correct" a previous write is to overwrite the whole object under the
+same key — there's no `UPDATE ... WHERE id = 5` equivalent available at
+the object-storage layer at all.
+
+*Concepts:* whole-object PUT/overwrite semantics; the trade-off between
+mutability and horizontal scalability.
+
+*Expected follow-up:* "What would change about this repo's approach if
+Bronze objects needed row-level updates?" — A move to a table format like
+Delta Lake/Iceberg/Hudi, which layer transactional, row-level semantics
+*on top of* immutable object storage via a metadata/log layer, rather
+than object storage itself gaining that capability.
+
+*Common mistake:* describing this as a current *limitation of MinIO
+specifically*, rather than a property of the object-storage model in
+general that MinIO, S3, and GCS all share by design.
+
+**Q: "Your `list_bronze_keys` function treats `bronze/clicks/` as if it
+were a folder. Is it actually one? What would break if you assumed it
+was?"**
+
+*What's tested:* whether the candidate has internalized the
+flat-key-space model deeply enough to predict a concrete failure from
+treating prefixes as real directories.
+
+*What a weak answer looks like:* "No, it's just a prefix" — correct but
+stops short of a concrete consequence.
+
+*What a strong answer covers:* no — every key in a bucket lives in one
+flat namespace; `/` has no special meaning to the store itself, only to
+`list_objects_v2`'s optional prefix-matching and (separately) its
+`Delimiter` parameter, which this codebase doesn't use. What would break:
+code that assumes an empty "folder" can exist (it can't — there's nothing
+to list until at least one object with that prefix is written, unlike
+`mkdir` creating a real, empty directory), or code that tries to "rename a
+folder" as one operation (there's no such primitive — every object under
+the old prefix has to be copied to a new key and the old one deleted,
+individually, since a prefix isn't a real, addressable entity that can be
+renamed).
+
+*Concepts:* flat key namespace vs. hierarchical filesystem; prefix
+matching as a string operation, not a directory traversal.
+
+*Expected follow-up:* "How would you efficiently rename every object
+under a prefix, then, given there's no rename primitive?" — List every
+key under the old prefix, copy each to its new key (`copy_object`), then
+delete the originals — an operation whose cost scales with object count,
+not tree depth, unlike a filesystem `mv`.
+
+*Common mistake:* asserting object storage "has folders" because a
+console UI (MinIO's or AWS's) visually renders one — the UI is doing the
+same prefix-based grouping this codebase's own key convention relies on,
+not exposing a real filesystem feature underneath.
+
+---
+
+## 19. Parquet ✅✅
+
+### 19.1 Concept
+
+**Parquet** is a columnar, self-describing binary file format: instead of
+storing data row-by-row (`row1: id,code,url` then `row2: id,code,url`...),
+it stores each *column* contiguously (`id: [1,2,3,...]`, then
+`code: [...]`, then `url: [...]`), with a footer that embeds the schema
+and per-column statistics. This repo has written every Bronze object as
+Parquet since Section 14 (`_dataframe_to_parquet_bytes`,
+snappy-compressed via PyArrow) — always as an assertion (ADR-003 calls it
+"efficient for analytical, column-selective reads"), never measured. This
+section closes that: a real benchmark script, genuinely run in this
+sandbox, comparing Parquet against CSV and JSON-lines on this project's
+own data, at two different scales.
+
+### Why does this exist?
+
+Row-oriented formats (CSV, JSON-lines) are simple and human-readable, but
+force every reader to parse an entire row just to access one column — a
+query that only needs `device_type` still has to read and skip past
+`id`, `short_code`, `occurred_at`, `hashed_ip`, and `user_id` for every
+single row. A columnar format lets a reader skip straight to the bytes
+for exactly the column(s) it needs, and lets compression work far better,
+too — a column of a few dozen repeating `device_type` values compresses
+much more effectively sitting next to millions of other `device_type`
+values than interleaved between five other, unrelated columns. Both
+properties matter enormously for analytical workloads, which very
+commonly touch a handful of columns out of many, across a lot of rows —
+exactly the query shape Section 2 (OLTP vs. OLAP) named as this whole
+platform's reason for existing in the first place.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+A CSV with a million rows and twenty columns, where a query only needs
+one column's average: a row-oriented reader has no choice but to read
+every byte of every row, parse all twenty fields per row, and discard
+nineteen of them per row, a million times over. A columnar reader with
+the same file in Parquet form reads *only* that one column's contiguous
+byte range off disk — the other nineteen columns' bytes are never even
+touched. The difference isn't "columnar happens to be faster" as a vague
+claim — it's a structural one: the amount of data actually read from disk
+scales with *columns needed*, not *columns that exist*.
+
+### URL Shortener Example
+
+`build_bronze_key`/`write_bronze` already write every table as Parquet.
+What this section adds: `benchmarks/parquet_vs_csv_vs_json.py`, a script
+that takes this repo's own real `clicks` table (or a larger synthetic
+version with the same shape) and writes it to disk in all three formats,
+then measures file size, write time, full-table read time, and
+single-column (`device_type`) read time for each — genuinely run, twice,
+in this sandbox.
+
+### 19.2 Architecture
+
+```
+ clicks (Postgres, real seeded data OR synthetic-generated DataFrame)
+        │
+        ├──▶ df.to_csv(...)      ──▶ clicks.csv      ──▶ pd.read_csv(...)
+        │                                              ──▶ pd.read_csv(usecols=["device_type"])
+        │                                                   (still scans every row; only SKIPS
+        │                                                    building the other columns)
+        │
+        ├──▶ df.to_json(lines=True) ──▶ clicks.jsonl  ──▶ pd.read_json(...)
+        │                                              ──▶ pd.read_json(...)[["device_type"]]
+        │                                                   (no columnar shortcut exists at all --
+        │                                                    every line is fully parsed regardless)
+        │
+        └──▶ df.to_parquet(compression="snappy") ──▶ clicks.parquet ──▶ pd.read_parquet(...)
+                                                                       ──▶ pd.read_parquet(columns=["device_type"])
+                                                                            (TRUE columnar pushdown --
+                                                                             other 5 columns' bytes
+                                                                             never read off disk)
+```
+
+Three formats, four measurements each (size, write time, full read, one-
+column read), run twice — once against this project's real 5,000-row
+`clicks` table, once against a synthetic 200,000-row version of the same
+shape — because, as 19.6 shows, the *real* dataset is small enough that
+the trends aren't yet obvious at that scale.
+
+### 19.3 Design Decision: benchmark at two scales, not one
+
+**Context:** this repo's own seeded data is small (5,000 `clicks` rows by
+`make seed`'s own `N_CLICKS` constant) — small enough, it turns out, that
+Parquet's advantages are not all visible yet. **Decision:** run the
+benchmark twice — once against the real, small seeded table, once against
+a synthetic 200,000-row table of the same shape — and report both
+honestly, rather than picking whichever scale makes the intended point
+more cleanly. **Alternatives considered:** benchmark only the real seeded
+data (simpler, fully "real," but understates Parquet's actual advantage
+at realistic production scale); benchmark only a large synthetic dataset
+(shows the advantage clearly, but never touches this repo's own actual
+data at all). **Trade-offs:** two scales costs more script complexity and
+roughly twice the runtime, in exchange for a materially more honest
+result — the small-scale run is a genuine, if initially surprising,
+finding in its own right (19.6), not a number to bury because it
+complicates the intended narrative. **Consequences:** any claim in this
+guide about Parquet's advantage now has to specify *at what scale* it
+holds — "Parquet is smaller and faster" is true, but incompletely true,
+without that qualifier, and this guide's own standing rule against
+overstating results (Section 15.7, 17.7's honesty about narrower
+guarantees than initially claimed) applies here too.
+
+### Alternatives
+
+Covered above. A further alternative considered and rejected: running
+each format/scale combination many times and reporting a mean/median with
+variance, the way a rigorous benchmark suite would — rejected for this
+section specifically because a single-run wall-clock measurement, taken
+honestly and labeled as such, is enough to demonstrate the *structural*
+effect this section is teaching (columnar vs. row-oriented I/O) without
+overstating precision this sandbox's shared, variable-load environment
+can't actually deliver; see 19.6 and 19.8 for that caveat stated
+explicitly.
+
+### Trade-offs
+
+| | Row-oriented (CSV/JSON) | Columnar (Parquet) |
+|---|---|---|
+| Full-table read | Reads and parses every byte of every row, always | Same total data volume, but decodes per-column, compressed |
+| Single-column read | CSV: still scans every row (`usecols` only skips building unused columns); JSON: no shortcut at all | True columnar pushdown -- only the needed column's bytes are read |
+| File size | No native compression (CSV); verbose text encoding, especially JSON's repeated keys per row | Compressed (snappy here) and compactly, binary-encoded |
+| Human-readable | Yes, directly | No -- needs a Parquet-aware tool |
+| Schema | Not self-describing -- inferred or assumed by the reader | Self-describing -- embedded in the file's own footer |
+| Small-scale overhead | Effectively none | Real, fixed per-file overhead (footer, schema encoding) that has to be amortized across enough rows to pay for itself -- see 19.6 |
+
+### 19.4 Implementation
+
+---
+
+**CREATE:** `benchmarks/parquet_vs_csv_vs_json.py`
+
+**PURPOSE:** Produce real, reproducible file-size and read/write-time
+numbers comparing Parquet against CSV and JSON-lines — the benchmark
+ADR-003 named as "planned" two increments ago.
+
+**DEPENDENCIES:** `pandas`, `pyarrow` (already dependencies of the main
+package); this project's own `config`/`db` modules, to read the real
+`clicks` table when run with no `--rows` argument.
+
+**IMPLEMENTATION GUIDE (write it yourself):** load a DataFrame (real, from
+`clicks`, or synthetic via a `--rows N` flag generating the same six
+columns purely in Python — no database round-trip needed for the
+synthetic path, so it scales far beyond what a small local Postgres
+comfortably holds). For each of the three formats, time a write to a
+temp directory, record the resulting file's size on disk
+(`Path.stat().st_size`), time a full read back into a DataFrame, and time
+a read of just the `device_type` column — using each format's *fairest*
+available API for that (`usecols=` for CSV, plain read-then-select for
+JSON since it has no columnar shortcut, `columns=` for Parquet). Print a
+table; don't round-trip through the database for the synthetic case at
+all, since the entire point of that path is testing at a scale the local
+Postgres wasn't seeded for.
+
+**REFERENCE IMPLEMENTATION (excerpt — full script already committed):**
+
+```python
+# benchmarks/parquet_vs_csv_vs_json.py (excerpt)
+
+def _read_csv_one_column(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path, usecols=["device_type"])          # scans every row regardless
+
+def _read_json_one_column(path: Path) -> pd.DataFrame:
+    return pd.read_json(path, orient="records", lines=True)[["device_type"]]  # no shortcut at all
+
+def _read_parquet_one_column(path: Path) -> pd.DataFrame:
+    return pd.read_parquet(path, engine="pyarrow", columns=["device_type"])   # true columnar pushdown
+```
+
+Full file: [`parquet_vs_csv_vs_json.py`](../benchmarks/parquet_vs_csv_vs_json.py).
+
+**RUN:**
+```bash
+make benchmark-parquet                 # real seeded clicks table
+make benchmark-parquet ROWS=200000     # synthetic, larger scale
+```
+
+**VERIFY / EXPECTED:** see 19.6's actual output below — this is one of
+the few places in this guide where "expected" and "actually observed" are
+the same section, since the numbers below are real.
+
+**TEST:** this script isn't unit-tested (it's a one-off measurement tool,
+not pipeline code another module imports — the same category `scripts/
+seed_sample_data.py` already falls into); `ruff check benchmarks/` is
+run as part of this increment's lint pass.
+
+**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections
+19.8/19.9.
+
+---
+
+### Hands-on Challenge (implement-yourself)
+
+Before LAB 15 below, try this without looking at the script: predict, in
+writing, whether you expect Parquet's *full-table* read to be faster or
+slower than CSV's at 5,000 rows, and why — before running anything. Then
+run `make benchmark-parquet` and compare your prediction against 19.6's
+real numbers. (Most people predict "Parquet wins on every metric,
+always" — the real, small-scale result is more interesting than that,
+and 19.6 explains exactly why.)
+
+### 19.5 Hands-on Exercise
+
+**LAB 15 — Run the benchmark yourself, at both scales.**
+
+```bash
+make benchmark-parquet                  # real clicks table (~5,000 rows)
+make benchmark-parquet ROWS=200000      # synthetic, 200,000 rows
+```
+
+What to observe: run it twice at the small scale and compare — wall-clock
+timings on a shared machine vary run to run (19.8 names this explicitly);
+the *size* numbers, by contrast, are deterministic and will match 19.6
+exactly. Then compare the small-scale and large-scale results side by
+side and notice which metrics *change trend* between the two (19.6 names
+exactly one that does).
+
+### 19.6 How to test
+
+The benchmark script above was genuinely run twice in this sandbox — once
+against the real, 5,000-row seeded `clicks` table, once against a
+synthetic 200,000-row version. **Both are ACTUAL OBSERVED results, not
+DESIGN EXPECTATIONS:**
+
+```
+Loaded 5000 REAL rows from this project's own `clicks` table.
+
+dataset              format      rows   size_bytes   write_s  full_read_s  one_col_read_s
+-----------------------------------------------------------------------------------------
+real_clicks          csv         5000       597311    0.0405       0.0124          0.0063
+real_clicks          json        5000       961259    0.0376       0.0288          0.0252
+real_clicks          parquet     5000       417649    0.0164       0.0132          0.0024
+
+real_clicks: csv is 1.43x the size of parquet
+real_clicks: json is 2.30x the size of parquet
+```
+
+```
+Generated 200000 SYNTHETIC rows (same shape as `clicks`, not real data).
+
+dataset              format      rows   size_bytes   write_s  full_read_s  one_col_read_s
+-----------------------------------------------------------------------------------------
+synthetic_200000     csv       200000     21626749    0.8884       0.4753          0.1645
+synthetic_200000     json      200000     38586801    0.6567       1.0284          0.9612
+synthetic_200000     parquet   200000      4329469    0.0912       0.0596          0.0082
+
+synthetic_200000: csv is 5.00x the size of parquet
+synthetic_200000: json is 8.91x the size of parquet
+```
+
+**What actually changed between the two scales, stated honestly:** file
+size and single-column read time favor Parquet decisively at *both*
+scales (at 5,000 rows, Parquet's one-column read is already ~2.6x faster
+than CSV's and ~10x faster than JSON's). But **full-table read time is
+the metric that flips**: at 5,000 rows, Parquet's full read (0.0132s) is
+essentially tied with — if anything, marginally slower than — CSV's
+(0.0124s); only at 200,000 rows does Parquet's full read pull decisively
+ahead (0.0596s vs. CSV's 0.4753s, ~8x faster). The reason is Parquet's
+own structure: every Parquet file carries fixed per-file overhead (a
+footer, embedded schema, column metadata) that a reader has to parse
+before touching any actual row data — at 5,000 rows that fixed cost isn't
+yet amortized away by the savings columnar storage provides; at 200,000
+rows it is, overwhelmingly. **The lesson, stated plainly: "Parquet is
+faster" is true, but only past a scale where its fixed overhead pays for
+itself — a claim this guide would have gotten wrong by only ever
+benchmarking this project's own small seeded dataset**, which is exactly
+why 19.3 chose to run both scales rather than one.
+
+**Caveat, stated honestly:** these are single-run wall-clock timings on a
+shared cloud sandbox, not a statistically rigorous multi-trial benchmark
+(no repeated runs, no variance reported) — the *size* numbers are exact
+and fully reproducible; the *timing* numbers should be read as
+directionally real, not as precise to the millisecond. Re-run
+`make benchmark-parquet` yourself and expect small run-to-run variance in
+the timing columns, none in the size columns.
+
+### 19.7 Failure Scenario
+
+**What happens if a Parquet file is read by a tool that doesn't
+understand it?**
+
+Concretely: a Bronze object opened with a plain text editor, or piped
+through `cat`, is unrecognizable binary — unlike a CSV or JSON-lines
+object, which is directly human-readable without any special tooling at
+all. This is a real, if minor, operational cost of the columnar/binary
+trade-off named in the Trade-offs table above: debugging "what's actually
+in this Bronze object" requires a Parquet-aware tool (`python -c "import
+pandas; print(pandas.read_parquet('...').head())"`, `parquet-tools`, or
+MinIO's own object browser, which can preview Parquet natively) rather
+than just opening the file. For a team without that tooling already in
+their muscle memory, this is a genuine, if small, onboarding friction
+point worth naming rather than glossing over as costless.
+
+### 19.8 Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| Compression codec | `snappy` (fast, moderate ratio) | Same default is common; some shops use `zstd` for a better ratio at some CPU cost once storage cost dominates over compute cost |
+| Row-group sizing | PyArrow's own default, unconfigured | Explicitly tuned row-group size, balancing read parallelism against per-row-group metadata overhead, once file sizes grow well past this repo's current scale |
+| Benchmark rigor | Single-run wall-clock timings, two scales, genuinely run once each (19.6) | Repeated trials, reported with variance, on dedicated (not shared/variable-load) hardware, at the actual production data scale rather than a synthetic stand-in |
+| Schema evolution | Not yet exercised — every write so far uses one, unchanging schema per table | Parquet supports schema evolution (adding/removing columns across files) but readers across an evolving dataset need to handle it explicitly; untested here |
+| Tooling accessibility | Requires a Parquet-aware tool to inspect (19.7) | Same constraint in production, typically mitigated by a query engine (Athena, Spark, DuckDB) sitting in front of raw files so nobody inspects them by hand regularly |
+
+### Principal Data Engineer Perspective
+
+The judgment call worth defending here is reporting the small-scale
+result honestly even though it complicates the story ADR-003 originally
+told ("Parquet is efficient for analytical, column-selective reads," said
+with confidence, two increments before it was ever measured). A weaker
+approach to closing this benchmark gap would have been to run it once, at
+whatever scale made Parquet look unambiguously best, and call the
+"planned benchmark" item done. What actually happened — running it twice,
+finding a real result that doesn't uniformly favor Parquet at small
+scale, and explaining *why*, structurally — is a better outcome for a
+portfolio reviewer to see, not a worse one: it demonstrates the habit of
+verifying an assumption rather than just restating it more confidently
+after having measured it. The second thing worth flagging: the
+single-column read numbers are the more important ones for this
+project's actual eventual query shape (Section 2's whole reason object
+storage plus a columnar format was chosen at all), and those favor
+Parquet decisively at *every* scale tested, including the smallest —
+worth being able to say which of a benchmark's several numbers is
+actually load-bearing for the original design decision, rather than
+treating every column of a results table as equally important.
+
+### 19.9 Principal Engineer Interview Questions
+
+**Q: "Your own benchmark shows Parquet's full-table read time roughly
+tied with CSV's at 5,000 rows, only pulling ahead at 200,000. Does that
+mean Parquet was the wrong choice for this project at its current
+scale?"**
+
+*What's tested:* whether the candidate can separate "which number
+matters for this specific system's actual query pattern" from "which
+number looks best in a table" — a genuine judgment call, not a
+lookup.
+
+*What a weak answer looks like:* "No, Parquet is always better" —
+contradicted by the candidate's own benchmark; a strong answer has to
+engage with the actual, honest result, not wave it away.
+
+*What a strong answer covers:* no, because full-table reads (`SELECT *`)
+aren't this platform's target query shape at all — Section 2 established
+that analytical workloads are column-selective, and the single-column
+read numbers (Parquet decisively faster than CSV and JSON at *every*
+tested scale, including 5,000 rows) are the metric that actually predicts
+this project's real future workload. Choosing a format based on the
+metric that matches your actual access pattern, not the metric that's
+easiest to headline, is the right call here — and it happens to still be
+Parquet, just for a more specific and better-justified reason than "it's
+generally faster."
+
+*Concepts:* matching a benchmark's chosen metric to the system's real
+access pattern; not treating every number in a results table as equally
+decision-relevant.
+
+*Expected follow-up:* "At what row count would you expect Parquet's
+full-read time to overtake CSV's, and how would you find out precisely?"
+— Somewhere between 5,000 and 200,000 rows for this exact schema and
+this exact hardware; finding the precise crossover would mean running
+the same benchmark at several intermediate row counts (e.g. 10k, 25k,
+50k, 100k) and plotting the trend, rather than guessing from two data
+points.
+
+*Common mistake:* citing only the size-reduction numbers (1.43x-8.91x)
+as if they alone settled the question, without engaging with the
+full-read timing result that doesn't uniformly favor Parquet — a subtler
+version of the same "restate the assumption more confidently after
+measuring it" failure this section's Principal Perspective calls out.
+
+**Q: "Explain, mechanically, why `pd.read_csv(usecols=["device_type"])`
+is NOT the same thing as true columnar I/O, even though it only returns
+one column."**
+
+*What's tested:* whether the candidate understands the actual mechanism
+behind columnar pushdown, not just that Parquet "supports" it as a
+feature checkbox.
+
+*What a weak answer looks like:* "CSV doesn't support columns the same
+way" — vague, doesn't explain the actual disk-I/O difference.
+
+*What a strong answer covers:* a CSV file has no way to locate where
+`device_type`'s values start without scanning through every preceding
+field of every row first — the parser has to read and tokenize the
+*entire* line, byte by byte, to even know where that column's value
+begins on each row; `usecols` only skips the cost of *building a Python
+object* for the columns it discards, not the cost of *reading and parsing
+their bytes off disk*. Parquet's footer stores exactly which byte ranges
+belong to which column, so `columns=["device_type"]` lets the reader seek
+directly to that column's bytes and never touch the other columns' data
+at all, at the I/O level, not just the object-construction level.
+
+*Concepts:* the difference between skipping object construction and
+skipping disk I/O; Parquet's footer-based column offset lookup as the
+actual mechanism, not "compression" or "it's a modern format" as vague
+substitutes for a real explanation.
+
+*Expected follow-up:* "Does this same distinction apply to filtering
+rows (a `WHERE` clause), not just selecting columns?" — Yes, via Parquet's
+per-row-group statistics (min/max per column per row group), which let a
+reader skip entire row groups that can't possibly match a filter without
+reading them at all — "predicate pushdown," a related but distinct
+mechanism from column pushdown, not exercised by this repo's benchmark
+but worth naming as the next layer of the same idea.
+
+*Common mistake:* conflating `usecols`' real (but different) benefit —
+skipping wasted Python object construction — with Parquet's actual
+disk-I/O-level skipping, as though they were the same optimization.
+
+---
+
+## 20. Partitioning ✅✅
+
+### 20.1 Concept
+
+**Partitioning** splits a dataset's files across separate keys/paths by
+the value of one or more columns — typically ones a reader will commonly
+filter on — so that a query can skip entire files it doesn't need without
+opening them at all. This repo has been partitioning data since Section
+14 without ever calling it that: `build_bronze_key`'s
+`ingestion_date=2026-09-19/` and `build_bronze_incremental_key`'s
+`watermark_start=.../watermark_end=.../` are both **Hive-style
+partitioning** — a `key=value` convention embedded directly in the object
+key — already in production use in every Bronze write this pipeline
+performs. This section makes that explicit, explains *why* the convention
+looks the way it does, and adds the piece genuinely missing so far:
+**partition pruning** — actually using the partition structure to avoid
+listing objects a query doesn't need, rather than listing everything and
+filtering afterward, which is what `list_bronze_keys` (Section 17) does
+today.
+
+### Why does this exist?
+
+Without partitioning, "give me `clicks` data for 2026-09-19" means
+listing (and potentially reading) *every* object this table has ever had
+written, then filtering by date in application code — wasted work that
+grows without bound as history accumulates, for a query that only ever
+needed one day's worth of data. Partitioning by the columns queries
+actually filter on turns that into "list only the objects under this
+date's own prefix" — the filtering happens by *choosing which prefix to
+list at all*, not by discarding unwanted objects after they've already
+been listed (or, worse, read). This is exactly the same idea as an index
+on a database column, applied to an object store instead of a table: put
+the thing queries filter on into the key/path structure itself, so
+lookups can skip straight past what they don't need.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+An unpartitioned dataset: every day's export lands as
+`exports/export_2026_09_01.csv`, `exports/export_2026_09_02.csv`, ... all
+under one flat `exports/` prefix. Answering "what's in the September 19th
+export" means listing all of `exports/` (however many files exist,
+growing forever) and picking out the one matching filename by string
+comparison. A Hive-partitioned version instead uses
+`exports/date=2026-09-01/data.csv`, `exports/date=2026-09-02/data.csv`,
+... — "what's in the September 19th export" becomes `list(Prefix=
+"exports/date=2026-09-19/")`, a single, cheap call that only ever touches
+objects for that one day, regardless of how many other days' worth of
+data exists elsewhere in the bucket.
+
+### URL Shortener Example
+
+`bronze/clicks/incremental/watermark_start=000000005000/watermark_end=000000005103/clicks.parquet`
+is already exactly this pattern — a Hive-style partition on
+`watermark_start`/`watermark_end` for incremental loads;
+`bronze/urls/ingestion_date=2026-09-19/urls.parquet` the same, on
+`ingestion_date`, for full loads. What's new this section:
+`list_bronze_keys_for_date_range` (full-load tables only — see 20.3's
+Design Decision for why incremental tables are explicitly out of scope
+for this specific function), which issues one `list_objects_v2` call
+**per date**, each scoped to that date's own partition prefix, instead of
+one call over the table's entire `bronze/{table}/` prefix followed by
+client-side filtering (which is what `list_bronze_keys`, Section 17,
+still does today, and continues to do — it's the right tool for "list
+everything," just not for "list one date range").
+
+### 20.2 Architecture
+
+```
+ Unpruned (list_bronze_keys, Section 17):
+
+   list_objects_v2(Prefix="bronze/urls/")
+        │
+        ▼
+   returns EVERY urls object ever written, every ingestion_date
+        │
+        ▼
+   caller filters by date in Python, if it only wanted one range
+   (cost scales with TOTAL history, not the range actually needed)
+
+
+ Pruned (list_bronze_keys_for_date_range, Section 20 -- NEW):
+
+   for each date in [start_date, end_date]:
+       list_objects_v2(Prefix=f"bronze/urls/ingestion_date={date}/")
+                             │
+                             ▼
+                    returns ONLY that date's own object(s)
+        │
+        ▼
+   caller concatenates -- S3 itself never even considered objects
+   outside the requested range (cost scales with the RANGE requested,
+   not total history)
+```
+
+The two functions coexist deliberately, not because one replaces the
+other: `list_bronze_keys` is still the right call for "give me
+everything" (reconciliation, Section 17, genuinely needs a full listing
+to detect orphans and cannot know in advance which dates to prune to);
+`list_bronze_keys_for_date_range` is the right call for "give me a known
+range" — exactly the access pattern a Phase 2 transform reading, say,
+"the last 7 days of `urls` snapshots" would have.
+
+### 20.3 Design Decision: scope pruning to full-load's date partitions only
+
+**Context:** this repo has two different partitioning schemes in
+production already — full-load's `ingestion_date=` (a calendar date) and
+incremental-load's `watermark_start=`/`watermark_end=` (an integer
+range) — and pruning needs to actually construct valid prefixes to query,
+which means knowing the scheme in advance. **Decision:**
+`list_bronze_keys_for_date_range` handles the date-partitioned scheme
+only; no equivalent watermark-range-pruned function was built this
+increment for incremental tables. **Alternatives considered:** a single,
+more general pruning function that accepts either a date range or a
+watermark range, dispatching on `load_type`; deferring date-range pruning
+entirely until both schemes could be handled uniformly. **Trade-offs:** a
+unified function would present one interface for both cases, but a
+watermark range isn't queryable the same way a date range is — the whole
+point of a watermark is that it's an opaque, monotonically-increasing
+id boundary discovered from `ingestion_metadata` (Section 15), not a
+value a caller can enumerate in advance the way `date(2026, 9, 18)`
+through `date(2026, 9, 20)` can be listed one day at a time; building a
+"prune by watermark range" function honestly would need to first query
+`ingestion_metadata` for which specific `(watermark_start, watermark_end)`
+pairs actually exist in the requested range, which is a meaningfully
+different (and already-available, via `list_successful_bronze_keys`)
+code path, not a variant of prefix construction. **Consequences:** a
+Phase 2 reader wanting a pruned listing of *incremental* Bronze data
+should query `ingestion_metadata` directly (already possible today, via
+`list_successful_bronze_keys` with a date filter added to that query) —
+this is named as a real, current scope boundary, not silently treated as
+solved by a function that doesn't actually solve it for that case.
+
+### Alternatives
+
+Covered above. A further, smaller alternative considered for the
+date-partitioned case specifically: accepting a list of `S3 Select` or
+server-side filter expressions instead of iterating dates client-side —
+rejected as genuinely out of scope for a POC (S3 Select requires the
+object contents themselves to be scanned server-side per object, a
+different and more complex mechanism than prefix-based partition pruning,
+and MinIO's S3 Select support/performance characteristics differ from
+AWS's in ways this project hasn't evaluated).
+
+### Trade-offs
+
+| | `list_bronze_keys` (full listing) | `list_bronze_keys_for_date_range` (pruned) |
+|---|---|---|
+| Calls issued | One | One per date in range |
+| Objects S3 considers | Every object under the table's prefix | Only objects under the requested dates' prefixes |
+| Right tool for | "Give me everything" (reconciliation) | "Give me a known date range" |
+| Works for incremental tables | Yes (lists everything, any scheme) | No -- see 20.3's Design Decision |
+| Cost as history grows | Grows with total history | Stays constant for a fixed-size requested range |
+
+### 20.4 Implementation
+
+---
+
+**CREATE:** (edit) `ingestion/src/url_shortener_analytics/object_store.py`
+— `list_bronze_keys_for_date_range`
+
+**PURPOSE:** Demonstrate, and make available, genuine partition pruning
+for full-load tables' date-partitioned Bronze keys — fewer S3 calls,
+fewer objects considered, for a caller that already knows the date range
+it needs.
+
+**IMPLEMENTATION GUIDE (write it yourself):** loop from `start_date` to
+`end_date` inclusive (one day at a time — `datetime.timedelta(days=1)`),
+and for each date, construct the *exact* prefix `build_bronze_key` itself
+would produce for that date (`bronze/{table}/ingestion_date={date}/`) and
+call `list_objects_v2` scoped to just that prefix. Concatenate the
+results. Resist the temptation to instead call `list_bronze_keys` once
+and filter the combined result by date in Python — that's exactly the
+*unpruned* pattern this function exists to avoid; the entire point is
+which prefix gets sent to S3, not how the result gets filtered
+afterward.
+
+**REFERENCE IMPLEMENTATION:**
+
+```python
+# ingestion/src/url_shortener_analytics/object_store.py (excerpt)
+
+def list_bronze_keys_for_date_range(
+    s3_client: BaseClient, bucket: str, table_name: str, start_date: date, end_date: date
+) -> list[str]:
+    keys: list[str] = []
+    current = start_date
+    while current <= end_date:
+        date_prefix = f"bronze/{table_name}/ingestion_date={current:%Y-%m-%d}/"
+        response = s3_client.list_objects_v2(Bucket=bucket, Prefix=date_prefix)
+        keys.extend(obj["Key"] for obj in response.get("Contents", []))
+        current += timedelta(days=1)
+    return keys
+```
+
+Full file: [`object_store.py`](../ingestion/src/url_shortener_analytics/object_store.py).
+
+**RUN:** exercised indirectly — there's no standalone CLI subcommand for
+this one (by design; it's a library function a Phase 2 reader would call
+programmatically with a known range, not an ad-hoc operator command the
+way `storage-stats` is).
+
+**VERIFY:** LAB 16 below, and `test_object_store.py`'s
+`test_list_bronze_keys_for_date_range_issues_one_call_per_date_scoped_to_that_dates_prefix`,
+which asserts the *exact* sequence of prefixes sent to a mocked S3
+client — not just the returned keys, but proof of which calls were
+actually issued.
+
+**EXPECTED:** for an N-day range, exactly N `list_objects_v2` calls, each
+`Prefix`-scoped to one date; a date with no object written that day
+contributes nothing (an empty `Contents`), not an error.
+
+**TEST:** `test_object_store.py` — two new tests: a 3-day range issuing
+exactly 3 calls, each with the exact expected prefix (using
+`unittest.mock.call` to assert the full call sequence, not just the
+count); a single-day range issuing exactly 1 call.
+
+**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections
+20.8/20.9.
+
+---
+
+### Hands-on Challenge (implement-yourself)
+
+Before LAB 16 below, try this without looking at `object_store.py`: using
+a mocked S3 client (`unittest.mock.MagicMock`, the same pattern this
+repo's own tests use throughout), write a small script that calls
+`list_bronze_keys` once and `list_bronze_keys_for_date_range` once, both
+for a 30-day range, against a bucket that has one object per day going
+back 365 days. Print `s3_client.list_objects_v2.call_count` after each.
+Predict the two numbers before running it. (Answer: `list_bronze_keys`
+issues exactly 1 call, `list_bronze_keys_for_date_range` issues exactly
+30 — more calls, not fewer. Sit with why "more calls" is nonetheless the
+*better* choice here: `list_bronze_keys`'s single call still has to
+return, and the caller still has to transfer and hold in memory,
+metadata for all 365 objects even though only 30 days were wanted;
+`list_bronze_keys_for_date_range`'s 30 calls together transfer metadata
+for only the ~30 objects actually needed. Pruning trades call *count* for
+data *volume* — the right trade whenever total history is much larger
+than the range actually requested, and the wrong one when it isn't,
+which 20.7's Failure Scenario covers directly.)
+
+### 20.5 Hands-on Exercise
+
+**LAB 16 — Prove pruning issues fewer, more targeted calls than a full
+listing, against a mocked S3 client.**
+
+```bash
+PYTHONPATH=ingestion/src python3 -m pytest ingestion/tests/unit/test_object_store.py -k date_range -v
+```
+
+What to observe: `test_list_bronze_keys_for_date_range_issues_one_call_per_date_scoped_to_that_dates_prefix`
+asserts the exact three `Prefix` values sent to the mocked client for a
+3-day range — this is the concrete, checkable proof that "partition
+pruning" here means specific, narrowly-scoped calls, not a vague
+performance claim. *(This LAB is fully runnable in this sandbox, unlike
+LAB 13's real-MinIO scenario — it tests this function's own call
+pattern against a mock, not real S3 network behavior, so no MinIO is
+needed. ACTUAL OBSERVED: this exact command was run while writing this
+section — 2 passed.)*
+
+### 20.6 How to test
+
+```bash
+make test
+```
+
+ACTUAL OBSERVED, genuinely run in this environment:
+
+```
+63 passed in 7.09s
+```
+
+`ruff check ingestion/ benchmarks/` also passed cleanly on every file
+this increment touched.
+
+**What remains a DESIGN EXPECTATION:** whether pruning produces a real
+*wall-clock* speedup against genuine MinIO/S3 network latency, as opposed
+to fewer, more targeted calls in principle (proven above, against a
+mock) — there is no MinIO in this sandbox to measure real network-call
+savings against. The call-count/call-target proof above is real and
+sufficient to demonstrate the mechanism; a true latency benchmark (one
+call vs. thirty, over a real network, at meaningfully large history) is
+left for the reader with real infrastructure to run.
+
+### 20.7 Failure Scenario
+
+**When does requesting a date range with `list_bronze_keys_for_date_range`
+actually perform *worse* than just calling `list_bronze_keys` once and
+filtering client-side?**
+
+The Hands-on Challenge above already surfaces the mechanism: pruning
+issues **one call per date in the requested range**, regardless of how
+much or how little data exists for the whole table overall. Requesting a
+365-day range issues 365 calls — worse than `list_bronze_keys`'s single
+call, in call *count*, even though `list_bronze_keys`'s one call has to
+return (and the caller has to hold) metadata for every object under the
+prefix, including dates outside what's wanted. Concretely: if a caller
+wants "every date this table has ever had data for" (i.e. the range
+*is* the whole history), `list_bronze_keys_for_date_range` is strictly
+worse than `list_bronze_keys` — more calls, same total objects returned,
+no pruning benefit at all, since there's nothing left to prune. Pruning
+only pays for itself when the requested range is meaningfully smaller
+than total history — exactly the condition Section 20.3's Trade-offs
+table states but is worth restating as a concrete, checkable failure
+case: a caller reaching for `list_bronze_keys_for_date_range` with a
+range that turns out to cover this table's entire lifetime has picked
+the wrong function, and nothing in the function's own signature warns
+them of that — it will happily issue however many calls the range
+implies, with no upper bound check.
+
+### 20.8 Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| Partition granularity | One partition per calendar day (full load) or per watermark range (incremental) — a single file per partition | Same convention (Hive-style) is standard in production lakes too; a real deployment additionally splits large partitions into multiple files (small-file compaction is the usual concern; this repo's files are small enough that under-splitting, not over-splitting, is the actual current risk — Section 33's named gap) |
+| Pruning | Client-side loop issuing one `list_objects_v2` call per date, in this repo's own code | A real query engine (Athena, Spark, DuckDB, Trino) does this automatically from a `WHERE date BETWEEN ...` clause via its own catalog/metastore, without hand-written per-date loops |
+| Unbounded range protection | None — `list_bronze_keys_for_date_range` issues as many calls as the range implies, with no cap (20.7) | A real implementation would reject or warn on a suspiciously large requested range, or transparently fall back to a full listing plus client-side filter past some threshold |
+| Cross-scheme pruning (incremental tables) | Not implemented — named scope boundary (20.3) | A real metastore tracks partition boundaries for every load type uniformly, regardless of whether the partition key is a date or a watermark range |
+| Partition discovery | Caller must already know the date range wanted | A real catalog (Hive Metastore, AWS Glue Catalog, Iceberg's own metadata) tracks which partitions exist, so a reader doesn't need to already know the answer before querying for it |
+
+### Principal Data Engineer Perspective
+
+The judgment call worth defending here is scoping this section's new code
+to exactly the case it can do honestly — date-range pruning for
+full-load tables — rather than building a more impressive-sounding
+"generic partition pruning" function that would have quietly done the
+wrong thing for incremental tables' watermark-range partitions. Section
+20.3's Design Decision is really about recognizing that two genuinely
+different partitioning schemes exist in this codebase already, and that
+papering over the difference with one interface would produce code that
+*looks* more complete while actually being less trustworthy — a caller
+passing a date range against an incremental table would get either wrong
+results or a confusing failure, not a clean "this isn't supported for
+that load type." Naming the scope boundary explicitly, and pointing to
+the real (if less polished) alternative for the incremental case
+(`list_successful_bronze_keys`, already available since Section 17), is
+worth more than a unified-looking function that doesn't actually unify
+anything correctly. The second thing worth flagging: 20.7's failure
+scenario — pruning a range that turns out to be someone's whole
+history — is the kind of "the optimization becomes the bug" case that's
+easy to miss when a new mechanism is evaluated only in the scenario that
+motivated building it (a small, known range) rather than stress-tested
+against the scenario that breaks its assumption (a range nobody bounded).
+
+### 20.9 Principal Engineer Interview Questions
+
+**Q: "Your partition-pruned listing function issues one API call per
+date in the requested range. For a 2-year date range, that's over 700
+calls. Isn't that worse than one call, in practice?"**
+
+*What's tested:* whether the candidate can reason about the actual
+trade-off pruning makes (fewer objects touched, more calls issued) rather
+than assuming "pruning" is an unconditional win.
+
+*What a weak answer looks like:* "Pruning is always more efficient" —
+contradicted by the candidate's own math (700+ calls vs. 1); a strong
+answer has to grapple with the real cost pruning introduces.
+
+*What a strong answer covers:* yes, in call *count* specifically, a
+naive per-date loop over a 2-year range is worse than one
+`list_bronze_keys` call — this is exactly Section 20.7's named failure
+case. The real fix at that scale isn't "prune more" but "prune smarter":
+batch contiguous date ranges into fewer, wider prefix queries where
+possible, fall back to a full listing plus client-side filter past some
+threshold, or — the production-grade answer — let a real catalog/metastore
+(Glue, Hive Metastore, Iceberg) track partition existence so a query
+planner can decide the right strategy per query, rather than a
+hand-written client loop making a fixed, one-size-fits-all choice.
+
+*Concepts:* pruning trades call count for data volume, not an
+unconditional win; the point where that trade stops paying off; the role
+a real catalog/metastore plays in making this decision dynamically
+instead of statically.
+
+*Expected follow-up:* "How would you decide, programmatically, whether
+to prune or do a full listing for a given request?" — Compare the
+requested range's implied call count against a full listing's single
+call, and pick whichever is cheaper for that specific request — which
+itself requires knowing (or estimating) total history size, information
+this repo's current code doesn't track anywhere.
+
+*Common mistake:* treating "partition pruning" as a keyword that's
+always good to have, without being able to state the concrete condition
+under which it stops being a win — the same failure mode as
+over-indexing a database table without considering write cost.
+
+**Q: "This repo has two different partitioning schemes — calendar dates
+for full loads, watermark ranges for incremental loads. Why not just use
+dates for both, for consistency?"**
+
+*What's tested:* whether the candidate remembers *why* incremental
+load's key scheme was chosen the way it was (Section 15) and can connect
+that reasoning to this section's partitioning discussion, rather than
+treating the two sections as unrelated.
+
+*What a weak answer looks like:* "Consistency isn't that important" —
+dismisses the question rather than engaging with the actual reason.
+
+*What a strong answer covers:* a full load's key only ever needs to
+answer "which calendar day is this snapshot from," which a date captures
+perfectly. An incremental batch's key needs to answer a different
+question: "which exact row range does this specific batch cover," which
+is what makes retries safely overwrite-or-not-collide (Section 15.7).
+Two incremental runs on the *same calendar day* cover *different* id
+ranges and must NOT share a key, or a genuine idempotency bug results —
+exactly the property `build_bronze_incremental_key`'s watermark-range
+keys guarantee and a date-only key would silently break. The two
+partitioning schemes differ because the two load types' actual
+correctness requirements differ, not from an accidental lack of
+consistency.
+
+*Concepts:* partition key choice driven by correctness requirements
+(Section 15's idempotency guarantee), not by surface-level naming
+consistency across otherwise-similar-looking code paths.
+
+*Expected follow-up:* "Could an incremental load ALSO be partitioned by
+date, with watermark range as a second, secondary partition level inside
+each date?" — Yes, and this is closer to how a mature lake table often
+looks (multi-level Hive partitioning, e.g. `date=.../watermark_start=...`)
+— explicitly out of scope for this repo's Phase 1 (named as "not true
+multi-file partitioning" in Section 34's checklist), but a reasonable
+Phase 2+ evolution once query patterns over incremental history become
+concrete enough to justify the added key-structure complexity.
+
+*Common mistake:* assuming every partitioning decision in a codebase
+should look identical for aesthetic consistency, rather than recognizing
+that different write patterns can have genuinely different correctness
+requirements driving genuinely different key structures.
+
+---
+
 ## 28. Architectural Principles
 
 Introduced here, demonstrated incrementally as more of Phase 1 is built.
@@ -4899,7 +6148,7 @@ component to run and offers no transactional guarantees a database would.
 **Consequences:** this repo depends on Docker to run MinIO locally; the
 same client code moves to real S3 by changing only `MINIO_ENDPOINT`.
 
-### ADR-003: Use Parquet for Bronze storage
+### ADR-003: Use Parquet for Bronze storage *(benchmarked)*
 
 **Context:** Extracted tabular data needs a file format. **Decision:**
 Apache Parquet, via PyArrow, snappy-compressed. **Alternatives
@@ -4908,9 +6157,12 @@ considered:** CSV, JSON-lines. **Trade-offs:** Parquet is columnar
 (embeds its own schema) but isn't human-readable by opening the raw file,
 unlike CSV. **Consequences:** every consumer of Bronze data needs a
 Parquet-aware reader (trivial — `pandas`, `pyarrow`, every real analytical
-engine supports it natively); a hands-on CSV vs. Parquet benchmark is
-planned (Section 19) to make this comparison concrete rather than
-asserted.
+engine supports it natively). The CSV/Parquet benchmark this ADR named as
+"planned" has now genuinely been run (`benchmarks/parquet_vs_csv_vs_json.py`,
+Section 19) at two scales — size and single-column-read time favor Parquet
+decisively at both; full-table-read time only pulls ahead past a few tens
+of thousands of rows, honestly reported in Section 19.6 rather than
+glossed over.
 
 ### ADR-004: Batch ingestion before CDC/streaming
 
@@ -5037,89 +6289,130 @@ validate-contracts` and its unit/integration tests (`test_contracts.py`,
 analytical layer (`sql/analytics/`) is explicitly **not** yet
 contract-checked — a named gap, not a silent one (Section 12.7).
 
+### ADR-011: One bucket, prefix-separated layers
+
+**Context:** Bronze exists today; Silver and Gold (Phase 2+) will need
+somewhere to land, and that decision shapes key-naming conventions
+everywhere in this codebase. **Decision:** one bucket, `analytics-lake`,
+with each layer as a top-level key prefix (`bronze/`, later `silver/`,
+`gold/`) rather than a separate bucket per layer. **Alternatives
+considered:** a bucket per layer; a bucket per table. **Trade-offs:**
+separate buckets give cleaner per-layer IAM boundaries in a real AWS
+deployment and make a lifecycle policy trivial to scope per layer; a
+single bucket with prefixes is simpler to provision and keeps
+`MINIO_BUCKET` a single config value — the right trade for Phase 1's
+actual operational complexity, at the cost of that per-layer
+access-control convenience. See Section 18.3 for the full reasoning.
+**Consequences:** migrating to per-layer buckets later, if a real
+per-layer IAM requirement emerges, means moving every existing object to
+a new bucket, not just renaming one — a real, non-trivial cost, named
+here rather than discovered only once it's needed.
+
+### ADR-012: Partition pruning scoped to date-partitioned full-load keys only
+
+**Context:** this repo has two Bronze partitioning schemes already in
+production — full-load's calendar-date keys and incremental-load's
+watermark-range keys (Sections 14-15) — and a pruned listing function
+needs to know which scheme it's constructing prefixes for. **Decision:**
+`object_store.list_bronze_keys_for_date_range` (Section 20) handles the
+date-partitioned, full-load case only; no equivalent watermark-range-pruned
+function was built. **Alternatives considered:** a single, more general
+pruning function dispatching on `load_type`. **Trade-offs:** a unified
+interface would look more complete, but a watermark range isn't
+enumerable the way a date range is — it has to be discovered from
+`ingestion_metadata` first (already possible via
+`list_successful_bronze_keys`, Section 17), which is a genuinely
+different code path, not a variant of prefix construction. See Section
+20.3 for the full reasoning. **Consequences:** a reader wanting a pruned
+view of incremental Bronze data should query `ingestion_metadata`
+directly rather than reach for `list_bronze_keys_for_date_range`, which
+will not raise an error but will not prune correctly for that load type
+either — a named scope boundary, not a silently-incomplete abstraction.
+
 ---
 
 ## 33. Phase 1 Summary (so far)
 
-**What we've built in this increment:** the dedicated deep-dive on
-Checkpointing (Section 16) and Idempotency (Section 17) — the two
-sections the TOC had flagged since Section 15 as "the mechanism exists,
-still awaits its own dedicated deep-dive." Two genuinely new pieces of
-code, not just new prose around existing code: `metadata.find_stale_running_runs`,
-closing the "no automated stale-`running`-row alerting" gap Section 15.8
-named two increments ago; and a full `reconciliation.py` module
-(`find_orphaned_bronze_objects`, `find_missing_bronze_objects`,
-`reconcile_bronze`), closing the "periodic reconciliation job" gap that
-same table named. Both are backed by a new `bronze_key` column on
-`ingestion_metadata` (`sql/source/003_ingestion_metadata.sql`), storing
-the exact object key each successful run wrote rather than recomputing it
-later (Section 17.3's Design Decision). Both are wired into the CLI
-(`check-stale-runs`, `reconcile-bronze`) and the `Makefile`. 21 new unit
-tests (38 → 59), plus a genuine, ACTUAL OBSERVED run of the new
-`metadata.py` functions against this sandbox's real, locally installed
-Postgres 16 — not just SQLite.
+**What we've built in this increment:** the Storage block — Object
+Storage Fundamentals (Section 18), Parquet (Section 19), and Partitioning
+(Section 20) — closing the groundwork Phase 2's transform needs before it
+can read Bronze at scale. Genuinely new code: `object_store.get_bucket_stats`
+(capacity/growth reporting, wired into a new `storage-stats` CLI command)
+and `object_store.list_bronze_keys_for_date_range` (real partition
+pruning for full-load tables' date-partitioned keys, proven against a
+mocked S3 client to issue exactly one call per requested date, each
+scoped to that date's own prefix). And a genuinely new, genuinely *run*
+benchmark, `benchmarks/parquet_vs_csv_vs_json.py`, closing the "planned"
+item ADR-003 named two increments ago — run twice in this sandbox, once
+against this project's real seeded `clicks` table (5,000 rows) and once
+against a synthetic 200,000-row dataset of the same shape, with every
+number in Section 19.6 labeled ACTUAL OBSERVED because it genuinely was.
+4 new unit tests (59 → 63); two new ADRs (011, 012).
 
-**A note on this increment specifically:** unlike Sections 7-12 (six
-interdependent sections landing together), 16 and 17 were written as two
-sections building on a large amount of *already-committed* prior work —
-most of Section 16's and 17's subject matter (the checkpoint state
-machine, deterministic Bronze keys) was implemented as early as Sections
-14-15; this increment's actual new code surface is comparatively small
-(one new module, one new function, one new column) precisely because the
-underlying mechanism was already correct. That's a deliberate contrast
-worth naming: not every "deep-dive" section is really about new code —
-some are about finishing the operational story around code that already
-works.
+**A note on this increment specifically:** the benchmark's honesty is the
+thing most worth calling out. The small-scale, real-data run did *not*
+uniformly favor Parquet — full-table read time came out essentially tied
+with CSV's at 5,000 rows, only pulling decisively ahead at 200,000 — a
+genuinely counter-intuitive result this guide reported plainly rather
+than either suppressing it or only ever benchmarking at whichever scale
+made the intended point most cleanly (Section 19.3's Design Decision, and
+19.6's full explanation of why the fixed per-file overhead of Parquet's
+footer/schema needs enough rows to amortize away). This is the same
+"never fabricate, always report what was actually observed" discipline
+this guide has followed since Section 15.7's honesty about its own
+idempotency gap, applied here to a benchmark result rather than a code
+behavior.
 
 **Concepts taught so far, at full depth:** the real application's
 architecture and schema, OLTP vs. OLAP, full load and incremental-load
-ingestion (watermarks, idempotency, checkpointing), the entire data
-modeling layer (Sections 7-12: requirements, grain, source model,
-dimensional model, star-vs-snowflake, data contracts), and now
-checkpointing and idempotency's own dedicated treatment: staleness
-detection via an elapsed-time threshold and its specific false-positive
-failure mode (Section 16); the difference between write-level idempotency
-and system-level consistency, and why reconciliation deliberately detects
-drift without auto-remediating it (Section 17).
+ingestion (watermarks, idempotency, checkpointing, Bronze reconciliation),
+the entire data modeling layer (Sections 7-12), and now the Storage
+block: the flat-key, whole-object-write model underlying every S3-API
+call this codebase makes and its concrete design consequences (Section
+18); columnar vs. row-oriented storage, real measured size and read-time
+differences at two scales, and why "Parquet is faster" needs a stated
+scale to be a true claim (Section 19); Hive-style partitioning as
+already-in-production convention (`ingestion_date=`, `watermark_start=`/
+`watermark_end=`) and what genuine partition pruning means concretely for
+an object store — fewer, narrower `list_objects_v2` calls, not just a
+vague performance claim (Section 20), plus the honest failure mode where
+pruning a too-large range costs more calls than a full listing would.
 
-**Known limitations, stated honestly:** no scheduler yet (runs, and now
-`check-stale-runs`/`reconcile-bronze`, are all manual); the elapsed-time
-staleness threshold has a named false-positive failure mode for
-legitimately slow runs (Section 16.7) with no heartbeat mechanism to fall
-back on yet; reconciliation detects drift but never remediates it, by
-deliberate design (Section 17.7) — a human still has to act on what it
-finds; incremental load is insert-only by construction (Section 15.9); a
-retried failed incremental run can, in one specific ordering, produce a
-redundant Bronze object (Section 15.7); the star schema is designed and
-DDL-committed but **not yet populated**; data contracts cover the source
-layer only (Section 12.7); no PII classification section yet; no
-benchmarks have been run yet (Sections 19-20). This sandbox still has no
-Docker daemon and no MinIO, so LAB 13 (reconciliation against a real
-bucket) and the S3-touching half of this increment's code
-(`list_bronze_keys`, `head_object`, and therefore `reconciliation.py`'s
-find-functions) remain covered only by genuine unit tests against a
-mocked `boto3` client, never against a real S3-compatible endpoint — a
-DESIGN EXPECTATION for the reader to confirm with `make up`. What *was*
-genuinely verified against real (non-Docker) infrastructure this
-increment: applying the new `bronze_key` column to this sandbox's
-already-running local Postgres 16 via the same idempotent-safe `ALTER
-TABLE ... ADD COLUMN IF NOT EXISTS` statement a fresh `docker compose up`
-would also run, and then exercising `finish_run_success`,
-`find_stale_running_runs`, and `list_successful_bronze_keys` against it
-directly — bronze-key persistence, stale-run detection with a genuinely
-backdated `started_at`, and pipeline-name filtering all behaved exactly as
-designed. One genuine, previously-undiscovered finding came out of that
-verification: a Postgres `uuid` column round-trips as a Python `uuid.UUID`
-object, while the SQLite unit-test fixture round-trips the same logical
-value as a plain `str` — a real cross-dialect wrinkle, now noted in
-Section 16.6, that no amount of unit testing against SQLite alone would
-ever have surfaced.
+**Known limitations, stated honestly:** three CLI commands
+(`check-stale-runs`, `reconcile-bronze`, and the new `storage-stats`)
+have no top-level exception handling around their own S3/database calls
+— a real, currently-unpatched gap named in Section 18.7, found by
+re-reading the code just written rather than assumed; `list_bronze_keys_for_date_range`
+has no upper bound on how many dates it will issue calls for, so a
+caller requesting an unbounded or very large range gets no warning before
+it happens (Section 20.7); partition pruning is scoped to full-load's
+date-partitioned keys only, not incremental's watermark-range keys, by
+deliberate, named design (Section 20.3, ADR-012); Parquet's benchmark
+numbers are single-run wall-clock timings on a shared sandbox, not a
+statistically rigorous multi-trial measurement (Section 19.6's stated
+caveat) — the size numbers are exact and reproducible, the timing numbers
+are directional; no scheduler yet; the elapsed-time staleness threshold's
+false-positive failure mode (Section 16.7) and reconciliation's
+detect-only design (Section 17.7) both still stand as before; the star
+schema is designed and DDL-committed but **not yet populated**; data
+contracts cover the source layer only; no PII classification section
+yet. This sandbox still has no Docker daemon and no real MinIO, so LAB
+14's real-bucket idempotent-rerun proof and any genuine network-latency
+measurement of partition pruning's real-world benefit both remain DESIGN
+EXPECTATIONS. What *was* genuinely verified in this sandbox this
+increment: the full benchmark script, against real seeded Postgres data
+and a larger synthetic dataset alike; `get_bucket_stats`'s own lack of
+error handling, confirmed by actually triggering a `NoSuchBucket`
+`ClientError` against a mocked client and watching it propagate uncaught;
+and `list_bronze_keys_for_date_range`'s exact per-date call pattern,
+confirmed against a mocked S3 client with the precise sequence of
+prefixes asserted, not just the returned keys.
 
-**Immediate next increment:** Object Storage/Parquet/Partitioning
-(Sections 18-20) as groundwork before Phase 2's transform needs them, or
-Ingestion Metadata's own deep-dive (Section 22, now that `ingestion_metadata`
-carries a `bronze_key` column and two new query functions worth teaching
-in their own right) — whichever the reader wants to tackle next.
+**Immediate next increment:** File Layout and Ingestion Metadata's own
+deep-dive (Sections 21-22), or PII and Security (Section 23) now that
+`clicks.hashed_ip` and `dim_user`'s email exclusion have been mentioned
+as partial mitigations several times without their own formal treatment —
+whichever the reader wants to tackle next.
 
 ---
 
@@ -5140,17 +6433,17 @@ in their own right) — whichever the reader wants to tackle next.
 | Watermark implemented | ✅ Done | `metadata.get_last_watermark`, wired into `extract_incremental.run_incremental_load`, Section 15 | — |
 | Checkpoint implemented | ✅ Done | `metadata.py`, `ingestion_metadata` table, exercised by both load types; stale-run detection (`find_stale_running_runs`, `check-stale-runs`), Section 16 | — |
 | Idempotency implemented | ✅ Done | `object_store.build_bronze_key` / `build_bronze_incremental_key`; `bronze_key` persistence and Bronze reconciliation (`reconciliation.py`, `reconcile-bronze`), Section 17 | One documented residual edge case, Section 15.7; reconciliation detects drift but doesn't remediate it, by design, Section 17.7 |
-| MinIO configured | ✅ Done | `docker-compose.yml`, `object_store.py` | — |
-| Parquet implemented | ✅ Done | `object_store.write_bronze` / `write_bronze_incremental` | Benchmark vs CSV/JSON not yet run (Section 19) |
-| Partitioning implemented | ⏳ Not started (only date/watermark-scoped keys, not true multi-file partitioning) | — | Section 20 |
+| MinIO configured | ✅ Done | `docker-compose.yml`, `object_store.py`; single-bucket/prefix-layer convention formalized, Section 18, ADR-011 | — |
+| Parquet implemented | ✅ Done | `object_store.write_bronze` / `write_bronze_incremental`; benchmark vs CSV/JSON genuinely run at two scales, Section 19 | — |
+| Partitioning implemented | ✅ Done (single file per partition; pruning added) | Hive-style date/watermark-scoped keys since Sections 14-15, formalized in Section 18.2; genuine partition-pruned listing for full-load tables, `list_bronze_keys_for_date_range`, Section 20, ADR-012 | Not true multi-file-per-partition splitting; pruning not extended to incremental's watermark-range keys (named scope boundary, Section 20.3) |
 | PII identified | ⏳ Not started | `clicks.hashed_ip` already avoids raw IPs by construction | Formal classification table, Section 23 |
-| Tests implemented | ✅ Done (unit + partial integration) | 59 passing unit tests (up from 38); the contracts integration test, and this increment's `metadata.py` additions, genuinely passed against a real (non-Docker) local Postgres in this sandbox | Full-load, incremental-load, and reconciliation integration tests still need real MinIO, not available here — user should run `make up && make test-integration` locally for the complete suite |
-| Failure scenarios tested | ✅ Partial | Sections 7-12 (data modeling), 14.7, 15.7 (8 of 10) | Remaining 2, Section 25 |
-| Performance benchmark completed | ⏳ Not started | — | Section 26, `benchmarks/` |
-| Architecture diagrams completed | ✅ Partial | 10 diagrams so far, including the full star schema ER diagram (Section 10.1) | More land with later sections (data lifecycle, failure/recovery, final architecture) |
-| ADRs documented | ✅ 10 of 10+ planned | Section 29 | ADR-005/006 now implemented; ADR-010 (contract validation strategy) from the prior increment; a bronze-key-storage-vs-recompute decision is documented in Section 17.3 but not yet promoted to its own numbered ADR |
-| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9 | Remaining categories not yet covered, Section 31 |
-| Hands-on labs completed | ✅ Partial | LAB 1-13 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation) | LAB 14+ |
+| Tests implemented | ✅ Done (unit + partial integration) | 63 passing unit tests (up from 38 two increments ago); the contracts integration test, and prior increments' `metadata.py` additions, genuinely passed against a real (non-Docker) local Postgres in this sandbox | Full-load, incremental-load, and reconciliation integration tests still need real MinIO, not available here — user should run `make up && make test-integration` locally for the complete suite |
+| Failure scenarios tested | ✅ Partial | Sections 7-12 (data modeling), 14.7, 15.7, 16.7, 17.7, 18.7, 19.7, 20.7 | Remaining named in Section 25's index |
+| Performance benchmark completed | ✅ Partial | Parquet vs. CSV/JSON, Section 19, genuinely run at two scales | Extraction-time-at-scale and partition-pruning real-network-latency benchmarks not yet run, Section 26 |
+| Architecture diagrams completed | ✅ Partial | 10+ diagrams so far, including the full star schema ER diagram (Section 10.1) and Sections 18/20's object-storage and partition-pruning diagrams | More land with later sections (data lifecycle, failure/recovery, final architecture) |
+| ADRs documented | ✅ 12 of 12+ planned | Section 29 | ADR-011 (bucket/prefix layout), ADR-012 (partition-pruning scope) added this increment; a bronze-key-storage-vs-recompute decision is documented in Section 17.3 but not yet promoted to its own numbered ADR |
+| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9 | Remaining categories not yet covered, Section 31 |
+| Hands-on labs completed | ✅ Partial | LAB 1-16 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation, LAB 14 storage growth/idempotency, LAB 15 Parquet benchmark, LAB 16 partition pruning) | LAB 17+ |
 | README updated | ✅ Done | `README.md` | — |
 | Git repository clean | ✅ Done | Section 35 | — |
 | No secrets committed | ✅ Done | `.gitignore`, `.env.example` reviewed | — |

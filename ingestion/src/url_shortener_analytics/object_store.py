@@ -10,7 +10,7 @@ from __future__ import annotations
 import io
 import logging
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import boto3
@@ -183,3 +183,52 @@ def list_bronze_keys(s3_client: BaseClient, bucket: str, prefix: str = "bronze/"
     """
     response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
     return [obj["Key"] for obj in response.get("Contents", [])]
+
+
+def get_bucket_stats(s3_client: BaseClient, bucket: str, prefix: str = "bronze/") -> dict[str, int]:
+    """Total object count and total bytes under `prefix` -- a cheap
+    capacity/growth signal an operator can watch over time (see the
+    guide's Section 18, "Production Considerations"). Reuses the `Size`
+    field `list_objects_v2` already returns per object in its listing --
+    no separate `head_object` call per key needed, unlike a naive
+    per-object stat loop would require.
+
+    POC SIMPLIFICATION: same single-call, 1,000-key cap as list_bronze_keys.
+    """
+    response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+    contents = response.get("Contents", [])
+    return {"object_count": len(contents), "total_bytes": sum(obj["Size"] for obj in contents)}
+
+
+def list_bronze_keys_for_date_range(
+    s3_client: BaseClient, bucket: str, table_name: str, start_date: date, end_date: date
+) -> list[str]:
+    """Partition-pruned key listing for a full-load table's date-partitioned
+    keys (see build_bronze_key): issues one `list_objects_v2` call **per
+    date** in `[start_date, end_date]`, each scoped to that exact date's own
+    partition prefix (`bronze/{table}/ingestion_date={date}/`) -- rather
+    than listing every key under the table's entire prefix (as
+    list_bronze_keys does) and filtering by date in Python afterward.
+
+    See docs/analytics-engineering-guide.md, Section 20, for why this
+    distinction -- how many objects S3 itself has to consider and return,
+    not just how the caller filters the result -- is what "partition
+    pruning" concretely means for object storage, and LAB 16 for a
+    mocked-S3 proof that pruning issues fewer calls and touches fewer
+    objects than a full listing does.
+
+    Scoped to full-load tables specifically: this repo's incremental-load
+    keys are watermark-range-partitioned (Section 15), not
+    calendar-date-partitioned, so date-range pruning the way this function
+    does it doesn't apply to them the same way -- see Section 20.3's
+    Design Decision for the reasoning on why this function doesn't attempt
+    to generalize to both partitioning schemes at once.
+    """
+    keys: list[str] = []
+    current = start_date
+    while current <= end_date:
+        date_prefix = f"bronze/{table_name}/ingestion_date={current:%Y-%m-%d}/"
+        response = s3_client.list_objects_v2(Bucket=bucket, Prefix=date_prefix)
+        keys.extend(obj["Key"] for obj in response.get("Contents", []))
+        current += timedelta(days=1)
+    return keys

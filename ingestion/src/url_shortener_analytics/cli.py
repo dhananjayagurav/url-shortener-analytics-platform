@@ -1,7 +1,7 @@
 """Command-line entrypoint: `python -m url_shortener_analytics.cli <command>`
 (or the `ingest` console script installed by pyproject.toml).
 
-Five commands:
+Six commands:
 
 - `run`                -- dispatch each table in pipelines.yaml to full or
                           incremental load, per its configured `load_type`.
@@ -24,11 +24,14 @@ Five commands:
                           wrote against what actually exists in object
                           storage, reporting orphaned and missing objects.
                           See the guide's Section 17.
+- `storage-stats`      -- report object count and total bytes under a
+                          Bronze prefix -- a cheap capacity/growth signal.
+                          See the guide's Section 18.
 
 See docs/analytics-engineering-guide.md, "Full Load Ingestion -> How to
 Run", Section 15 "How to Run", Section 12 "How to Run", Section 16 "How to
-Run", and Section 17 "How to Run", for the exact commands and expected
-output.
+Run", Section 17 "How to Run", and Section 18 "How to Run", for the exact
+commands and expected output.
 """
 
 from __future__ import annotations
@@ -48,7 +51,7 @@ from url_shortener_analytics.exceptions import ContractError
 from url_shortener_analytics.extract_full import run_full_load
 from url_shortener_analytics.extract_incremental import run_incremental_load
 from url_shortener_analytics.logging_setup import configure_logging
-from url_shortener_analytics.object_store import get_s3_client
+from url_shortener_analytics.object_store import get_bucket_stats, get_s3_client
 from url_shortener_analytics.reconciliation import reconcile_bronze
 
 logger = logging.getLogger(__name__)
@@ -241,6 +244,21 @@ def reconcile_bronze_command(config_path: Path = DEFAULT_PIPELINE_CONFIG) -> int
     return 0
 
 
+def storage_stats_command(prefix: str = "bronze/") -> int:
+    """Report object count and total bytes under `prefix` -- a cheap
+    capacity/growth signal an operator can watch over time without needing
+    a real observability platform (see the guide's Section 18, "Production
+    Considerations"). Always exits 0 -- this is a reporting command, not a
+    check with a pass/fail condition."""
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    s3_client = get_s3_client(settings)
+
+    stats = get_bucket_stats(s3_client, settings.minio_bucket, prefix)
+    logger.info("bronze storage stats", extra={"prefix": prefix, **stats})
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="ingest", description="url-shortener-analytics-platform ingestion CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -283,6 +301,14 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to pipelines.yaml (default: ingestion/configs/pipelines.yaml)",
     )
 
+    storage_stats_parser = subparsers.add_parser(
+        "storage-stats", help="Report object count and total bytes under a Bronze prefix"
+    )
+    storage_stats_parser.add_argument(
+        "--prefix", type=str, default="bronze/",
+        help="Object key prefix to report stats for (default: bronze/)",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "run":
@@ -295,6 +321,8 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(check_stale_runs_command(args.max_runtime_minutes))
     elif args.command == "reconcile-bronze":
         sys.exit(reconcile_bronze_command(args.config))
+    elif args.command == "storage-stats":
+        sys.exit(storage_stats_command(args.prefix))
 
 
 if __name__ == "__main__":
