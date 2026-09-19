@@ -8,7 +8,12 @@ import pytest
 from botocore.exceptions import ClientError
 
 from url_shortener_analytics.exceptions import ObjectStoreWriteError
-from url_shortener_analytics.object_store import build_bronze_key, write_bronze
+from url_shortener_analytics.object_store import (
+    build_bronze_incremental_key,
+    build_bronze_key,
+    write_bronze,
+    write_bronze_incremental,
+)
 
 RUN_DATE = datetime(2026, 9, 19, 12, 0, 0, tzinfo=UTC)
 
@@ -61,4 +66,48 @@ def test_write_bronze_raises_after_exhausting_retries() -> None:
     with pytest.raises(ObjectStoreWriteError):
         write_bronze(df, "widgets", RUN_DATE, s3_client, bucket="test-bucket", max_attempts=2, backoff_seconds=0)
 
+    assert s3_client.put_object.call_count == 2
+
+
+def test_build_bronze_incremental_key_is_deterministic_per_watermark_range() -> None:
+    key_1 = build_bronze_incremental_key("clicks", 100, 250)
+    key_2 = build_bronze_incremental_key("clicks", 100, 250)
+    assert key_1 == key_2
+    assert key_1 == (
+        "bronze/clicks/incremental/watermark_start=000000000100/watermark_end=000000000250/clicks.parquet"
+    )
+
+
+def test_build_bronze_incremental_key_differs_by_table_and_by_range() -> None:
+    assert build_bronze_incremental_key("clicks", 100, 250) != build_bronze_incremental_key("urls", 100, 250)
+    assert build_bronze_incremental_key("clicks", 100, 250) != build_bronze_incremental_key("clicks", 100, 300)
+    # Adjacent, non-overlapping batches (250->250 then 250->400) get different
+    # keys -- this is deliberate, see the function's own docstring for when
+    # this guarantee does and doesn't give a clean overwrite on retry.
+    assert build_bronze_incremental_key("clicks", 0, 250) != build_bronze_incremental_key("clicks", 250, 400)
+
+
+def test_write_bronze_incremental_calls_put_object_with_the_deterministic_key() -> None:
+    s3_client = MagicMock()
+    df = pd.DataFrame({"id": [101, 102, 103], "value": ["a", "b", "c"]})
+
+    key = write_bronze_incremental(df, "clicks", 100, 103, s3_client, bucket="test-bucket")
+
+    assert key == "bronze/clicks/incremental/watermark_start=000000000100/watermark_end=000000000103/clicks.parquet"
+    s3_client.put_object.assert_called_once()
+    call_kwargs = s3_client.put_object.call_args.kwargs
+    assert call_kwargs["Bucket"] == "test-bucket"
+    assert call_kwargs["Key"] == key
+    assert len(call_kwargs["Body"]) > 0
+
+
+def test_write_bronze_incremental_retries_then_succeeds() -> None:
+    s3_client = MagicMock()
+    error = ClientError({"Error": {"Code": "SlowDown", "Message": "throttled"}}, "PutObject")
+    s3_client.put_object.side_effect = [error, None]
+    df = pd.DataFrame({"id": [101]})
+
+    key = write_bronze_incremental(df, "clicks", 100, 101, s3_client, bucket="test-bucket", backoff_seconds=0)
+
+    assert key == "bronze/clicks/incremental/watermark_start=000000000100/watermark_end=000000000101/clicks.parquet"
     assert s3_client.put_object.call_count == 2

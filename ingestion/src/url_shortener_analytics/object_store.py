@@ -56,6 +56,25 @@ def build_bronze_key(table_name: str, run_date: datetime) -> str:
     return f"bronze/{table_name}/ingestion_date={run_date:%Y-%m-%d}/{table_name}.parquet"
 
 
+def build_bronze_incremental_key(table_name: str, watermark_start: int, watermark_end: int) -> str:
+    """Deterministic Bronze key for one incremental batch.
+
+    Keyed by (table_name, watermark_start, watermark_end) rather than by
+    calendar date: an incremental pipeline can run many times a day, and
+    each run's batch covers a *different* id range that must NOT overwrite
+    a previous run's batch the way a full load's same-day rerun does. Two
+    calls with the exact same watermark range (e.g. retrying an identical
+    failed run, where no new rows arrived in between) compute the same key
+    and safely overwrite each other -- see docs/analytics-engineering-guide.md,
+    Section 15, "Design Decision" and "Failure Scenario" for exactly when
+    this guarantee does and does not hold.
+    """
+    return (
+        f"bronze/{table_name}/incremental/"
+        f"watermark_start={watermark_start:012d}/watermark_end={watermark_end:012d}/{table_name}.parquet"
+    )
+
+
 def _dataframe_to_parquet_bytes(df: pd.DataFrame) -> bytes:
     buffer = io.BytesIO()
     table = pa.Table.from_pandas(df, preserve_index=False)
@@ -63,26 +82,19 @@ def _dataframe_to_parquet_bytes(df: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
-def write_bronze(
+def _put_parquet_with_retry(
     df: pd.DataFrame,
-    table_name: str,
-    run_date: datetime,
+    key: str,
     s3_client: BaseClient,
     bucket: str,
     *,
-    max_attempts: int = 3,
-    backoff_seconds: float = 1.0,
+    max_attempts: int,
+    backoff_seconds: float,
 ) -> str:
-    """Serialize `df` to Parquet and PUT it to the Bronze layer.
-
-    Retries transient failures (network errors, throttling) up to
-    `max_attempts` times with linear backoff -- a MinIO/S3 PUT is safe to
-    retry blindly because the key is deterministic (build_bronze_key) and a
-    retried PUT simply overwrites the same object with the same bytes.
-    Raises ObjectStoreWriteError, chained from the real underlying error,
-    once attempts are exhausted.
-    """
-    key = build_bronze_key(table_name, run_date)
+    """Shared retry/serialize logic behind both write_bronze and
+    write_bronze_incremental -- the only thing that differs between a full
+    load's write and an incremental load's write is how the key is built,
+    not how the write itself is performed or retried."""
     body = _dataframe_to_parquet_bytes(df)
 
     last_error: Exception | None = None
@@ -105,6 +117,43 @@ def write_bronze(
                 time.sleep(backoff_seconds * attempt)
 
     raise ObjectStoreWriteError(f"failed to write s3://{bucket}/{key} after {max_attempts} attempts") from last_error
+
+
+def write_bronze(
+    df: pd.DataFrame,
+    table_name: str,
+    run_date: datetime,
+    s3_client: BaseClient,
+    bucket: str,
+    *,
+    max_attempts: int = 3,
+    backoff_seconds: float = 1.0,
+) -> str:
+    """Serialize `df` to Parquet and PUT it to the Bronze layer at the
+    deterministic full-load key. See build_bronze_key's docstring for the
+    idempotency argument; raises ObjectStoreWriteError once retries are
+    exhausted."""
+    key = build_bronze_key(table_name, run_date)
+    return _put_parquet_with_retry(df, key, s3_client, bucket, max_attempts=max_attempts, backoff_seconds=backoff_seconds)
+
+
+def write_bronze_incremental(
+    df: pd.DataFrame,
+    table_name: str,
+    watermark_start: int,
+    watermark_end: int,
+    s3_client: BaseClient,
+    bucket: str,
+    *,
+    max_attempts: int = 3,
+    backoff_seconds: float = 1.0,
+) -> str:
+    """Serialize `df` to Parquet and PUT it to the Bronze layer at the
+    deterministic incremental-batch key. See build_bronze_incremental_key's
+    docstring for exactly what "deterministic" does and doesn't guarantee
+    here."""
+    key = build_bronze_incremental_key(table_name, watermark_start, watermark_end)
+    return _put_parquet_with_retry(df, key, s3_client, bucket, max_attempts=max_attempts, backoff_seconds=backoff_seconds)
 
 
 def head_object(s3_client: BaseClient, bucket: str, key: str) -> dict[str, Any] | None:

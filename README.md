@@ -68,7 +68,8 @@ make install
 make up              # starts Postgres (mirrors the real urls schema) + MinIO
 make seed            # seeds reproducible synthetic urls/users/clicks
 
-make ingest-full      # runs a full load of urls, users, clicks -> Bronze
+make ingest           # runs urls, users full load + clicks incremental load -> Bronze
+make ingest-full      # override: force a full load of every table (backfills/rebuilds)
 ```
 
 ## Testing

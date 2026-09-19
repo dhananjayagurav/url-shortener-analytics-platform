@@ -86,9 +86,9 @@ with the exact command to produce the real result yourself.
 **Ingestion**
 13. [Batch Ingestion Design](#13-batch-ingestion-design) ✅
 14. [Full Load Ingestion](#14-full-load-ingestion-) ✅✅
-15. Incremental Load & Watermarks ⏳
-16. Checkpointing ⏳ *(the mechanism exists — see [Section 13.3](#133-checkpointing-and-watermark-mechanism-already-built) — this section will teach it in depth once incremental load makes checkpoint *recovery* observable)*
-17. Idempotency ⏳ *(the mechanism exists — see [Section 14](#14-full-load-ingestion) — deep-dive lands with LAB 4/5)*
+15. [Incremental Load & Watermarks](#15-incremental-load--watermarks-) ✅✅
+16. Checkpointing ⏳ *(the mechanism exists and checkpoint recovery is now observable — see [Section 13.3](#133-checkpointing-and-watermark-mechanism-already-built) and [Section 15.7](#157-failure-scenario) — still awaits its own dedicated deep-dive section)*
+17. Idempotency ⏳ *(the mechanism exists for both load types — see [Section 14](#14-full-load-ingestion) (LAB 4/5) and [Section 15.7](#157-failure-scenario) (LAB 2/3, plus the one documented residual edge case) — still awaits its own dedicated deep-dive section)*
 
 **Storage**
 18. Object Storage Fundamentals ⏳
@@ -107,8 +107,8 @@ with the exact command to produce the real result yourself.
 **Reference**
 28. [Architectural Principles](#28-architectural-principles) ✅ *(introduced now, extended as more are demonstrated)*
 29. [Architecture Decision Records](#29-architecture-decision-records) ✅
-30. Hands-on Labs (index) ⏳ *(LAB 1 exists — see [Section 14.5](#145-hands-on-exercise)*)
-31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see [Section 14.9](#149-principal-engineer-interview-questions)*)
+30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — see [Section 14.5](#145-hands-on-exercise); LAB 2, LAB 3 — see [Section 15.5](#155-hands-on-exercise))*
+31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see [Section 14.9](#149-principal-engineer-interview-questions) and [Section 15.9](#159-principal-engineer-interview-questions))*
 32. Principal-Level Scenarios ⏳
 33. [Phase 1 Summary](#33-phase-1-summary-so-far) (running, updated each increment)
 34. [Phase 1 Completion Checklist](#34-phase-1-completion-checklist)
@@ -334,7 +334,7 @@ as a planned phase):
    load-bearing is a common source of production confusion.
 4. Add an index on `urls.created_at` if this platform's extraction queries
    ever filter on it directly (they don't yet — Phase 1 uses full loads
-   and an `id`-based watermark, per [ADR-005](#adr-005-watermark-based-incremental-ingestion-planned-not-yet-implemented)).
+   and an `id`-based watermark, per [ADR-005](#adr-005-watermark-based-incremental-ingestion-implemented)).
 
 ### Principal Data Engineer Perspective
 
@@ -798,7 +798,7 @@ introduced.
 |---|---|---|---|
 | Reads | Entire table, every run | Only rows changed since last run | Every row-level write, via the database's transaction log |
 | Needs | Nothing beyond table access | A reliable "what changed" signal (a watermark) | Log access (e.g. Postgres logical replication) |
-| This repo, Phase 1 | ✅ Implemented — [Section 14](#14-full-load-ingestion) | ⏳ Planned — Section 15 | Not planned before Phase 5 (post-Phase-4, see repository-level plan) |
+| This repo, Phase 1 | ✅ Implemented — [Section 14](#14-full-load-ingestion) (`urls`, `users`, `clicks` all start here) | ✅ Implemented — [Section 15](#15-incremental-load--watermarks-) (`clicks` only) | Not planned before Phase 5 (post-Phase-4, see repository-level plan) |
 
 ### 13.3 Checkpointing and watermark mechanism (already built)
 
@@ -1291,6 +1291,534 @@ slow" without naming *what* becomes slow or fails first.
 
 ---
 
+## 15. Incremental Load & Watermarks ✅✅
+
+### 15.1 Concept
+
+An **incremental load** extracts only the rows that are *new* since the
+last successful run, instead of re-reading the entire table every time. It
+needs a **watermark**: a saved value (here, the highest `id` already
+ingested) that tells the next run where to resume — `WHERE id > watermark`
+instead of `SELECT *`.
+
+### Why does this exist?
+
+Full load (Section 14) re-reads everything, every run — fine for `urls`
+and `users` (hundreds of rows), ruinous for `clicks`, which is designed to
+grow without bound as an append-heavy event table. At even a modest
+million rows, re-scanning the whole table on every run wastes I/O on the
+OLTP database, wastes time, and wastes Bronze storage on the same
+already-ingested rows written out again. Incremental load makes the cost
+of each run proportional to *new* data, not *total* data — the same
+argument that motivates almost every real streaming or CDC system, just
+applied here at the simplest level that can work: a single saved integer.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+Imagine syncing your email client's inbox. The very first sync has to
+download every message — there's nothing to compare against yet. But every
+sync after that only needs to ask the mail server "anything with a UID
+higher than the last one I saw?" The client remembers one number (the
+highest UID it has already downloaded) and uses it as the starting point
+for the next request. It never re-downloads message #1 through #9,000
+just to check for message #9,001 — that's the whole idea of a watermark:
+one small piece of saved state turns "read everything" into "read what's
+new."
+
+### URL Shortener Example
+
+`clicks` is exactly this inbox. Every redirect that happens (hypothetically
+— see ADR-008) inserts one new row with an auto-incrementing `id`. The
+first incremental run for `clicks` reads every row that exists so far
+(watermark starts at 0) and remembers the highest `id` it saw. The next
+run — minutes, hours, or a day later — asks Postgres for only
+`id > <that remembered value>`, gets back just the clicks that happened in
+between, writes those to a new Bronze object, and remembers the new
+highest `id`. `urls` and `users` stay on full load (Section 14) because
+they're small and don't grow the same way; `clicks` is the one table in
+this project's schema that this section's watermark logic actually
+applies to.
+
+### 15.2 Architecture
+
+```mermaid
+sequenceDiagram
+    participant CLI as cli.py (run)
+    participant MD as metadata.py
+    participant EX as extract_incremental.py
+    participant PG as Postgres (clicks)
+    participant OS as object_store.py
+    participant S3 as MinIO
+
+    CLI->>MD: start_run(pipeline, "clicks", "incremental")
+    MD-->>CLI: run_id (status=running)
+    CLI->>EX: run_incremental_load(...)
+    EX->>MD: get_last_watermark(pipeline, "clicks")
+    MD-->>EX: watermark (0 on first run; status='success' rows only)
+    EX->>PG: SELECT * FROM clicks WHERE id > :watermark ORDER BY id
+    PG-->>EX: DataFrame (possibly empty)
+    alt DataFrame is empty
+        EX->>MD: finish_run_success(rows=0, watermark_end=watermark unchanged)
+    else DataFrame has rows
+        EX->>OS: write_bronze_incremental(df, "clicks", watermark, new_watermark)
+        OS->>S3: put_object (key includes watermark_start/watermark_end)
+        S3-->>OS: 200 OK
+        OS-->>EX: bronze key
+        EX->>MD: finish_run_success(rows, watermark_end=new_watermark)
+    end
+```
+
+Same failure shape as full load: any exception between `start_run` and
+`finish_run_success` is caught by `run_incremental_load`, recorded via
+`finish_run_failure`, and re-raised — see [15.7](#157-failure-scenario)
+for exactly what "recorded" does and doesn't protect against here.
+
+### 15.3 Design Decision
+
+Two separate decisions had to be made for this component, and both are
+worth stating explicitly rather than leaving implicit in the code.
+
+**Decision 1 — how the watermark itself is compared: ID-based, not
+timestamp-based.** The watermark is `clicks.id` (a `BIGSERIAL`), compared
+with `WHERE id > :watermark`, not `occurred_at` compared with
+`WHERE occurred_at > :watermark`. `BIGSERIAL` values are assigned by
+Postgres itself, in strict insertion order, with no possibility of two
+rows sharing a value and no dependency on any client's clock. A
+`TIMESTAMPTZ` column, by contrast, is set by whatever produced the row
+(here, `DEFAULT now()` — but in a real system, potentially a
+client-supplied timestamp), and two rows genuinely can share the same
+timestamp at typical database timestamp precision under enough concurrent
+write load, or even go *backwards* relative to insertion order if a
+writer's clock is skewed. See [15.9](#159-principal-engineer-interview-questions)
+for the full comparison and a worked failure example.
+
+**Decision 2 — how the Bronze key is built for an incremental batch:
+`(table_name, watermark_start, watermark_end)`, not `(table_name, date)`.**
+Full load's key is safe to reuse verbatim for incremental load *only* if
+an incremental pipeline runs at most once per calendar day — it doesn't;
+it's designed to run many times a day, and each run's batch covers a
+*different* `id` range that must not collide with (overwrite) a previous
+run's batch the way same-day full-load reruns intentionally do. See
+`build_bronze_incremental_key`'s docstring in `object_store.py` for the
+exact format, and [15.7](#157-failure-scenario) for the one case where
+this key scheme's idempotency guarantee does *not* fully hold.
+
+### Alternatives
+
+1. **Timestamp-based watermark (rejected).** Simpler to read as a human
+   ("give me everything after 2pm"), and works acceptably when there's no
+   concurrent write pressure and every writer's clock is trustworthy.
+   Rejected here because neither of those conditions is something this
+   pipeline can guarantee about `clicks`' write path, and the failure mode
+   when they don't hold — silently skipped rows — is worse than the
+   failure mode of the chosen approach.
+2. **Full CDC via Postgres logical replication (rejected for Phase 1).**
+   Would eliminate polling entirely and capture every write, including
+   deletes and updates, which id-based polling cannot see at all (this
+   pipeline's watermark approach is insert-only by construction — see
+   [15.8](#158-production-considerations)). Rejected for Phase 1 per
+   ADR-004: no operational need yet, and it introduces an entirely
+   different infrastructure component (a replication slot, a consumer
+   process) before batch has been given a real chance to be sufficient.
+3. **ID-based watermark (chosen).** Immune to clock skew and duplicate
+   timestamps by construction, at the cost of only working when rows are
+   append-only, sequentially inserted, and never deleted or updated after
+   insertion — an assumption that happens to hold exactly for how
+   `clicks` is modeled in this project.
+
+### Trade-offs
+
+| | ID-based watermark (chosen) | Timestamp-based watermark (rejected) |
+|---|---|---|
+| Clock skew | Immune — Postgres assigns the sequence, not a client | Vulnerable — a writer with a skewed clock can insert a row with an `occurred_at` earlier than rows already ingested, and it will never be picked up |
+| Concurrent duplicate values | Impossible — `BIGSERIAL` values are unique by construction | Possible at typical timestamp precision under concurrent writes — an ambiguous cutoff row could be double-read or skipped |
+| Captures updates/deletes | No — only ever sees rows by insertion order, never re-reads a row that was later changed | Also no, in general, unless there's a separate `updated_at` also being watermarked |
+| Human-readability of "resume point" | Low — a bare integer, not obviously a point in time | High — "resume after 2026-09-19 14:00" reads naturally |
+| Requires on the source table | An indexed, monotonically-increasing integer/bigint key | An indexed, reliably-set timestamp column |
+
+### 15.4 Implementation
+
+This component touches four files. One is new and taught here in full
+depth; the other three were already introduced in Section 14 and get a
+shorter "what changed" treatment, since the underlying pattern (extract →
+write → checkpoint) doesn't change — only what gets extracted and how the
+Bronze key is built does.
+
+---
+
+**CREATE:** `ingestion/src/url_shortener_analytics/extract_incremental.py`
+
+**PURPOSE:** Read only the rows added since the last successful run,
+write them to Bronze under a watermark-scoped key, and advance the
+watermark — while treating "no new rows" as a normal, successful, no-op
+outcome rather than an edge case bolted on afterward.
+
+**DEPENDENCIES:** `pandas`, a SQLAlchemy `Engine`, this package's
+`metadata` module (for `get_last_watermark` and the same
+`start_run`/`finish_run_success`/`finish_run_failure` checkpoint calls
+`extract_full.py` uses) and `object_store.write_bronze_incremental`.
+
+**IMPLEMENTATION GUIDE (write it yourself):** start from
+`extract_full.py`'s shape — you're building the same two-function pattern
+(a pure extract function, and an orchestration function) — and change
+exactly what needs to change. `extract_incremental(table_name, engine,
+watermark)` should run a parameterized query,
+`SELECT * FROM <table_name> WHERE id > :watermark ORDER BY id` (use
+SQLAlchemy's `text()` with a bound parameter — never f-string the
+watermark value directly into SQL), and return the result as a DataFrame,
+wrapped in the same `try/except -> ExtractionError` pattern as
+`extract_full`. Order by `id` explicitly — you need `df["id"].max()` to be
+unambiguous, and relying on unspecified row order to happen to already be
+sorted is exactly the kind of implicit assumption that breaks quietly
+later. `run_incremental_load(engine, s3_client, bucket, pipeline_name,
+table_name)` is the orchestration, and this is where the real design
+decision lives: call `metadata.start_run(...)`, then
+`metadata.get_last_watermark(...)` to find where to resume, then your
+`extract_incremental`. **Before** doing anything else, check
+`df.empty` — if it's empty, call
+`metadata.finish_run_success(rows_read=0, rows_written=0,
+watermark_end=<the watermark you just read, unchanged>)` and return early,
+**without** calling `write_bronze_incremental` at all. (Ask yourself: what
+would a zero-row Parquet object at a `watermark_start == watermark_end`
+key actually represent, and who would it confuse later? That's the reason
+to skip the write, not just "why bother.") If `df` is non-empty, compute
+`new_watermark = int(df["id"].max())`, call
+`object_store.write_bronze_incremental(df, table_name, watermark,
+new_watermark, s3_client, bucket)`, then
+`metadata.finish_run_success(rows_read=len(df), rows_written=len(df),
+watermark_end=new_watermark)`. Wrap the extract-through-write portion in
+`try/except Exception` that calls `metadata.finish_run_failure(...)` and
+**re-raises**, exactly like `run_full_load` — this orchestration function
+should look like `run_full_load`'s twin with one extra branch, not a
+rewrite from scratch.
+
+**REFERENCE IMPLEMENTATION:**
+
+```python
+# ingestion/src/url_shortener_analytics/extract_incremental.py (excerpt —
+# full file is already committed at this path)
+
+def extract_incremental(table_name: str, engine: Engine, watermark: int) -> pd.DataFrame:
+    query = text(f"SELECT * FROM {table_name} WHERE id > :watermark ORDER BY id")
+    return pd.read_sql_query(query, engine, params={"watermark": watermark})
+
+
+def run_incremental_load(engine, s3_client, bucket, pipeline_name, table_name) -> dict:
+    run_id = metadata.start_run(engine, pipeline_name, table_name, load_type="incremental")
+    try:
+        watermark = metadata.get_last_watermark(engine, pipeline_name, table_name)
+        df = extract_incremental(table_name, engine, watermark)
+
+        if df.empty:
+            metadata.finish_run_success(engine, run_id, rows_read=0, rows_written=0, watermark_end=watermark)
+            return {"run_id": run_id, "rows": 0, "key": None, "watermark_end": watermark}
+
+        new_watermark = int(df["id"].max())
+        key = write_bronze_incremental(df, table_name, watermark, new_watermark, s3_client, bucket)
+        metadata.finish_run_success(engine, run_id, rows_read=len(df), rows_written=len(df), watermark_end=new_watermark)
+    except Exception as err:
+        metadata.finish_run_failure(engine, run_id, str(err))
+        raise
+    return {"run_id": run_id, "rows": len(df), "key": key, "watermark_end": new_watermark}
+```
+
+Full file: [`ingestion/src/url_shortener_analytics/extract_incremental.py`](../ingestion/src/url_shortener_analytics/extract_incremental.py).
+
+**RUN:** `make ingest` (dispatches `clicks` here, `urls`/`users` to full
+load — see the CLI change below). There's no standalone CLI for this file
+alone, same reasoning as `object_store.py` in Section 14.
+
+**VERIFY:** open `http://localhost:9001` (MinIO console), browse to
+`bronze/clicks/incremental/`; confirm one object per run, keyed by that
+run's `watermark_start=.../watermark_end=...` range, and that a second
+`make ingest` run with no new source rows produces **no** new object
+(compare `list_objects_v2` counts before/after — exactly what
+`test_run_incremental_load_with_no_new_rows_skips_the_write_but_still_succeeds`
+asserts under mocks, and what LAB 3 below proves against real MinIO).
+
+**EXPECTED:** the number of objects under `bronze/clicks/incremental/`
+equals the number of runs that found at least one new row — never one
+more than that, regardless of how many total runs (including no-op ones)
+have happened.
+
+**TEST:** `ingestion/tests/unit/test_extract_incremental.py` — 8 tests,
+covering watermark-scoped reads (including the watermark-at-max-id "reads
+nothing" boundary), the first-run-reads-everything case
+(`watermark=0`), the no-new-rows no-op path (asserting the checkpoint
+still records `status='success', rows_written=0` and that no Bronze write
+was attempted), and the failure-doesn't-advance-the-watermark case.
+`ingestion/tests/integration/test_incremental_load_integration.py` proves
+the same behavior against real Postgres + MinIO (not yet executed in this
+sandbox — see [15.6](#156-how-to-test)).
+
+**PRODUCTION CONSIDERATIONS:** see [15.8](#158-production-considerations).
+
+**INTERVIEW QUESTIONS:** see [15.9](#159-principal-engineer-interview-questions).
+
+---
+
+**Changed files** (already covered in depth in Section 14 — this is what
+changed about them for incremental load, not a repeat of their full
+teaching):
+
+| File | What changed | Why |
+|---|---|---|
+| [`object_store.py`](../ingestion/src/url_shortener_analytics/object_store.py) | Added `build_bronze_incremental_key` and `write_bronze_incremental`; extracted the shared retry/serialize logic both `write_bronze` and `write_bronze_incremental` need into a private `_put_parquet_with_retry` helper | One retry policy, one Parquet-serialization code path, for both load types — not two copies that could drift apart |
+| [`cli.py`](../ingestion/src/url_shortener_analytics/cli.py) | Added a `run` subcommand that dispatches each table to full or incremental load based on `pipelines.yaml`'s `load_type` field; kept `full-load` as an explicit override for backfills | `run` is what a real schedule would call; `full-load` stays available because forcing a full reload is a legitimate operator action (e.g. rebuilding Bronze from scratch after a schema change), not something that should require editing config |
+| [`pipelines.yaml`](../ingestion/configs/pipelines.yaml) | `clicks`' `load_type` changed from `full` to `incremental` | This is the one line that actually turns incremental load "on" for `clicks` — everything else in this section exists to make that one config value meaningful |
+| [`Makefile`](../Makefile) | Added `make ingest` (calls `cli.py run`); kept `make ingest-full` (calls `cli.py full-load`) | Matches the CLI's two entry points 1:1 |
+
+### Hands-on Challenge (implement-yourself)
+
+Before reading LAB 2 below, try this: **without looking at
+`extract_incremental.py`, write down (in plain English or pseudocode) what
+would go wrong if `run_incremental_load` called
+`metadata.finish_run_success(...)` *before* calling
+`write_bronze_incremental(...)` instead of after.** Then check your answer
+against [15.7](#157-failure-scenario): a process killed in that window
+would leave the watermark advanced in `ingestion_metadata` even though the
+corresponding Bronze object was never actually written — the *opposite* of
+the safe failure mode this section's ordering produces, and a genuinely
+worse bug than a stuck `running` row, because it's a **silent data gap**:
+`get_last_watermark` would report success, the next run would start from
+the advanced watermark, and the rows in between would never be extracted
+by anything, ever, without manual intervention.
+
+### 15.5 Hands-on Exercise
+
+**LAB 2 — Run an incremental load twice, prove it only reads what's new.**
+
+Prerequisites: `make up`, `make seed` have been run; `make ingest` (or
+`make ingest-full`) has populated an initial baseline.
+
+```bash
+make ingest    # first run: clicks watermark starts at 0, reads everything so far
+```
+
+Expected output (structured log lines):
+
+```
+ts=... level=INFO logger=url_shortener_analytics.extract_incremental msg="extracting table (incremental load)" table='clicks' watermark=0
+ts=... level=INFO logger=url_shortener_analytics.extract_incremental msg="extraction complete" table='clicks' rows=1000 watermark=0
+ts=... level=INFO logger=url_shortener_analytics.object_store msg="wrote bronze object" key='bronze/clicks/incremental/watermark_start=000000000000/watermark_end=000000001000/clicks.parquet' bytes=... rows=1000 attempt=1
+```
+
+*(Row counts above are a DESIGN EXPECTATION based on
+`scripts/seed_sample_data.py`'s fixed seed for however many `clicks` rows
+it generates — run the command yourself to see the ACTUAL OBSERVED value;
+nothing above was fabricated as a claimed real run.)*
+
+Now insert a few new rows directly (simulating new redirects happening),
+and run again:
+
+```bash
+docker compose exec postgres psql -U urlshortener -d urlshortener \
+  -c "INSERT INTO clicks (short_code) VALUES ('test01'), ('test02');"
+make ingest    # second run: watermark is now 1000, reads only the 2 new rows
+```
+
+What to observe: the second run's log line reads
+`watermark=1000` (not `0`), reports `rows=2` (not 1002), and writes a
+**new**, separate Bronze object at
+`bronze/clicks/incremental/watermark_start=000000001000/watermark_end=000000001002/clicks.parquet`
+— the first run's object at `watermark_start=000000000000/...` is left
+untouched. Two objects now exist under `bronze/clicks/incremental/`,
+together covering every row exactly once.
+
+**LAB 3 — Prove a no-op run writes nothing.**
+
+```bash
+make ingest    # third run: no new rows inserted since LAB 2's second run
+```
+
+What to observe: the log shows `rows=0`, no `"wrote bronze object"` line
+appears at all, and `ingestion_metadata` gets a new row with
+`status='success', rows_written=0, watermark_end` equal to the previous
+run's `watermark_end` (verify with
+`docker compose exec postgres psql ... -c "SELECT status, rows_written, watermark_end FROM ingestion_metadata WHERE source_table='clicks' ORDER BY started_at DESC LIMIT 3;"`).
+Confirmed under mocks by
+`test_run_incremental_load_with_no_new_rows_skips_the_write_but_still_succeeds`,
+and, against real infrastructure, by
+`test_incremental_load_with_no_new_rows_writes_nothing`.
+
+### 15.6 How to test
+
+```bash
+make test                # unit tests: SQLite + mocked S3, no Docker needed
+make up
+make test-integration     # real Postgres + MinIO
+```
+
+The full unit suite (27 tests — 15 from Section 14 plus 12 new: 4 for
+`build_bronze_incremental_key`/`write_bronze_incremental` in
+`test_object_store.py`, 8 in `test_extract_incremental.py`) was run in
+this environment while writing this section (Python 3.11,
+`PYTHONPATH=ingestion/src python3 -m pytest ingestion/tests/unit -q`) and
+genuinely passed — this is an ACTUAL OBSERVED result, not a projection:
+
+```
+27 passed in 12.78s
+```
+
+`ingestion/tests/integration/test_incremental_load_integration.py` (3
+tests: reads-only-new-rows, no-op-writes-nothing, retry-overwrites-not-
+duplicates) is written and `ruff check`-clean, but **not yet executed** —
+there is no Docker daemon available in this sandbox (`docker info` fails
+here). Run it yourself with `make up && make test-integration` and this
+section will be updated with the actual observed result once that's done
+in an environment with Docker.
+
+### 15.7 Failure Scenario
+
+**What happens if the process is killed after `write_bronze_incremental`
+succeeds but before `finish_run_success` records the new watermark?**
+
+This is the incremental-load analogue of Section 14.7's full-load failure
+scenario, and it matters more here because a watermark, unlike a full
+load's date-scoped key, controls *what the next run even attempts to
+read*. The Bronze object for this run's batch now exists in MinIO, but
+`ingestion_metadata` still shows `status='running'` for it —
+`get_last_watermark` only reads `status='success'` rows, so the next run
+resumes from the *old* watermark, not the one this run computed. Recovery:
+re-running is safe, but not for free — it re-extracts the same rows a
+second time and, because the `id > watermark` starting point is unchanged,
+computes the **same** `(watermark_start, watermark_end)` pair, which
+`build_bronze_incremental_key` turns into the **same** key — so the retry
+overwrites the first (orphaned, `running`) run's object with identical
+bytes. This is exactly the scenario
+`test_retrying_the_same_failed_watermark_range_overwrites_not_duplicates`
+proves.
+
+**The one case where this guarantee does NOT fully hold, stated honestly:**
+if new rows are inserted into `clicks` *between* the failed run and its
+retry, the retry's `extract_incremental` call reads a *larger* range than
+the failed run did (same `watermark_start`, but a higher `watermark_end`,
+because `df["id"].max()` is now bigger). `build_bronze_incremental_key`
+then computes a **different** key — so the retry writes a **second**,
+non-overlapping-but-superset object next to the orphaned first one,
+instead of cleanly overwriting it. The orphaned object isn't wrong (every
+row in it is correct data), but it *is* redundant — some rows now exist in
+two Bronze objects. **Production implication:** this is precisely the kind
+of edge case a real orchestrator's retry policy and a periodic
+Bronze-compaction/cleanup job need to account for; Phase 1 documents it
+rather than hides it, consistent with this project's stated principle of
+being honest about POC limitations (see ADR-007's note on retention) —
+fully closing this gap would mean either detecting and deleting orphaned
+`running` objects on startup, or moving to a run-id-scoped key with
+separate deduplication downstream, both explicitly out of scope here.
+
+### 15.8 Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| Watermark source | `clicks.id`, a `BIGSERIAL` — assumes an ever-increasing integer PK on every incrementally-loaded table | Same idea, but often a dedicated monotonic sequence or `updated_at` handled via CDC, since not every production table has an integer PK suited to this |
+| Captures updates/deletes | No — insert-only; a row that's later updated in place is never re-read | CDC (Debezium/logical replication) captures every write type; polling-based incremental load fundamentally cannot |
+| Scheduling | Manual (`make ingest`) | Orchestrator-driven (Airflow, etc. — Phase 3), on a fixed interval, with alerting on missed/late runs |
+| Orphaned-object cleanup | None — see 15.7's residual edge case | A periodic reconciliation job comparing `ingestion_metadata` against actual Bronze object listings |
+| Watermark column requirement | Must be indexed (`ix_clicks_...` — not yet added; see the Hands-on Challenge two sections up about partition/index design) | Same requirement, enforced by data-contract review before a new table is onboarded to incremental load |
+
+### Principal Data Engineer Perspective
+
+The decision worth being able to defend in review here isn't "should this
+use a watermark" — it's *which* watermark, and principal-level judgment
+shows up in naming the assumption an id-based watermark makes explicit:
+this approach only works because `clicks` is, by this project's own
+design, insert-only and never updated after the fact. The moment a real
+requirement appears — "let us edit or soft-delete a click record for
+fraud correction," say — this entire mechanism silently stops being
+correct, because an updated row's `id` doesn't change, so it will never be
+picked up by `WHERE id > watermark` again. A weaker engineer ships the
+id-based watermark and moves on; a principal engineer writes down, at
+design time, the exact condition under which it breaks — which is what
+this section's Trade-offs table and ADR-005 are for — so that whoever
+adds update/delete support later inherits a known, documented constraint
+instead of discovering it by debugging a data-quality incident. The second
+thing worth flagging: this section's failure-scenario writeup admits a
+real, if narrow, idempotency gap (15.7) rather than claiming a stronger
+guarantee than the code actually provides. That's a deliberate modeling
+choice about what to prioritize in a portfolio project — an interviewer
+evaluating this repo should come away trusting every claim it makes,
+which is worth more than a repo that quietly overstates its own
+correctness.
+
+### 15.9 Principal Engineer Interview Questions
+
+**Q: "Why an id-based watermark instead of a timestamp-based one? Walk me
+through a concrete scenario where the timestamp-based version breaks."**
+
+*What's tested:* whether the candidate understands watermarking as a
+correctness mechanism with a specific failure mode, not just a
+stylistic choice.
+
+*What a weak answer looks like:* "Timestamps can have clock skew issues" —
+true, but vague enough to sound memorized rather than understood.
+
+*What a strong answer covers:* concretely, suppose two application
+servers both insert a `clicks` row in the same second, and an incremental
+run's watermark is set to `occurred_at = 14:00:00`. If a third row with
+`occurred_at = 14:00:00` from a *different* server arrives one second
+later (its clock was one second slow, or its write was simply delayed by
+normal network/lock contention), the next run's `WHERE occurred_at >
+'14:00:00'` **silently excludes it forever** — it's not late, it's gone.
+An id-based watermark cannot have this failure: Postgres assigns
+`BIGSERIAL` values from a single sequence, in the literal order rows
+commit, with no dependency on any client's clock or on network delay.
+
+*Concepts:* watermark correctness, clock skew, "equal-to-cutoff" boundary
+ambiguity in timestamp comparisons.
+
+*Expected follow-up:* "What does the id-based approach give up in
+exchange?" — It can't detect that an existing row was updated or deleted,
+only that new rows were inserted (see the next question).
+
+*Common mistake:* describing clock skew only in terms of literal wall-clock
+drift between servers, without connecting it to the actual mechanism (a
+row landing with a timestamp *earlier* than the watermark's current
+cutoff, purely because of when it was written relative to other writes).
+
+**Q: "This incremental load only ever sees new rows. What happens if a
+`clicks` row is updated after it's already been ingested — say, a
+fraud-review process changes `device_type` on a row that was ingested
+yesterday? Will this pipeline ever see that change?"**
+
+*What's tested:* whether the candidate recognizes the boundary of what an
+id-based, insert-scoped watermark can and can't capture — a very common
+gap between "the demo works" and "this is production-correct for the
+actual write pattern."
+
+*What a weak answer looks like:* "It'll pick it up next run" — incorrect;
+this is the single most important limitation of this design and needs to
+be named as one.
+
+*What a strong answer covers:* no — `WHERE id > watermark` only ever
+matches rows whose `id` wasn't ingested yet; an update to an
+already-ingested row doesn't change its `id`, so it will never satisfy
+that condition again, ever, under this mechanism. Bronze silently becomes
+stale relative to OLTP for that row. Real options: add and watermark on an
+`updated_at` column too (catches updates, still has the timestamp
+caveats from the previous question); move to CDC, which captures every
+write type at the WAL level regardless of what changed; or, for this
+project's actual `clicks` design specifically, treat click records as
+genuinely immutable (never updated after insert) as a stated data
+contract, which sidesteps the problem by design rather than by mechanism.
+
+*Concepts:* insert-only vs. mutable source tables, the difference between
+"my watermark logic is correct" and "my watermark logic matches this
+table's actual write pattern."
+
+*Expected follow-up:* "How would you even detect this gap in production,
+before a stakeholder notices stale numbers?" — Row-count and checksum
+reconciliation between OLTP and Bronze on a schedule, which is exactly
+what Section 25 (Failure Scenarios) and a future data-quality section
+would formalize.
+
+*Common mistake:* conflating "the pipeline ran successfully" with "the
+data is correct" — a successful `status='success'` checkpoint says nothing
+about whether an update to already-ingested data was captured, because
+this mechanism was never designed to look for that in the first place.
+
+---
+
 ## 28. Architectural Principles
 
 Introduced here, demonstrated incrementally as more of Phase 1 is built.
@@ -1421,17 +1949,24 @@ data freshness being bounded by run frequency rather than near-real-time.
 exists; the eventual Kafka introduction (Phase 5+) needs its own
 migration path onto whatever this pipeline has already built.
 
-### ADR-005: Watermark-based incremental ingestion *(planned, not yet implemented)*
+### ADR-005: Watermark-based incremental ingestion *(implemented)*
 
-Recorded now so the decision and its context aren't lost between this
-increment and the one that implements it. **Context:** `clicks` will grow
-without bound; full-reading it every run doesn't scale. **Decision (planned):**
-an `id`-based (not timestamp-based) watermark, for the same clock-skew and
-duplicate-timestamp reasons documented in this project's earlier notebook
-prototype. **Alternatives considered:** timestamp-based watermark; full
-CDC. **Trade-offs:** id-based watermarking is immune to clock skew but
-tracks insertion order, not event order — late-arriving-data handling is
-deferred. **Consequences:** to be implemented in Section 15.
+**Context:** `clicks` will grow without bound; full-reading it every run
+doesn't scale. **Decision:** an `id`-based (not timestamp-based) watermark,
+for the same clock-skew and duplicate-timestamp reasons documented in this
+project's earlier notebook prototype — see
+[Section 15.3](#153-design-decision) for the full reasoning and
+[Section 15.9](#159-principal-engineer-interview-questions) for a worked
+failure example of the rejected alternative. **Alternatives considered:**
+timestamp-based watermark; full CDC. **Trade-offs:** id-based watermarking
+is immune to clock skew but tracks insertion order, not event order —
+late-arriving-data handling and update/delete capture are both explicitly
+out of scope (see [Section 15.8](#158-production-considerations)).
+**Consequences:** implemented in `extract_incremental.py` and
+`metadata.py`; `clicks` is the only table currently onboarded to this
+strategy (`ingestion/configs/pipelines.yaml`); the Bronze idempotency
+guarantee this decision depends on has one documented residual edge case
+— see [Section 15.7](#157-failure-scenario).
 
 ### ADR-006: Dimensional analytical model *(planned, not yet implemented)*
 
@@ -1497,48 +2032,60 @@ documented as such in the README.
 **What we've built in this increment:** the repository skeleton; the real
 (and clearly-labeled hypothetical) source schema, documented and
 mirrored locally; a full-load batch ingestion pipeline
-(`extract_full.py`, `object_store.py`, `metadata.py`, `cli.py`) that is
-idempotent, checkpointed, retried, and covered by 15 passing unit tests
-plus integration tests runnable against real infrastructure; this guide.
+(`extract_full.py`, `object_store.py`, `metadata.py`, `cli.py`) for
+`urls`/`users`/`clicks`; an incremental, watermark-based ingestion path
+(`extract_incremental.py`, plus incremental support added to
+`object_store.py` and `cli.py`) for `clicks` specifically, dispatched
+automatically by `cli.py run` based on `pipelines.yaml`'s `load_type`
+per table; both load types idempotent, checkpointed, retried, and
+covered by 27 passing unit tests plus integration tests runnable against
+real infrastructure; this guide.
 
-**A note on this increment specifically:** this pass didn't add new code —
-it took the sections already built (1, 2, 14) and rewrote them to the full
-teaching template (Concept → Why → Simple Example → URL Shortener Example
-→ Architecture → Design Decision → Alternatives → Trade-offs →
-Implementation → Code → How to Run → How to Verify → Hands-on Exercise →
-Failure Scenario → Production Considerations → Principal Perspective →
-Interview Questions), matching the depth of this project's original
-notebook-based prototype. Sections marked ✅ (not ✅✅) in the table of
-contents still need this same upgrade pass — they're accurate, just not
-yet at full depth. Every future new section is written at this depth from
-the start.
+**A note on this increment specifically:** this pass added real new code
+(`extract_incremental.py`, the incremental-key functions in
+`object_store.py`, the `run` CLI subcommand) *and* wrote Section 15 at
+full teaching-template depth from the start (Concept → Why → Simple
+Example → URL Shortener Example → Architecture → Design Decision →
+Alternatives → Trade-offs → Implementation → Code → How to Run → How to
+Verify → Hands-on Exercise → Failure Scenario → Production Considerations
+→ Principal Perspective → Interview Questions) — matching the depth
+established for Sections 1, 2, and 14 in the previous increment. Sections
+still marked ✅ (not ✅✅) in the table of contents still need that same
+upgrade pass — they're accurate, just not yet at full depth.
 
 **Concepts taught so far, at full depth:** the real application's
 architecture and schema (with an explicit gaps/assumptions/recommended-
-changes breakdown), OLTP vs. OLAP (with a generic pre-URL-Shortener
-example, design decision, alternatives and trade-offs), full load
-ingestion (with the exact CREATE/PURPOSE/IMPLEMENTATION/RUN/VERIFY/TEST
-format for its two core files, plus an implement-yourself hands-on
-challenge). Batch ingestion design, checkpointing's existence, and
-idempotency's existence are introduced but still await their own full-depth
-passes (Sections 13, 16, 19).
+changes breakdown), OLTP vs. OLAP, full load ingestion (with the exact
+CREATE/PURPOSE/IMPLEMENTATION/RUN/VERIFY/TEST format, plus an
+implement-yourself hands-on challenge), and now incremental load &
+watermarks (id-based vs. timestamp-based watermark design decision with a
+worked failure example, the watermark-scoped idempotency key design and
+its one honestly-documented residual edge case, the empty-result-is-not-
+an-error design point, and a Principal-level question on what an
+insert-only watermark structurally cannot capture). Batch ingestion
+design, checkpointing's existence, and idempotency's existence are
+introduced and now demonstrated for both load types, but still await
+their own dedicated deep-dive passes (Sections 13, 16, 17).
 
-**Known limitations, stated honestly:** no incremental load yet (`clicks`
-still does a full read every run); no scheduler (runs are manual);
-`ingestion_metadata` has no automated stale-`running`-row alerting; no
-formal data contracts yet; no PII classification section yet, though the
-hypothetical `clicks.hashed_ip` design already avoids storing raw IPs; no
-benchmarks have been run yet (Parquet/partitioning claims in this guide so
-far are conceptual, not benchmark-backed — that's explicitly what Sections
-19-20 and `benchmarks/` are for); most sections in the table of contents
-still need the full-depth pass this increment applied to Sections 1, 2 and
-14.
+**Known limitations, stated honestly:** no scheduler yet (runs are
+manual, via `make ingest`); `ingestion_metadata` has no automated
+stale-`running`-row alerting; incremental load is insert-only by
+construction — an update or delete to an already-ingested `clicks` row is
+never re-captured (Section 15.9); a retried failed incremental run can, in
+one specific ordering, produce a redundant (not wrong, just duplicated)
+Bronze object instead of a clean overwrite (Section 15.7); no formal data
+contracts yet; no PII classification section yet, though the hypothetical
+`clicks.hashed_ip` design already avoids storing raw IPs; no benchmarks
+have been run yet (Parquet/partitioning claims in this guide so far are
+conceptual, not benchmark-backed — that's explicitly what Sections 19-20
+and `benchmarks/` are for); most sections in the table of contents still
+need the full-depth pass already applied to Sections 1, 2, 14, and 15.
 
-**Immediate next increment:** either incremental load + watermarks for
-`clicks` at full depth (Section 15 — the single most important remaining
-Phase 1 topic per the original curriculum), or the analytics requirements
-/ data modeling sections (7-12) — whichever the reader wants to tackle
-next.
+**Immediate next increment:** the analytics requirements / data modeling
+sections (7-12) — the next largest remaining gap now that both Phase 1
+ingestion load types are implemented and taught at full depth — or a
+deep-dive pass on checkpointing/idempotency (Sections 16-17), whichever
+the reader wants to tackle next.
 
 ---
 
@@ -1555,21 +2102,21 @@ next.
 | Star schema implemented | ⏳ Not started | — | Section 11, `sql/analytics/` |
 | Data contracts defined | ⏳ Not started | — | Section 12 |
 | Full ingestion implemented | ✅ Done | `extract_full.py`, LAB 1 | — |
-| Incremental ingestion implemented | ⏳ Not started | — | Section 15 |
-| Watermark implemented | ⏳ Not started (mechanism exists, unused by full load) | `metadata.get_last_watermark` | Wire into an incremental extractor, Section 15 |
-| Checkpoint implemented | ✅ Done | `metadata.py`, `ingestion_metadata` table | Deep-dive section (16) still to write |
-| Idempotency implemented | ✅ Done | `object_store.build_bronze_key`, integration test | Deep-dive section (17), LAB 6-8 |
+| Incremental ingestion implemented | ✅ Done | `extract_incremental.py`, LAB 2/3, Section 15 | — |
+| Watermark implemented | ✅ Done | `metadata.get_last_watermark`, wired into `extract_incremental.run_incremental_load`, Section 15 | — |
+| Checkpoint implemented | ✅ Done | `metadata.py`, `ingestion_metadata` table, exercised by both load types | Deep-dive section (16) still to write |
+| Idempotency implemented | ✅ Done | `object_store.build_bronze_key` / `build_bronze_incremental_key`, integration tests for both load types | Deep-dive section (17); one documented residual edge case, Section 15.7 |
 | MinIO configured | ✅ Done | `docker-compose.yml`, `object_store.py` | — |
-| Parquet implemented | ✅ Done | `object_store.write_bronze` | Benchmark vs CSV/JSON not yet run (Section 19) |
-| Partitioning implemented | ⏳ Not started (only date-scoped keys, not true multi-file partitioning) | — | Section 20 |
+| Parquet implemented | ✅ Done | `object_store.write_bronze` / `write_bronze_incremental` | Benchmark vs CSV/JSON not yet run (Section 19) |
+| Partitioning implemented | ⏳ Not started (only date/watermark-scoped keys, not true multi-file partitioning) | — | Section 20 |
 | PII identified | ⏳ Not started | `clicks.hashed_ip` already avoids raw IPs by construction | Formal classification table, Section 23 |
-| Tests implemented | ✅ Done (unit) | 15 passing unit tests, `ingestion/tests/unit/` | Integration tests written but not yet run against live Docker in this environment (no Docker daemon available here — user should run `make test-integration` locally) |
-| Failure scenarios tested | ✅ Partial | Section 14.7 (1 of 10) | Remaining 9, Section 25 |
+| Tests implemented | ✅ Done (unit) | 27 passing unit tests, `ingestion/tests/unit/` | Integration tests written (full load + incremental load) but not yet run against live Docker in this environment (no Docker daemon available here — user should run `make test-integration` locally) |
+| Failure scenarios tested | ✅ Partial | Section 14.7, Section 15.7 (2 of 10) | Remaining 8, Section 25 |
 | Performance benchmark completed | ⏳ Not started | — | Section 26, `benchmarks/` |
-| Architecture diagrams completed | ✅ Partial | 5 diagrams so far | More land with later sections (star schema, data lifecycle, failure/recovery, final architecture) |
-| ADRs documented | ✅ 9 of 8+ planned | Section 29 | ADR-005/006 recorded as planned, not yet implemented |
-| Interview questions reviewed | ✅ Partial | Section 14.9 (Category C) | Remaining categories, Section 31 |
-| Hands-on labs completed | ✅ Partial | LAB 1, LAB 4/5 (compressed) | LAB 2-3, 6-12 |
+| Architecture diagrams completed | ✅ Partial | 7 diagrams so far | More land with later sections (star schema, data lifecycle, failure/recovery, final architecture) |
+| ADRs documented | ✅ 9 of 8+ planned | Section 29 | ADR-005 now implemented; ADR-006 still recorded as planned, not yet implemented |
+| Interview questions reviewed | ✅ Partial | Section 14.9, Section 15.9 (Category C) | Remaining categories, Section 31 |
+| Hands-on labs completed | ✅ Partial | LAB 1, LAB 2, LAB 3, LAB 4/5 (compressed) | LAB 6-12 |
 | README updated | ✅ Done | `README.md` | — |
 | Git repository clean | ✅ Done | Section 35 | — |
 | No secrets committed | ✅ Done | `.gitignore`, `.env.example` reviewed | — |

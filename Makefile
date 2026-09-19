@@ -1,4 +1,4 @@
-.PHONY: venv install up down logs ps db-shell ingest-full test test-integration lint fmt seed
+.PHONY: venv install up down logs ps db-shell ingest ingest-full test test-integration lint fmt seed
 
 venv:
 	python3.12 -m venv .venv
@@ -24,6 +24,9 @@ db-shell:
 
 seed:
 	python scripts/seed_sample_data.py
+
+ingest:
+	python -m url_shortener_analytics.cli run
 
 ingest-full:
 	python -m url_shortener_analytics.cli full-load

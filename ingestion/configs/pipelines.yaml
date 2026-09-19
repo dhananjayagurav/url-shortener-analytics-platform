@@ -3,9 +3,9 @@
 # This file exists so "which tables does the pipeline touch, and with what
 # load strategy" is a config change, not a code change -- see
 # docs/analytics-engineering-guide.md, Architectural Principles,
-# "Metadata-driven processing". Phase 1 only implements full load; the
-# `load_type: incremental` entries are read but not yet acted on -- see
-# ADR-005 and the guide's "What Phase 1 does not implement" note.
+# "Metadata-driven processing". As of Section 15, `run` (see cli.py)
+# dispatches each table to full or incremental load based on this file's
+# `load_type` -- see ADR-005, now "implemented".
 
 pipeline_name: url_shortener_bronze_ingestion
 
@@ -15,4 +15,4 @@ tables:
   - name: users
     load_type: full
   - name: clicks
-    load_type: full     # becomes `incremental` once extract_incremental.py lands (Section 14 of the guide)
+    load_type: incremental   # id-based watermark; see guide Section 15
