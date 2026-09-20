@@ -16,10 +16,13 @@ built the way it is and *how to run it*, not a copy of its source.
 **Status of this document:** Phase 1 is complete as of Section 36 — every
 section in the table of contents below now has real content, and Section
 33 gives the full close-out summary. **Phase 2 has now begun** (Sections
-37-38): its first real component — Bronze `clicks` → Silver `clicks`,
-genuinely built and run on Spark — is done; everything else in Phase 2's
-table of contents below is planned but not yet built, named explicitly
-rather than implied to exist. Sections are marked ✅ (implemented and
+37-39): Spark is introduced, the first real component — Bronze `clicks` →
+Silver `clicks`, genuinely built and run on Spark — is done, and it now
+genuinely consumes multiple real Bronze batches (full-load and
+incremental) together, closing a gap the first component's own write-up
+predicted but hadn't yet observed; everything else in Phase 2's table of
+contents below is planned but not yet built, named explicitly rather than
+implied to exist. Sections are marked ✅ (implemented and
 documented) or ✅✅ (written to the full teaching template below); none
 remain marked ⏳. This is an honest, current map of the project, not a
 retroactive claim that every section was written to the same depth from
@@ -127,7 +130,7 @@ with the exact command to produce the real result yourself.
 **Phase 2 — Data Lake, Transformation & Data Quality**
 37. [Why Distributed Processing? Introducing Spark](#37-why-distributed-processing-introducing-spark-) ✅✅
 38. [First Transformation: Bronze `clicks` → Silver `clicks`](#38-first-transformation-bronze-clicks-silver-clicks-) ✅✅
-39. Schema Evolution & Late-Arriving Data — *planned*
+39. [Consuming Multiple Bronze Batches Together](#39-consuming-multiple-bronze-batches-together-) ✅✅ *(retitled from the original "Schema Evolution & Late-Arriving Data" placeholder — see 39.1)*
 40. Data Quality Framework (validation rules, quarantine, profiling) — *planned*
 41. Deduplication — *planned*
 42. Slowly Changing Dimensions (SCD Type 1 vs Type 2, implemented for real) — *planned*
@@ -152,8 +155,10 @@ This Phase 2 table of contents is deliberately a topic list, not a
 commitment to exactly these 20 section numbers in this exact order —
 Phase 1's own TOC grew and got renumbered more than once as sections were
 actually built (compare Section 33's close-out counts against this
-document's very first commits). What's real right now is Sections 37-38;
-everything from 39 onward is scope, not progress, and will be built one
+document's very first commits) -- Section 39 itself is one example,
+retitled from its original placeholder name once real work showed what it
+actually needed to be about. What's real right now is Sections 37-39;
+everything from 40 onward is scope, not progress, and will be built one
 reviewed increment at a time, the same way Phase 1 was.
 
 ---
@@ -9760,6 +9765,45 @@ unnecessary entirely, since `make ingest-full` already writes real Bronze
 objects through the real `write_bronze()` path whenever real MinIO is
 reachable.
 
+### ADR-017: Explicit per-object Bronze reads, never a directory-level read across mixed partition schemes
+
+**Context:** Section 38 built Bronze `clicks` → Silver `clicks` against
+one Bronze object; Section 39 added a second, real, incremental Bronze
+object and found that `spark.read.parquet()` on the table's parent
+directory genuinely fails once both exist
+(`AssertionError: Conflicting directory structures detected`) — Spark's
+Hive-style partition discovery cannot reconcile full-load's
+`ingestion_date=` partitioning with incremental's
+`watermark_start=`/`watermark_end=` partitioning as one schema.
+**Decision:** every Bronze-reading component in this project reads each
+real Bronze object by its own explicit file path and unions the results
+in code (`list_local_bronze_files` + `unionByName`, Section 39.3-39.4) —
+never a directory-level read, for any table that has, or could someday
+have, more than one partitioning scheme in play (every table with both a
+full-load and an incremental load path — `urls`/`users` today, once
+Section 27's named gap is eventually closed; `clicks` already).
+**Alternatives considered:** Spark's `.option("basePath", ...)` —
+rejected after checking what it actually does: it relocates where
+partition inference *starts*, it does not reconcile two structurally
+different partition-column sets. Changing Bronze's own key formats
+(Sections 14/15) so both load types share one partitioning scheme —
+rejected as a much larger, riskier change to already-committed,
+already-tested Phase 1 code for a Phase 2 reading convenience.
+**Trade-offs:** explicit-file reads require enumerating Bronze's real
+objects independently of Spark's own directory listing (one new, small
+function) — in exchange for correctness that doesn't depend on Bronze's
+two key formats ever becoming compatible with each other. **Consequences:**
+a standing convention for this codebase now, not a one-off fix scoped to
+`clicks` alone — the next table's own Silver transform should reuse
+`list_local_bronze_files` (or its real-S3 successor,
+`object_store.py`'s already-existing `list_bronze_keys`, Section 17) and
+the explicit-read-then-union pattern from the start, rather than
+rediscovering this same failure independently. This does **not** cover
+every Bronze-consistency problem — Section 39.7 found a second, real,
+still-unfixed issue (duplicate rows when more than one full-load snapshot
+exists for a table at once), explicitly deferred to Section 41's
+deduplication work, not silently assumed to be solved by this ADR too.
+
 ---
 
 ## 30. Hands-on Labs (index)
@@ -10271,21 +10315,20 @@ Phase 2 begins only when explicitly requested — consistent with
 how this repository has been built so far, one reviewed increment at a
 time.
 
-**Update — Phase 2 has begun.** Sections 37-38, immediately following,
+**Update — Phase 2 has begun.** Sections 37-39, immediately following,
 are Phase 2's first genuine increment: an introduction to distributed
-processing and Spark, and a real, run Bronze `clicks` → Silver `clicks`
-transformation. Everything else this section named above — SCD, the data
-quality framework, Gold's dimension-key joins, and the rest — remains
-exactly as described here: real, scoped, upcoming work, not yet built.
-See Section 38's own "Production Considerations" for one new, concrete
-finding this first component surfaced that isn't in this list yet:
-Bronze's two partitioning schemes (full-load's `ingestion_date=`,
-incremental's `watermark_start=`/`watermark_end=`) are not compatible with
-Spark's automatic Hive-style partition discovery once a table has both
-kinds of Bronze object to read at once — a problem `clicks` doesn't yet
-have to solve for real (only one full-load-shaped Bronze snapshot exists
-in this environment so far) but will, the moment a genuine incremental
-Bronze batch needs to feed the same Silver table.
+processing and Spark, a real, run Bronze `clicks` → Silver `clicks`
+transformation, and — since then — a real second Bronze batch (an
+incremental `clicks` object, alongside the original full-load one) that
+proved and then fixed exactly the gap Section 38.7/38.8 predicted but
+hadn't yet observed: Spark's Hive-style partition discovery genuinely
+cannot read Bronze's two different partitioning schemes
+(`ingestion_date=` for full loads, `watermark_start=`/`watermark_end=`
+for incremental batches) as one directory once both exist for the same
+table. Section 39 shows the real, reproduced error and the real fix.
+Everything else this section named above — SCD, the data quality
+framework, Gold's dimension-key joins, and the rest — remains exactly as
+described here: real, scoped, upcoming work, not yet built.
 
 ---
 
@@ -11352,5 +11395,595 @@ function.
 coerce to a default" as a uniform, one-size-fits-all policy — the
 interview signal is in showing the decision is made per-field, on
 purpose, against a real repository's actual modeled conventions.
+
+---
+
+## 39. Consuming Multiple Bronze Batches Together ✅✅
+
+### 39.1 Concept
+
+Section 38 built and ran Bronze `clicks` → Silver `clicks` against
+exactly one Bronze object: a single full-load snapshot. A real pipeline
+never stays that way — new `clicks` rows keep arriving, and Section 15's
+incremental load writes each new batch as its *own*, separate Bronze
+object (`build_bronze_incremental_key`), never touching the original
+full-load object. This section makes Silver consume *every* Bronze
+object for a table — full-load and incremental together — as one
+combined input, and honestly documents a real failure this genuinely
+caused the first time it was tried, and the real fix.
+
+**A note on this section's name.** Phase 2's table of contents (above)
+originally planned this slot as "Schema Evolution & Late-Arriving Data" —
+a broader, more abstract topic (a column being added mid-stream, an event
+arriving out of order). What actually happened, building this increment
+for real, was narrower and more concrete: a genuine, reproducible failure
+reading two Bronze objects together at all, caused by Spark's own
+partition-discovery mechanism, not by any column changing shape or any
+event arriving out of timestamp order. Retitling this section to match
+what was actually built — rather than stretching "schema evolution" to
+cover it, or silently building something different from what the TOC
+promised — is the same honesty this guide has applied to its own section
+numbering before (Section 37.7's TOC note already flagged this as
+likely). Schema evolution *in the traditional sense* (a new or changed
+column appearing in a later Bronze batch) remains a real, distinct, still
+entirely unbuilt topic — genuinely different from what this section
+covers, not folded in by relabeling.
+
+### Why does this exist?
+
+Section 38.8 named this as a **Failure Scenario** — reasoned through from
+Spark's documented partition-discovery behavior and this project's own
+two real Bronze key formats, but explicitly marked as *not yet observed*,
+since only one Bronze object existed at the time. Leaving a reasoned-but-
+unverified prediction sitting in the guide indefinitely would eventually
+stop being honest scoping and start being an excuse — the entire point of
+labeling something a DESIGN EXPECTATION is that it gets verified for real
+at the next opportunity, not left there forever. This section is that
+verification: a second, genuine Bronze batch was produced, the predicted
+failure was reproduced exactly, and it was fixed for real.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+A library receives new book donations every week, and logs each week's
+donations as its own spreadsheet file, named by the date received. A
+librarian who wants a single count of *all* donated books ever needs to
+open every dated spreadsheet and add them together — not just the most
+recent one. If, instead, half the spreadsheets were named by date
+(`2026-01-05.xlsx`) and the other half were named by donor batch number
+(`batch-014.xlsx`), a tool that tries to "smart-detect" a naming pattern
+across the whole folder at once could get confused about what the
+filenames even mean — exactly the situation Bronze `clicks` is in, with
+two genuinely different naming schemes for two genuinely different kinds
+of object.
+
+### URL Shortener Example
+
+A real, second batch of `clicks` activity was produced for this project,
+step by step, all genuinely run:
+
+1. `make seed-more-clicks` inserted 200 new, real rows into this
+   sandbox's real Postgres `clicks` table — ids 5004 through 5203,
+   `occurred_at` timestamps in the last few hours (not the original
+   batch's 0-9 day spread), using the same Faker/random conventions
+   `seed_sample_data.py` already established, with its own documented
+   seed (`scripts/seed_more_clicks.py`, `SEED = 43`).
+2. `make write-local-bronze-clicks-incremental` read the watermark
+   directly from the existing full-load Bronze snapshot's own real max
+   `id` (5003 — not hardcoded, not assumed), called the real, unmodified
+   `extract_incremental("clicks", engine, watermark=5003)`, got back
+   exactly the 200 new rows, and wrote them to
+   `data/bronze/clicks/incremental/watermark_start=000000005003/watermark_end=000000005203/clicks.parquet`
+   — the real, exact key `build_bronze_incremental_key` computes.
+3. With both objects now on disk, the naive read this project had always
+   *intended* to eventually run —
+   `spark.read.parquet("data/bronze/clicks")`, the whole table's
+   directory — was tried for real, and genuinely failed:
+
+```
+AssertionError: assertion failed: Conflicting directory structures detected. Suspicious paths:
+	file:/.../data/bronze/clicks
+	file:/.../data/bronze/clicks/incremental
+
+If provided paths are partition directories, please set "basePath" in the
+options of the data source to specify the root directory of the table. If
+there are multiple root directories, please load them separately and then
+union them.
+```
+
+This is a genuine Spark `AssertionError`, not a typed-up example — Spark's
+own partition-discovery code tried to infer one consistent partition
+schema across `ingestion_date=2026-09-20` (the full-load object's parent
+directory) and `incremental/watermark_start=.../watermark_end=...` (the
+incremental object's parent directory) at once, found the two structurally
+incompatible, and refused to guess — exactly Section 38.7's prediction,
+now genuinely reproduced.
+
+### 39.2 Architecture
+
+```mermaid
+flowchart TD
+    FullLoad[(Bronze clicks full-load<br/>ingestion_date=2026-09-20/clicks.parquet<br/>5,003 rows)]
+    Incr[(Bronze clicks incremental<br/>watermark_start=5003/watermark_end=5203/clicks.parquet<br/>200 rows)]
+    List[list_local_bronze_files<br/>real glob, both objects found]
+    ReadEach["Each file read EXPLICITLY<br/>spark.read.parquet(str(file))<br/>-- no directory-level read, ever"]
+    Union[unionByName<br/>-- narrow, no shuffle -- see 39.7]
+    Clean[clean_clicks -- Section 38, unchanged]
+    Silver[(Silver clicks<br/>5,203 rows, 0 dropped)]
+
+    FullLoad --> List
+    Incr --> List
+    List --> ReadEach
+    ReadEach --> Union
+    Union --> Clean
+    Clean --> Silver
+```
+
+**Readable ASCII equivalent:**
+
+```
+data/bronze/clicks/ingestion_date=2026-09-20/clicks.parquet    (5,003 rows)
+data/bronze/clicks/incremental/watermark_start=.../clicks.parquet  (200 rows)
+    |                                              |
+    | list_local_bronze_files() finds both, sorted
+    v                                              v
+spark.read.parquet(file_1)              spark.read.parquet(file_2)
+    |  (each read explicitly by its own path --      |
+    |   NEVER spark.read.parquet(parent_directory))   |
+    v                                              v
+              unionByName  (narrow -- 39.7's real EXPLAIN confirms no shuffle)
+                            |
+                            v
+                      clean_clicks()   (Section 38, completely unchanged)
+                            |
+                            v
+              data/silver/clicks/  (5,203 rows, 0 dropped -- 39.6)
+```
+
+### 39.3 Design Decision: read each Bronze object explicitly, never the parent directory
+
+**Context:** the naive, "obvious" read (`spark.read.parquet(bronze_root / "clicks")`)
+genuinely fails once Bronze has more than one object for a table with
+different partitioning schemes (39.1's real, reproduced error).
+**Decision:** `list_local_bronze_files` (new, in `analytics_transform.config`)
+finds every real `*.parquet` file for a table via a plain filesystem
+glob; `read_bronze_clicks` (new, in `transform_clicks.py`) reads each one
+*individually* (`spark.read.parquet(str(single_file_path))`) and unions
+the results with `unionByName`. **Alternatives considered:** (1) Spark's
+own `.option("basePath", ...)` mechanism, which exists specifically to
+tell the partition-discovery code where a table's "root" is — rejected
+after checking what it actually does: `basePath` tells Spark where to
+*start* inferring partition columns from, but it does not reconcile two
+genuinely different partition column sets (`ingestion_date` vs.
+`watermark_start`/`watermark_end`) into one schema; the two Bronze
+partitioning schemes aren't a "where's the root" problem, they're a
+"these are structurally different tables of partition columns" problem,
+which `basePath` doesn't solve. (2) Changing Bronze's own key formats
+(Sections 14/15) so both load types share one consistent partitioning
+scheme — rejected as a much larger, riskier change: it would mean
+editing already-committed, already-tested Phase 1 production code
+(`build_bronze_key`/`build_bronze_incremental_key`) for a Phase 2 reading
+convenience, when the reading side can be fixed on its own instead.
+**Trade-offs:** explicit-file reads mean this component now needs *some*
+way to enumerate Bronze's real objects (`list_local_bronze_files`) rather
+than relying on Spark's built-in directory listing — a real, small,
+additional piece of code to maintain, in exchange for correctness that
+doesn't depend on Bronze's two key formats ever becoming compatible with
+each other. **Consequences:** `list_local_bronze_files` is explicitly
+named as the local-filesystem analog of `object_store.py`'s real
+`list_bronze_keys` (Section 17) — the real production equivalent, once
+real MinIO/S3 is reachable (ADR-016), is a straightforward swap to that
+existing, already-tested function plus the same per-object-then-union
+read pattern this section establishes; nothing about `clean_clicks` or
+the union strategy needs to change.
+
+This design decision is recorded as **[ADR-017](#adr-017-explicit-per-object-bronze-reads-never-a-directory-level-read-across-mixed-partition-schemes)**
+in Section 29's consolidated ADR list, alongside ADR-016.
+
+### Alternatives
+
+Covered in 39.3.
+
+### Trade-offs
+
+| | Explicit per-file read + union (chosen) | Directory-level read | `basePath` option |
+|---|---|---|---|
+| Works with Bronze's two real partitioning schemes present together | Yes — genuinely verified (39.6) | No — genuine `AssertionError` (39.1) | No — doesn't reconcile different partition-column sets, only relocates the discovery root |
+| Requires enumerating Bronze's real objects some other way | Yes (`list_local_bronze_files`) | No (Spark does it, then fails) | No (Spark does it, still fails for this reason) |
+| Changes Bronze's own key formats (Sections 14/15) | No | No | No |
+| Extra code to maintain | One small listing function | None | One extra `.option(...)` call |
+
+### 39.4 Implementation
+
+---
+
+**CREATE:** `scripts/seed_more_clicks.py` — a second, real batch of
+`clicks` rows
+
+**PURPOSE:** Real new activity for Silver to actually have something
+incremental to consume — without this, "read Bronze's incremental object
+too" would have nothing real behind it.
+
+**IMPLEMENTATION GUIDE (write it yourself):** same Faker/`random`
+pattern as `seed_sample_data.py`, called a second time with its own
+documented seed (`SEED = 43`, not a reuse of `42`) so this batch is
+reproducible independently; `occurred_at` drawn from the last few hours
+(`now - timedelta(minutes=random.randint(0, 180))`), not the original
+seed's 0-9 day spread, so the new batch reads as "what happened since",
+not a second copy of the same historical window.
+
+**REFERENCE IMPLEMENTATION:** see the real, current
+[`seed_more_clicks.py`](../scripts/seed_more_clicks.py).
+
+**RUN:** `make seed-more-clicks`
+
+**EXPECTED / ACTUAL OBSERVED** (genuinely run in this sandbox):
+
+```
+clicks before: 5003 rows, max id 5003
+inserting 200 new clicks ...
+clicks after: 5203 rows, max id 5203
+new rows: 200 (ids 5004..5203)
+```
+
+---
+
+**CREATE:** `scripts/write_local_bronze_clicks_incremental.py` — real
+incremental Bronze `clicks` batch, written locally
+
+**PURPOSE:** The second Bronze object type this section needs, produced
+the same ADR-016 way `write_local_bronze_clicks.py` produces the first
+(real extraction, local write, no real MinIO available).
+
+**IMPLEMENTATION GUIDE (write it yourself):** read the watermark from the
+existing full-load Bronze snapshot's own real max `id` (glob for
+`ingestion_date=*/clicks.parquet`, read its `id` column, take the max) —
+not a hardcoded number, so the watermark is always traceable to what
+Bronze itself actually contains; call the real, unmodified
+`extract_incremental("clicks", engine, watermark)`; if the result is
+empty, log and exit cleanly rather than writing an empty object (mirrors
+`run_incremental_load`'s own real empty-batch handling, Section 15); on a
+non-empty result, compute the target key with the real
+`build_bronze_incremental_key(table_name, watermark, new_watermark)` and
+write it locally, same Parquet serialization as
+`write_local_bronze_clicks.py`.
+
+**REFERENCE IMPLEMENTATION:** see the real, current
+[`write_local_bronze_clicks_incremental.py`](../scripts/write_local_bronze_clicks_incremental.py).
+
+**RUN:** `make write-local-bronze-clicks-incremental`
+
+**EXPECTED / ACTUAL OBSERVED** (genuinely run in this sandbox):
+
+```
+watermark read from existing full-load bronze snapshot: 5003
+extracting table (incremental load): clicks, watermark=5003
+extraction complete: rows=200, table=clicks, watermark=5003
+wrote local incremental bronze clicks batch: bytes=21986 rows=200
+  path='.../data/bronze/clicks/incremental/watermark_start=000000005003/watermark_end=000000005203/clicks.parquet'
+```
+
+---
+
+**CREATE:** `transformations/src/analytics_transform/config.py` (edit) —
+`list_local_bronze_files`; `transformations/src/analytics_transform/silver/transform_clicks.py`
+(edit) — `read_bronze_clicks`, `run_silver_clicks_job` updated to use it
+
+**PURPOSE:** The real fix: enumerate every real Bronze object for a
+table, read each one explicitly, union them — see 39.3's Design
+Decision for the full reasoning.
+
+**IMPLEMENTATION GUIDE (write it yourself):** `list_local_bronze_files(bronze_root, table_name)`
+is `sorted((bronze_root / table_name).glob("**/*.parquet"))` — a plain
+filesystem glob, the local analog of `object_store.py`'s real
+`list_bronze_keys`. `read_bronze_clicks(spark, bronze_root)` calls it,
+raises `FileNotFoundError` with a clear message if nothing is found
+(there's no honest default DataFrame to return instead), reads each
+returned path individually, and combines them with
+`functools.reduce(lambda a, b: a.unionByName(b), dataframes)`.
+`run_silver_clicks_job`'s signature changes from taking a `bronze_path:
+str` to a `bronze_root: Path`, calling `read_bronze_clicks` instead of
+`spark.read.parquet(bronze_path)` directly — everything downstream
+(`clean_clicks`, the write, the stats dict) is unchanged.
+
+**REFERENCE IMPLEMENTATION:** see the real, current
+[`config.py`](../transformations/src/analytics_transform/config.py) and
+[`transform_clicks.py`](../transformations/src/analytics_transform/silver/transform_clicks.py).
+
+**RUN:** `make transform-silver-clicks` (now reads every Bronze clicks
+object it finds, not just one).
+
+**TEST:** `transformations/tests/unit/test_config.py` (new — 3 tests for
+`list_local_bronze_files`); `transformations/tests/unit/test_transform_clicks.py`
+(2 new tests for `read_bronze_clicks`, including the real regression test
+for this section's fix — see 39.6).
+
+---
+
+### 39.5 How to Run
+
+```bash
+make write-local-bronze-clicks               # if not already done (Section 38)
+make seed-more-clicks                         # real, new clicks rows
+make write-local-bronze-clicks-incremental    # real incremental Bronze batch
+make transform-silver-clicks                  # now reads BOTH Bronze objects
+```
+
+### 39.6 How to Verify — ACTUAL OBSERVED results
+
+**The real failure, reproduced** (before this section's fix — genuinely
+run against both real Bronze objects, in this sandbox):
+
+```
+$ python3 -c "spark.read.parquet('data/bronze/clicks')..."
+FAILED: Py4JJavaError ... AssertionError: assertion failed: Conflicting
+directory structures detected. Suspicious paths:
+	file:/.../data/bronze/clicks
+	file:/.../data/bronze/clicks/incremental
+```
+
+**The real fix, verified directly** — reading each file by its own
+explicit path adds no stray partition column at all (unlike the
+directory-level read Section 38.7 first found):
+
+```
+$ python3 -c "spark.read.parquet('data/bronze/clicks/ingestion_date=.../clicks.parquet').printSchema()"
+root
+ |-- id: long (nullable = true)
+ |-- short_code: string (nullable = true)
+ |-- occurred_at: timestamp (nullable = true)
+ |-- device_type: string (nullable = true)
+ |-- hashed_ip: string (nullable = true)
+ |-- user_id: double (nullable = true)
+```
+
+— no `ingestion_date` column this time; the incremental file, read the
+same explicit way, shows the identical six-column schema, so
+`unionByName` needs no reconciliation between them at all.
+
+**New unit tests, all real, all passing:**
+
+```bash
+$ PYTHONPATH=ingestion/src:transformations/src python3 -m pytest transformations/tests/unit -v
+...
+test_config.py::test_finds_both_full_load_and_incremental_files PASSED
+test_config.py::test_returns_empty_list_when_table_has_no_bronze_files PASSED
+test_config.py::test_ignores_other_tables PASSED
+...
+test_transform_clicks.py::test_read_bronze_clicks_unions_full_load_and_incremental PASSED
+test_transform_clicks.py::test_read_bronze_clicks_raises_clear_error_when_nothing_exists PASSED
+...
+15 passed, 2 warnings in 12.50s
+```
+
+The `test_read_bronze_clicks_unions_full_load_and_incremental` test is
+this section's real regression test — it genuinely failed on the first
+attempt (counted 4 rows instead of 2), which turned out to be a real bug
+in the *test's own fixture*, not the fix: writing test data with Spark's
+`.write.parquet(...)` creates a *directory* of part-files at the given
+path, not a single file — unlike the real production scripts, which write
+genuine single Parquet files via `pyarrow` directly. `list_local_bronze_files`'s
+glob matched both the directory Spark created and the part-file inside
+it, double-counting every row. Fixed by writing the test fixture with
+`pyarrow` directly, matching what the real scripts actually produce — a
+real, small lesson (kept in the test file's own comment) about a test
+fixture needing to match production reality, not just pytest's most
+convenient way to write data.
+
+**The real end-to-end run, both Bronze objects present:**
+
+```bash
+$ make transform-silver-clicks
+{'bronze_rows': 5203, 'silver_rows': 5203, 'dropped_rows': 0}
+```
+
+5,003 (full-load) + 200 (incremental) = 5,203 — correct, and 0 dropped
+(same reasoning as Section 38.6: this project's real seeded data already
+satisfies its own contract).
+
+**A real detail worth naming explicitly, caught while verifying this**:
+Silver's output this time landed as **two** Parquet part-files, not one:
+
+```bash
+$ ls data/silver/clicks/*.parquet
+part-00000-....snappy.parquet   (200 rows)
+part-00001-....snappy.parquet   (5,003 rows)
+```
+
+This is correct, expected Spark behavior, not a bug — `unionByName`
+combines two DataFrames that each started as their own single-partition
+read, and Spark's write stage writes one output file per partition by
+default (no `.repartition()`/`.coalesce()` call was added, since nothing
+about correctness required one at this data volume). The two files
+together hold exactly 5,203 rows — verifying this required summing
+*every* file's row count, not just reading the first one found by a glob
+(an easy mistake to make while checking this, caught and corrected before
+writing this number down).
+
+**Idempotency, genuinely re-checked** with both Bronze objects present:
+running `make transform-silver-clicks` twice in a row produced identical
+`{'bronze_rows': 5203, 'silver_rows': 5203, 'dropped_rows': 0}` output
+both times, and still exactly two Silver part-files after the second run
+— `overwrite` mode's idempotency guarantee (Section 38.6) holds with
+multiple Bronze inputs, not just one.
+
+**Real execution plan** — confirming the union itself adds no shuffle:
+
+```
+== Physical Plan ==
+Union (11)
+:- * Project (5)
+:  +- * Project (4)
+:     +- * Filter (3)
+:        +- * ColumnarToRow (2)
+:           +- Scan parquet  (1)   <- reads the incremental file
++- * Project (10)
+   +- * Project (9)
+      +- * Filter (8)
+         +- * ColumnarToRow (7)
+            +- Scan parquet  (6)   <- reads the full-load file
+```
+
+No `Exchange` node anywhere in this plan — `Union` here is exactly as
+narrow as Section 37.1 predicted a union of two independently-computable
+branches would be: each branch reads and cleans its own file completely
+independently, and `Union` simply concatenates the two branches' output
+partitions, with no data ever needing to move between them.
+
+**Phase 1's full unit suite, re-run unchanged:** `80 passed` — this
+section's changes touched nothing outside `transformations/`.
+
+**Lint:** `ruff check transformations/ scripts/write_local_bronze_clicks.py
+scripts/write_local_bronze_clicks_incremental.py scripts/seed_more_clicks.py`
+— ACTUAL OBSERVED: `All checks passed!`.
+
+### 39.7 Failure Scenario
+
+**This section fixed reading a full-load object and an incremental
+object together. What happens if a table's full-load snapshot is
+re-taken on a *later* day, while an incremental object from an earlier
+day still exists?**
+
+This was tested directly, not just reasoned about, specifically because
+this section's whole premise is verifying predictions rather than leaving
+them as DESIGN EXPECTATIONS: a second, "tomorrow-dated" full-load Bronze
+object was genuinely written (`ingestion_date=2026-09-21/clicks.parquet`,
+containing all 5,203 rows that existed in Postgres at that point — a full
+load always re-reads everything, per Section 14), left alongside the
+original `ingestion_date=2026-09-20` object (5,003 rows) and the
+incremental object (200 rows), and `make transform-silver-clicks` was run
+against all three at once. The real result: **10,406 rows** — every one
+of `clicks`' 5,203 real ids counted twice (ids 1-5,003 appear in *both*
+full-load objects; ids 5,004-5,203 appear in *both* the incremental
+object and the newer full-load object, which already contains
+everything). This is a genuine duplication bug, reproduced on purpose,
+not a hypothetical — `read_bronze_clicks` unions *every* file it finds
+with no awareness that a full load's own semantics ("this is the entire
+table, right now") make it inherently incompatible with also including
+an *older* full-load snapshot or an incremental batch the newer snapshot
+has already superseded. **This is exactly the gap deduplication (Section
+41, planned) exists to close** — today, this component's correctness
+silently depends on an assumption that isn't yet enforced anywhere in
+code: at most one full-load Bronze object exists for a table at a time.
+The test object was removed after this was confirmed, restoring this
+project's real Bronze layout to its correct, current, two-object state
+(5,003 + 200 = 5,203) — but the finding itself, and the gap it reveals,
+is kept here rather than quietly reset away with the test data.
+
+### 39.8 Production Considerations
+
+| Aspect | This repo (POC, this sandbox) | Production |
+|---|---|---|
+| Bronze object discovery | `list_local_bronze_files`: filesystem glob | `object_store.py`'s real `list_bronze_keys` (Section 17) — already built, already tested, swaps in directly |
+| Multiple full-load snapshots for one table | Not handled — 39.7's real, reproduced duplication bug | Section 41's deduplication, or a retention policy that only ever keeps the latest full-load object per table |
+| Every Silver run re-reads all history | Yes — no incremental Silver state yet; fine at this project's real row count (5,203) | Needs incremental transformation (Section 47, planned) once Bronze's total object count/row count makes a full re-read from scratch genuinely expensive |
+| Partition-scheme mismatch across load types | Fixed at the read layer (this section) | Same fix, or a longer-term move to one consistent Bronze partitioning convention across load types (a larger, deliberately-deferred change — see 39.3's Alternatives) |
+
+### Principal Data Engineer Perspective
+
+The real discipline worth naming here is what happened between Section
+38 and this one: Section 38.8 named a real, reasoned, *unverified*
+prediction and explicitly labeled it as such rather than either ignoring
+it or overstating it as already handled. This section is the verification
+— not a hypothetical "here's what would happen," but a genuinely
+reproduced failure, a genuine fix, and (39.7) a genuinely reproduced
+*second* failure mode that the fix does not yet cover, found by actually
+testing the fix's own edge case rather than assuming it was complete
+because the first, expected scenario now passed. A Principal Engineer's
+job in exactly this situation is resisting the pull to declare victory
+the moment the originally-predicted failure is fixed — the honest
+next question is always "what does this fix *not* yet handle," and 39.7
+exists because that question was actually asked and actually tested,
+not left as an assumption.
+
+### 39.9 Principal Engineer Interview Questions
+
+**Q (Category: Distributed Systems / Spark Internals): "You're reading a
+partitioned dataset from cloud storage and Spark throws a 'Conflicting
+directory structures detected' error. What's actually happening, and how
+do you fix it?"**
+
+*What's tested:* whether the candidate understands Spark's Hive-style
+partition discovery mechanism concretely enough to diagnose a real error
+message, not just recognize it as "some kind of Spark issue."
+
+*What a weak answer looks like:* "Just add `basePath` to the read
+options" — a real Spark error-message suggestion, repeated without
+understanding whether it actually applies to the specific cause.
+
+*What a strong answer covers:* Spark's Parquet reader, given a
+*directory*, tries to infer partition columns from the directory-name
+segments below it (`key=value` patterns) so it can add them as real
+columns automatically. This fails specifically when the directories
+found don't share one consistent partition-column structure — this
+project's own real, concrete case: `ingestion_date=2026-09-20` (one
+partition column) vs. `incremental/watermark_start=.../watermark_end=...`
+(two *different* partition columns, nested one level deeper). `basePath`
+only helps when the mismatch is about *where* to start inferring from,
+not when the partition-column sets themselves are genuinely
+incompatible — the real, tested fix here was reading each object by its
+own explicit file path (bypassing partition discovery entirely) and
+unioning the results in code.
+
+*Concepts:* Hive-style partition discovery; the difference between "wrong
+root path" and "structurally incompatible partition schemes"; explicit
+enumeration + union as a general-purpose escape hatch when a data
+source's directory structure doesn't fit one inferred schema.
+
+*Expected follow-up:* "How would you detect this kind of mismatch before
+it reaches production, rather than at read time?" — A real test with
+fixtures matching production's actual object layout (both partitioning
+schemes present at once), the same regression test this section actually
+added — not a unit test on synthetic data alone, since the bug here was
+specifically about *directory structure*, something a purely in-memory
+DataFrame test can't exercise at all.
+
+*Common mistake:* treating every Spark partition-discovery error as
+solvable by `basePath` without first checking whether the actual
+partition-column sets across the directories in question are even
+compatible with each other.
+
+**Q (Category: Data Quality / Correctness Judgment): "Your fix correctly
+unions a full-load Bronze object and an incremental one. What happens if
+someone re-runs the full load a week later, while the old incremental
+object is still sitting there?"**
+
+*What's tested:* whether the candidate proactively reasons about a
+fix's *boundary* — what it does and doesn't cover — rather than treating
+"the originally-reported bug is fixed" as the end of the analysis.
+
+*What a weak answer looks like:* "It should still work, since we're just
+reading and unioning files" — technically describes the mechanism, misses
+that unioning is not the same as *deduplicating*.
+
+*What a strong answer covers:* a full load, by definition, re-reads the
+*entire* source table — so a new full-load object and an older
+incremental object necessarily overlap on every row the incremental
+object already captured (and the older full-load object overlaps
+entirely with the newer one). A naive union — exactly what this
+project's `read_bronze_clicks` does today — double-counts every
+overlapping row, genuinely reproduced here (39.7: 10,406 rows instead of
+5,203). The real fix isn't at the read layer at all; it's deduplication,
+scoped to run *after* the union, keyed on `click_id`, keeping the
+most-recently-loaded version of any id that appears more than once — work
+this project has explicitly deferred to Section 41, not silently assumed
+away.
+
+*Concepts:* union vs. deduplication as genuinely different operations;
+full-load semantics ("this is everything, right now") as inherently
+overlapping with any incremental or older full-load data; verifying a
+fix's boundary by actually testing the next-most-likely scenario, not
+just the originally-reported one.
+
+*Expected follow-up:* "Where would you actually put deduplication in
+this pipeline — before or after `clean_clicks`?" — After: deduplication
+needs a clean, normalized `click_id` to key on (the exact column
+`clean_clicks`'s schema-normalization step produces), and doing it before
+would mean re-deriving that normalization logic a second time, or keying
+on the still-inconsistent raw `id`/type situation Section 38.1 already
+found and fixed once.
+
+*Common mistake:* assuming a fix that correctly resolves the reported
+failure mode has no other blind spots, rather than actively probing for
+the next adjacent scenario the same way this section's own 39.7 did.
 
 ---

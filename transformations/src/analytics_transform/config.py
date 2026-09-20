@@ -18,6 +18,28 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
+def list_local_bronze_files(bronze_root: Path, table_name: str) -> list[Path]:
+    """Every real Bronze Parquet file for `table_name`, full-load and
+    incremental objects together, sorted for a deterministic read order.
+
+    The local-filesystem analog of `object_store.py`'s `list_bronze_keys`
+    -- needed because ADR-016 means there's no real S3 `list_objects_v2`
+    call to make against this environment's Bronze layer. Callers should
+    read each returned path *individually* (`spark.read.parquet(str(f))`
+    per file, then union the results) rather than pointing Spark at
+    `bronze_root / table_name` directly -- see
+    docs/analytics-engineering-guide.md, Phase 2, Section 39, for the
+    real, observed reason: Spark's Hive-style partition discovery cannot
+    reconcile Bronze's two different partitioning schemes (full-load's
+    `ingestion_date=`, incremental's `watermark_start=`/`watermark_end=`)
+    in one directory-level read, and genuinely raises
+    `AssertionError: Conflicting directory structures detected` the
+    moment both exist under the same table's prefix at once.
+    """
+    table_root = bronze_root / table_name
+    return sorted(table_root.glob("**/*.parquet"))
+
 # transformations/src/analytics_transform/config.py -> repo root is 3
 # parents up (analytics_transform -> src -> transformations -> root).
 REPO_ROOT = Path(__file__).resolve().parents[3]

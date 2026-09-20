@@ -12,7 +12,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from analytics_transform.silver.transform_clicks import clean_clicks
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+from analytics_transform.silver.transform_clicks import clean_clicks, read_bronze_clicks
 from pyspark.sql import Row, SparkSession
 from pyspark.sql.types import (
     DoubleType,
@@ -127,3 +130,70 @@ def test_adds_silver_loaded_at_column(spark: SparkSession) -> None:
     silver_df = clean_clicks(_bronze_df(spark))
     assert "silver_loaded_at" in silver_df.columns
     assert all(row.silver_loaded_at is not None for row in silver_df.collect())
+
+
+# --- read_bronze_clicks: real files on disk, both Bronze partitioning
+# schemes at once. This is the real regression test for Section 39's
+# fix -- before it, spark.read.parquet() on the parent directory raised
+# a genuine AssertionError the moment both a full-load and an incremental
+# Bronze object existed under the same table's prefix (see
+# docs/analytics-engineering-guide.md, Phase 2, Section 39.6 for the real,
+# reproduced error text). These tests write real Parquet files to
+# pytest's tmp_path (not this repo's real data/ directory) and prove
+# read_bronze_clicks reads both without that error, and returns their
+# union.
+
+
+def _write_single_parquet_file(path, rows: list[dict]) -> None:
+    """Write one genuine, single-file Parquet object at `path` -- via
+    pyarrow directly, the same way the real production scripts
+    (scripts/write_local_bronze_clicks.py,
+    scripts/write_local_bronze_clicks_incremental.py) actually write
+    Bronze, and deliberately NOT via Spark's own `.write.parquet(...)`,
+    which always creates a *directory* of part-files rather than a single
+    file at the given path -- using that here would make this test's own
+    fixture unrealistic versus what real Bronze objects actually look
+    like on disk (this was tried first, and genuinely failed for exactly
+    this reason: `list_local_bronze_files`'s glob matched both the
+    directory Spark created and the part-file inside it, double-counting
+    every row -- a real lesson about matching the test fixture to
+    production reality, not a hypothetical concern)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    table = pa.Table.from_pylist(rows, schema=pa.schema([
+        pa.field("id", pa.int64()),
+        pa.field("short_code", pa.string()),
+        pa.field("occurred_at", pa.timestamp("us")),
+        pa.field("device_type", pa.string()),
+        pa.field("hashed_ip", pa.string()),
+        pa.field("user_id", pa.float64()),
+    ]))
+    pq.write_table(table, path)
+
+
+def test_read_bronze_clicks_unions_full_load_and_incremental(spark: SparkSession, tmp_path) -> None:
+    full_load_path = tmp_path / "clicks" / "ingestion_date=2026-09-20" / "clicks.parquet"
+    incremental_path = (
+        tmp_path / "clicks" / "incremental" / "watermark_start=000000000001"
+        / "watermark_end=000000000002" / "clicks.parquet"
+    )
+    _write_single_parquet_file(
+        full_load_path,
+        [{"id": 1, "short_code": "aaa111", "occurred_at": TS, "device_type": "mobile", "hashed_ip": None, "user_id": None}],
+    )
+    _write_single_parquet_file(
+        incremental_path,
+        [{"id": 2, "short_code": "bbb222", "occurred_at": TS, "device_type": "desktop", "hashed_ip": None, "user_id": None}],
+    )
+
+    # The real regression: this must NOT raise
+    # "AssertionError: Conflicting directory structures detected."
+    bronze_df = read_bronze_clicks(spark, tmp_path)
+
+    assert bronze_df.count() == 2
+    assert set(bronze_df.columns) == set(BRONZE_CLICKS_SCHEMA.fieldNames())
+    assert {row.id for row in bronze_df.collect()} == {1, 2}
+
+
+def test_read_bronze_clicks_raises_clear_error_when_nothing_exists(spark: SparkSession, tmp_path) -> None:
+    with pytest.raises(FileNotFoundError, match="no bronze clicks files found"):
+        read_bronze_clicks(spark, tmp_path)

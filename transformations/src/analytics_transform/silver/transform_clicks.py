@@ -29,13 +29,15 @@ anywhere for review), and any dimension-key join (`url_key`/`user_key`/
 from __future__ import annotations
 
 import argparse
+import functools
 import logging
+from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import LongType, StringType, TimestampType
 
-from analytics_transform.config import get_transform_settings
+from analytics_transform.config import get_transform_settings, list_local_bronze_files
 
 logger = logging.getLogger(__name__)
 
@@ -87,19 +89,16 @@ def clean_clicks(bronze_df: DataFrame) -> DataFrame:
         .filter((F.col("short_code").isNotNull()) & (F.length(F.col("short_code")) > 0))
         .withColumn("silver_loaded_at", F.current_timestamp())
         # --- explicit output schema ---
-        # Spark's parquet reader auto-discovers Hive-style partition
-        # columns from the *directory* names it reads (see
-        # run_silver_clicks_job's docstring): reading
-        # bronze/clicks/ingestion_date=2026-09-20/clicks.parquet adds an
-        # `ingestion_date` column that isn't in the Parquet file itself,
-        # and doesn't exist on an incremental Bronze read at all (those
-        # objects partition by `watermark_start=`/`watermark_end=`
-        # instead -- object_store.py's build_bronze_incremental_key). This
-        # final .select() is deliberate, not incidental: it fixes Silver's
-        # column set regardless of which partitioning scheme the Bronze
-        # read picked up, so Silver clicks has one stable schema no matter
-        # which Bronze objects fed it. See Section 38's Failure Scenario
-        # for what breaks if this line is removed.
+        # A deliberate, explicit contract for Silver clicks' column set,
+        # independent of whatever columns happened to come out of the
+        # Bronze read -- kept even though read_bronze_clicks (below) no
+        # longer lets a stray partition column reach this function at all
+        # (Section 39 fixed that at the read layer, by reading each
+        # Bronze object explicitly rather than as one directory -- see
+        # that function's docstring for the real, observed reason).
+        # Defense-in-depth: if a future Bronze object ever carries an
+        # unexpected extra column for some other reason, this still keeps
+        # Silver's output schema exactly seven columns, always.
         .select(
             "click_id", "short_code", "occurred_at", "device_type",
             "hashed_ip", "user_id", "silver_loaded_at",
@@ -107,14 +106,52 @@ def clean_clicks(bronze_df: DataFrame) -> DataFrame:
     )
 
 
-def run_silver_clicks_job(spark: SparkSession, bronze_path: str, silver_path: str) -> dict[str, int]:
-    """Read Bronze clicks Parquet, clean it, write Silver clicks Parquet.
-    Returns real counts (bronze rows read, silver rows written, rows
-    dropped) -- this is the dict the CLI entrypoint prints, and the
-    numbers the guide's "How to Verify" section shows are the actual
-    output of running this function, not typed-up estimates.
+def read_bronze_clicks(spark: SparkSession, bronze_root: Path) -> DataFrame:
+    """Read every real Bronze `clicks` object -- full-load and
+    incremental batches together -- as one unioned DataFrame.
+
+    Reads each file returned by `list_local_bronze_files` *individually*
+    (`spark.read.parquet(str(f))` per file) and unions the results, rather
+    than calling `spark.read.parquet(bronze_root / "clicks")` once on the
+    parent directory. This is not a style preference -- pointing Spark at
+    the directory genuinely fails, the moment both a full-load object
+    (`ingestion_date=.../clicks.parquet`) and an incremental object
+    (`incremental/watermark_start=.../watermark_end=.../clicks.parquet`)
+    exist under it at once:
+
+        AssertionError: Conflicting directory structures detected.
+        ... If provided paths are partition directories, please set
+        "basePath" in the options ... If there are multiple root
+        directories, please load them separately and then union them.
+
+    -- a real, genuinely-reproduced error (see
+    docs/analytics-engineering-guide.md, Phase 2, Section 39.6),
+    triggered by Spark's own Hive-style partition-column discovery
+    trying, and failing, to reconcile Bronze's two different partitioning
+    schemes (Section 14's `ingestion_date=`, Section 15's
+    `watermark_start=`/`watermark_end=`) as one table. Reading each file
+    by its own explicit path sidesteps partition discovery entirely --
+    verified directly (Section 39.6 again): neither file gains a stray
+    `ingestion_date` or `watermark_start`/`watermark_end` column when read
+    this way, so the two DataFrames' schemas already match and
+    `unionByName` needs no further reconciliation.
     """
-    bronze_df = spark.read.parquet(bronze_path)
+    files = list_local_bronze_files(bronze_root, "clicks")
+    if not files:
+        raise FileNotFoundError(f"no bronze clicks files found under {bronze_root / 'clicks'}")
+
+    dataframes = [spark.read.parquet(str(f)) for f in files]
+    return functools.reduce(lambda left, right: left.unionByName(right), dataframes)
+
+
+def run_silver_clicks_job(spark: SparkSession, bronze_root: Path, silver_path: str) -> dict[str, int]:
+    """Read every real Bronze clicks object, clean it, write Silver
+    clicks Parquet. Returns real counts (bronze rows read, silver rows
+    written, rows dropped) -- this is the dict the CLI entrypoint prints,
+    and the numbers the guide's "How to Verify" section shows are the
+    actual output of running this function, not typed-up estimates.
+    """
+    bronze_df = read_bronze_clicks(spark, bronze_root)
     bronze_count = bronze_df.count()
 
     silver_df = clean_clicks(bronze_df)
@@ -136,12 +173,11 @@ def main() -> None:
     parser.parse_args()
 
     settings = get_transform_settings()
-    bronze_path = str(settings.bronze_root / "clicks")
     silver_path = str(settings.silver_root / "clicks")
 
     spark = SparkSession.builder.appName("silver-clicks").master("local[*]").getOrCreate()
     try:
-        stats = run_silver_clicks_job(spark, bronze_path, silver_path)
+        stats = run_silver_clicks_job(spark, settings.bronze_root, silver_path)
         print(stats)
     finally:
         spark.stop()

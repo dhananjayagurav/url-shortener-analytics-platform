@@ -1,4 +1,4 @@
-.PHONY: venv install install-transform up down logs ps db-shell ingest ingest-full create-analytics-schema validate-contracts check-stale-runs reconcile-bronze storage-stats benchmark-parquet benchmark-query-performance benchmark-extraction-time layout-report ingestion-history ingestion-summary pii-report test test-integration test-transform coverage lint fmt seed write-local-bronze-clicks transform-silver-clicks
+.PHONY: venv install install-transform up down logs ps db-shell ingest ingest-full create-analytics-schema validate-contracts check-stale-runs reconcile-bronze storage-stats benchmark-parquet benchmark-query-performance benchmark-extraction-time layout-report ingestion-history ingestion-summary pii-report test test-integration test-transform coverage lint fmt seed write-local-bronze-clicks write-local-bronze-clicks-incremental seed-more-clicks transform-silver-clicks
 
 venv:
 	python3.12 -m venv .venv
@@ -125,7 +125,21 @@ fmt:
 write-local-bronze-clicks:
 	PYTHONPATH=ingestion/src python3 scripts/write_local_bronze_clicks.py
 
-# See docs/analytics-engineering-guide.md, Phase 2, Section 38. Requires
-# write-local-bronze-clicks to have been run at least once first.
+# See docs/analytics-engineering-guide.md, Phase 2, Section 39. Inserts a
+# real, second batch of clicks rows into Postgres, simulating activity
+# that happened after the full-load snapshot above.
+seed-more-clicks:
+	PYTHONPATH=ingestion/src python3 scripts/seed_more_clicks.py
+
+# See docs/analytics-engineering-guide.md, Phase 2, Section 39. Requires
+# write-local-bronze-clicks (for its watermark) and, for a non-empty
+# result, seed-more-clicks to have been run first.
+write-local-bronze-clicks-incremental:
+	PYTHONPATH=ingestion/src python3 scripts/write_local_bronze_clicks_incremental.py
+
+# See docs/analytics-engineering-guide.md, Phase 2, Section 38 and 39.
+# Requires write-local-bronze-clicks to have been run at least once
+# first; reads every Bronze clicks object it finds (full-load and
+# incremental together, per Section 39).
 transform-silver-clicks:
 	PYTHONPATH=ingestion/src:transformations/src python3 transformations/src/analytics_transform/silver/transform_clicks.py
