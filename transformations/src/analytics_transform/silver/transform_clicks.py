@@ -20,10 +20,15 @@ why each of these, and only these, belong here):
    dropped (those three are not recoverable -- there's no default that
    makes a click event meaningful without them).
 
-Explicitly NOT here yet: deduplication, SCD, a full data-quality
-quarantine framework (bad rows are coerced/dropped in place, not routed
-anywhere for review), and any dimension-key join (`url_key`/`user_key`/
-`device_key`/`date_key` -- that's Gold's job, a later Phase 2 milestone).
+Section 40 added deduplication (`deduplicate_clicks`, below) -- see
+docs/analytics-engineering-guide.md, Phase 2, Section 40, for the full
+write-up, including why plain key-based dedup (not "pick the freshest
+value") is correct for this specific table.
+
+Explicitly NOT here yet: SCD, a full data-quality quarantine framework
+(bad rows are coerced/dropped in place, not routed anywhere for review),
+and any dimension-key join (`url_key`/`user_key`/`device_key`/`date_key`
+-- that's Gold's job, a later Phase 2 milestone).
 """
 
 from __future__ import annotations
@@ -106,6 +111,57 @@ def clean_clicks(bronze_df: DataFrame) -> DataFrame:
     )
 
 
+def deduplicate_clicks(silver_df: DataFrame) -> DataFrame:
+    """Drop duplicate `click_id`s, keeping exactly one row per id.
+
+    Exists to close a real, reproduced bug (Section 39.7): once more than
+    one Bronze full-load snapshot of `clicks` coexists on disk (e.g. two
+    separate full-load runs, both still present under
+    `bronze/clicks/ingestion_date=.../`), `read_bronze_clicks`'s union
+    legitimately contains the *same* click_id more than once -- Spark has
+    no way to know that on its own, since nothing before this function
+    de-conflicts Bronze objects by content, only by which files exist on
+    disk (Section 39's `list_local_bronze_files`).
+
+    Plain `.dropDuplicates(["click_id"])` -- keep any one copy, not
+    specifically "the newest one" -- is deliberately sufficient here,
+    which is NOT true of every table. It relies on a real, already-stated
+    contract fact: `contracts/source/clicks.yaml`'s `quality_rules` say
+    "id is monotonically increasing" and "rows are never UPDATEd or
+    DELETEd after insert" -- clicks are insert-only/immutable at the
+    source. So two Bronze copies of the same click_id are guaranteed
+    byte-identical in every business column; there is no "freshest
+    version" to pick between, because the row never changes after it's
+    first written. (Contrast this with a mutable table like `urls`, where
+    two Bronze copies of the same row *can* legitimately differ --
+    `title` or `is_active` can change between snapshots -- and a
+    freshest-wins strategy, e.g. `row_number() OVER (PARTITION BY id
+    ORDER BY silver_loaded_at DESC)`, would be required instead. That's
+    future work for whichever Phase 2 section builds Silver `urls`, not
+    handled here.)
+
+    Called on the already-cleaned (Silver-shaped) DataFrame, not the raw
+    Bronze DataFrame -- see run_silver_clicks_job below for why: keeping
+    "rows dropped for being invalid" and "rows dropped for being
+    duplicates" as two separate, independently-explainable counts is
+    only possible if this runs after clean_clicks, on the `click_id`
+    column clean_clicks already produced (Bronze's raw `id` column no
+    longer exists by this point).
+
+    This is the pipeline's first WIDE transformation: dropDuplicates
+    requires a shuffle to co-locate every row sharing a click_id onto the
+    same partition before Spark can tell which copies are duplicates --
+    unlike `read_bronze_clicks`'s `unionByName` (narrow, Section 39.7) or
+    `clean_clicks`'s per-row `.withColumn`/`.filter` calls (all narrow).
+    See docs/analytics-engineering-guide.md, Phase 2, Section 40.7, for a
+    real, captured `EXPLAIN (formatted)` showing the `Exchange` node this
+    introduces -- and the honest correction to Section 37.7, which
+    predicted the first shuffle wouldn't happen until the Gold-layer
+    dimension join (Section 43).
+    """
+    return silver_df.dropDuplicates(["click_id"])
+
+
 def read_bronze_clicks(spark: SparkSession, bronze_root: Path) -> DataFrame:
     """Read every real Bronze `clicks` object -- full-load and
     incremental batches together -- as one unioned DataFrame.
@@ -145,24 +201,42 @@ def read_bronze_clicks(spark: SparkSession, bronze_root: Path) -> DataFrame:
 
 
 def run_silver_clicks_job(spark: SparkSession, bronze_root: Path, silver_path: str) -> dict[str, int]:
-    """Read every real Bronze clicks object, clean it, write Silver
-    clicks Parquet. Returns real counts (bronze rows read, silver rows
-    written, rows dropped) -- this is the dict the CLI entrypoint prints,
-    and the numbers the guide's "How to Verify" section shows are the
-    actual output of running this function, not typed-up estimates.
+    """Read every real Bronze clicks object, clean it, deduplicate it,
+    write Silver clicks Parquet. Returns real counts -- this is the dict
+    the CLI entrypoint prints, and the numbers the guide's "How to
+    Verify" section shows are the actual output of running this
+    function, not typed-up estimates.
+
+    Three counts, not one conflated `dropped_rows` (that field existed
+    through Section 39; Section 40 splits it, because "invalid" and
+    "duplicate" are different failure modes with different causes and
+    different fixes, and collapsing them into one number hides which one
+    actually happened on a given run):
+
+    - `invalid_rows_dropped`: rows clean_clicks's filters removed --
+      missing click_id, missing occurred_at, empty short_code. A data
+      QUALITY problem, at the source or in Bronze.
+    - `duplicate_rows_removed`: rows deduplicate_clicks's dropDuplicates
+      removed -- the same click_id appearing in more than one Bronze
+      object. A pipeline/orchestration problem (Section 39.7: multiple
+      overlapping Bronze snapshots coexisting), not a data quality one.
     """
     bronze_df = read_bronze_clicks(spark, bronze_root)
     bronze_count = bronze_df.count()
 
-    silver_df = clean_clicks(bronze_df)
+    cleaned_df = clean_clicks(bronze_df)
+    cleaned_count = cleaned_df.count()
+
+    silver_df = deduplicate_clicks(cleaned_df)
     silver_count = silver_df.count()
 
     silver_df.write.mode("overwrite").parquet(silver_path)
 
     stats = {
         "bronze_rows": bronze_count,
+        "invalid_rows_dropped": bronze_count - cleaned_count,
+        "duplicate_rows_removed": cleaned_count - silver_count,
         "silver_rows": silver_count,
-        "dropped_rows": bronze_count - silver_count,
     }
     logger.info("silver clicks job complete", extra=stats)
     return stats

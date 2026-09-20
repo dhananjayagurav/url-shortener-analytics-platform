@@ -16,13 +16,17 @@ built the way it is and *how to run it*, not a copy of its source.
 **Status of this document:** Phase 1 is complete as of Section 36 — every
 section in the table of contents below now has real content, and Section
 33 gives the full close-out summary. **Phase 2 has now begun** (Sections
-37-39): Spark is introduced, the first real component — Bronze `clicks` →
+37-40): Spark is introduced, the first real component — Bronze `clicks` →
 Silver `clicks`, genuinely built and run on Spark — is done, and it now
 genuinely consumes multiple real Bronze batches (full-load and
 incremental) together, closing a gap the first component's own write-up
-predicted but hadn't yet observed; everything else in Phase 2's table of
-contents below is planned but not yet built, named explicitly rather than
-implied to exist. Sections are marked ✅ (implemented and
+predicted but hadn't yet observed; and deduplication (Section 40) closes
+the second, distinct gap that discovery itself then revealed — duplicate
+rows when more than one Bronze full-load snapshot coexists — verified by
+genuinely reproducing that exact scenario and confirming the fix's real
+row counts. Everything else in Phase 2's table of contents below is
+planned but not yet built, named explicitly rather than implied to
+exist. Sections are marked ✅ (implemented and
 documented) or ✅✅ (written to the full teaching template below); none
 remain marked ⏳. This is an honest, current map of the project, not a
 retroactive claim that every section was written to the same depth from
@@ -131,8 +135,8 @@ with the exact command to produce the real result yourself.
 37. [Why Distributed Processing? Introducing Spark](#37-why-distributed-processing-introducing-spark-) ✅✅
 38. [First Transformation: Bronze `clicks` → Silver `clicks`](#38-first-transformation-bronze-clicks-silver-clicks-) ✅✅
 39. [Consuming Multiple Bronze Batches Together](#39-consuming-multiple-bronze-batches-together-) ✅✅ *(retitled from the original "Schema Evolution & Late-Arriving Data" placeholder — see 39.1)*
-40. Data Quality Framework (validation rules, quarantine, profiling) — *planned*
-41. Deduplication — *planned*
+40. [Deduplication](#40-deduplication-) ✅✅ *(resequenced ahead of Data Quality Framework — see 40.1)*
+41. Data Quality Framework (validation rules, quarantine, profiling) — *planned*
 42. Slowly Changing Dimensions (SCD Type 1 vs Type 2, implemented for real) — *planned*
 43. Gold Layer: dimension-key joins, populating `fact_clicks` — *planned*
 44. Small-File Problem & Compaction (Spark-side, Silver/Gold) — *planned*
@@ -157,9 +161,12 @@ Phase 1's own TOC grew and got renumbered more than once as sections were
 actually built (compare Section 33's close-out counts against this
 document's very first commits) -- Section 39 itself is one example,
 retitled from its original placeholder name once real work showed what it
-actually needed to be about. What's real right now is Sections 37-39;
-everything from 40 onward is scope, not progress, and will be built one
-reviewed increment at a time, the same way Phase 1 was.
+actually needed to be about — Section 40 (Deduplication) is a second
+example, pulled forward ahead of Data Quality Framework once Section
+39.7 found the real, concrete bug it exists to fix. What's real right
+now is Sections 37-40; everything from 41 onward is scope, not progress,
+and will be built one reviewed increment at a time, the same way Phase 1
+was.
 
 ---
 
@@ -9801,8 +9808,51 @@ the explicit-read-then-union pattern from the start, rather than
 rediscovering this same failure independently. This does **not** cover
 every Bronze-consistency problem — Section 39.7 found a second, real,
 still-unfixed issue (duplicate rows when more than one full-load snapshot
-exists for a table at once), explicitly deferred to Section 41's
-deduplication work, not silently assumed to be solved by this ADR too.
+exists for a table at once) — closed for real in Section 40's
+deduplication work, not silently assumed to be solved by this ADR.
+
+### ADR-018: Plain key-based deduplication for `clicks`, not freshest-wins
+
+**Context:** Section 39.7 reproduced a real duplication bug — unioning
+Bronze objects that overlap (an older and a newer full-load snapshot, or
+a full-load snapshot and an incremental batch it has already superseded)
+double-counts every overlapping `click_id`. Deduplication has to pick
+one surviving row per duplicate `click_id`; the obvious-sounding default
+is "keep the freshest version" (e.g. `row_number() OVER (PARTITION BY
+click_id ORDER BY <some recency column> DESC)`), and Section 39.9's own
+interview-question write-up predicted exactly that before this ADR was
+written. **Decision:** deduplicate with plain
+`.dropDuplicates(["click_id"])` instead — keep any one surviving copy,
+with no ordering or recency logic at all. **Why this is correct here,
+not just simpler:** `contracts/source/clicks.yaml`'s `quality_rules`
+state, as an already-existing, already-enforced contract fact (not a new
+assumption introduced by this ADR): `id` is monotonically increasing,
+and rows are never UPDATEd or DELETEd after insert. `clicks` is
+insert-only at the source. So every duplicate copy of a given `click_id`
+across Bronze objects is guaranteed byte-identical in its business
+columns — there is no "freshest version" to choose between, because the
+row physically cannot have changed between the snapshots that both
+captured it. **Alternatives considered:** freshest-wins via
+`row_number()`/window function, keyed on `silver_loaded_at` or Bronze's
+own ingestion metadata — rejected as unnecessary complexity for this
+table specifically (an extra shuffle-and-sort-heavy window function
+doing strictly more work than `dropDuplicates` to arrive at the same
+answer, since every candidate "freshest" row is identical anyway) — this
+is not a rejection of freshest-wins as a pattern, only as the *default*
+applied here without checking whether the table's own contract makes it
+unnecessary. **Trade-offs:** this decision is scoped to `clicks`, not
+adopted as a blanket project-wide convention — `deduplicate_clicks`'s own
+docstring (Section 40.4) names `urls` as a concrete counter-example
+(a mutable table, where `title`/`is_active` genuinely can change between
+snapshots) that would need freshest-wins instead, when that table's own
+Silver transform is eventually built. **Consequences:** correctness here
+depends on `clicks`' insert-only contract rule continuing to hold and
+continuing to be enforced upstream (Section 12's contract validation) —
+if that rule were ever silently violated (a real UPDATE reaching
+`clicks`), plain key-based dedup would silently keep an arbitrary one of
+two genuinely-different row versions rather than the correct one, with
+no error raised anywhere. This is a real, named assumption this
+component's correctness rests on, not an unconditional guarantee.
 
 ---
 
@@ -10315,7 +10365,7 @@ Phase 2 begins only when explicitly requested — consistent with
 how this repository has been built so far, one reviewed increment at a
 time.
 
-**Update — Phase 2 has begun.** Sections 37-39, immediately following,
+**Update — Phase 2 has begun.** Sections 37-40, immediately following,
 are Phase 2's first genuine increment: an introduction to distributed
 processing and Spark, a real, run Bronze `clicks` → Silver `clicks`
 transformation, and — since then — a real second Bronze batch (an
@@ -10325,10 +10375,15 @@ hadn't yet observed: Spark's Hive-style partition discovery genuinely
 cannot read Bronze's two different partitioning schemes
 (`ingestion_date=` for full loads, `watermark_start=`/`watermark_end=`
 for incremental batches) as one directory once both exist for the same
-table. Section 39 shows the real, reproduced error and the real fix.
-Everything else this section named above — SCD, the data quality
-framework, Gold's dimension-key joins, and the rest — remains exactly as
-described here: real, scoped, upcoming work, not yet built.
+table. Section 39 shows the real, reproduced error and the real fix —
+and also found a second, distinct duplication bug (39.7) the fix doesn't
+cover, which Section 40 (Deduplication) then closed, resequenced ahead
+of the originally-planned Data Quality Framework since it was the more
+concretely motivated next step, verified by genuinely reproducing 39.7's
+exact scenario and confirming the fix's real row counts. Everything else
+this section named above — SCD, the data quality framework, Gold's
+dimension-key joins, and the rest — remains exactly as described here:
+real, scoped, upcoming work, not yet built.
 
 ---
 
@@ -10341,7 +10396,7 @@ classification) a real platform needs around ingestion. Phase 2's job is
 to actually populate that star schema — reading Bronze, cleaning and
 transforming it, and writing Silver and eventually Gold — using Apache
 Spark, the tool this scale of transformation work is actually built for.
-Sections 39 onward (the rest of Phase 2's table of contents, above) are
+Sections 41 onward (the rest of Phase 2's table of contents, above) are
 planned, not built; this phase begins, like every increment before it,
 with one real component.
 
@@ -10780,7 +10835,19 @@ to populate `fact_clicks`'s surrogate keys (Section 43, Gold layer,
 planned) — a join is a wide transformation by construction, and one side
 of each of those joins is small enough (a handful of dimension rows) that
 a broadcast join (Section 45, planned) becomes the relevant optimization
-to reach for, rather than a full shuffle join.
+to reach for, rather than a full shuffle join. **Update (Section 40):**
+this prediction turned out to be wrong about *timing*, though right about
+*mechanism* — the pipeline's actual first wide transformation arrived
+earlier than expected, at deduplication (`dropDuplicates`, Section 40),
+not at the Gold-layer join. `dropDuplicates` needs every row sharing a
+`click_id` co-located on one partition before it can tell which copies
+are duplicates, which requires exactly the same kind of shuffle a join
+does — confirmed by a real, captured `EXPLAIN (formatted)` showing an
+`Exchange(hashpartitioning(click_id, 200))` node (Section 40.7). Kept
+here, uncorrected in place, with this note added, rather than quietly
+edited to look like it was right the first time — see this section's own
+"Principal Data Engineer Perspective" for why that discipline matters
+more than looking right in hindsight.
 
 *Common mistake:* describing shuffles as something to avoid entirely,
 rather than as an unavoidable cost of certain *correct* computations that
@@ -10809,13 +10876,16 @@ star-schema `fact_clicks` Phase 1 already committed the DDL for
 not part of this component.
 
 **What this component deliberately does NOT do**, named explicitly so the
-scope boundary is a decision, not an oversight: no deduplication (Section
-41, planned), no SCD (Section 42, planned — there's no *dimension* here to
-version; `clicks` is a fact-shaped event stream, not a slowly-changing
-entity), no quarantine table or full data-quality framework (Section
-40, planned — a bad row here is coerced or dropped in place, with a
-logged count, not routed anywhere for review), and no dimension-key join
-(Section 43, Gold, planned).
+scope boundary is a decision, not an oversight: no deduplication here —
+`clean_clicks` stays a pure per-row cleaning function; deduplication is
+its own function, `deduplicate_clicks`, added in Section 40 once 39.7
+found the real bug that motivates it, and called separately by
+`run_silver_clicks_job` (see that section) — no SCD (Section 42, planned
+— there's no *dimension* here to version; `clicks` is a fact-shaped event
+stream, not a slowly-changing entity), no quarantine table or full
+data-quality framework (Section 41, planned — a bad row here is coerced
+or dropped in place, with a logged count, not routed anywhere for
+review), and no dimension-key join (Section 43, Gold, planned).
 
 ### Why does this exist?
 
@@ -10945,7 +11015,7 @@ malformed `hashed_ip` (not a 64-character hex string, per
 the whole row; a row missing its primary key, its business timestamp, or
 its `short_code` is dropped outright, since none of those three has a
 sane default that makes the row meaningful. **Alternatives considered:**
-building the full data-quality quarantine framework (Section 40) as part
+building the full data-quality quarantine framework (Section 41) as part
 of this same component, so "cleaning" and "quality" ship together.
 **Trade-offs:** shipping them together would mean this first, deliberately
 small milestone doesn't actually ship until quarantine routing, a
@@ -10958,7 +11028,7 @@ aggregate count) is a real but *simpler* interim posture than Section
 value this component coerces to `'unknown'` today leaves no per-row trace
 of what the original bad value actually was — only 38.6's real aggregate
 count (0, for this project's own clean seed data) shows anything happened
-at all. Section 40's quarantine framework is exactly the work that closes
+at all. Section 41's quarantine framework is exactly the work that closes
 this gap, when it's built.
 
 ### Alternatives
@@ -11280,7 +11350,7 @@ mixed-scheme directory at all.
 |---|---|---|
 | Storage backend | Local filesystem (`data/bronze`, `data/silver`) — ADR-016 | `s3a://<bucket>/bronze`, `s3a://<bucket>/silver`; Spark's own S3A connector (`hadoop-aws`), no change to `clean_clicks` |
 | Spark deployment | `local[*]`, in-process, one machine (Section 37.3) | Real cluster (YARN/Kubernetes), executors across many machines |
-| Bad-row handling | Coerce (`device_type`) or drop (unrecoverable fields), aggregate count only | Section 40's quarantine framework: per-row routing to a reviewable table, not just a count |
+| Bad-row handling | Coerce (`device_type`) or drop (unrecoverable fields), aggregate count only | Section 41's quarantine framework: per-row routing to a reviewable table, not just a count |
 | Mixed partition schemes | Not yet encountered (only one full-load Bronze object exists here) — Section 38.8's named, unobserved failure mode | Explicit per-load-type reads, unioned — Section 39 |
 | Idempotency | Verified for a single, repeated run of the same input (38.6) | Also needs to handle *upstream* Bronze changing between Silver runs — incremental Silver updates, not just full re-derivation each time (Section 47, planned) |
 | Scheduling | Manual (`make transform-silver-clicks`) | Orchestrated (a scheduler/orchestrator step, same open gap Section 15.8/26.8 already name for ingestion) |
@@ -11384,7 +11454,7 @@ already-modeled "unknown" convention instead of inventing a new one.
 *Expected follow-up:* "Where does this reasoning break down at scale —
 what happens once there are 50 columns across 10 tables, each needing
 this same per-field judgment call made individually?" — This is exactly
-Section 40's data quality framework's job: making the coerce/drop/null
+Section 41's data quality framework's job: making the coerce/drop/null
 decision a declared, per-column *rule* (likely alongside
 `contracts/source/*.yaml`'s existing `quality_rules`, the same
 co-location reasoning ADR-014 already applied to PII classification)
@@ -11874,7 +11944,7 @@ is kept here rather than quietly reset away with the test data.
 | Aspect | This repo (POC, this sandbox) | Production |
 |---|---|---|
 | Bronze object discovery | `list_local_bronze_files`: filesystem glob | `object_store.py`'s real `list_bronze_keys` (Section 17) — already built, already tested, swaps in directly |
-| Multiple full-load snapshots for one table | Not handled — 39.7's real, reproduced duplication bug | Section 41's deduplication, or a retention policy that only ever keeps the latest full-load object per table |
+| Multiple full-load snapshots for one table | Not handled — 39.7's real, reproduced duplication bug | Section 40's deduplication, or a retention policy that only ever keeps the latest full-load object per table |
 | Every Silver run re-reads all history | Yes — no incremental Silver state yet; fine at this project's real row count (5,203) | Needs incremental transformation (Section 47, planned) once Bronze's total object count/row count makes a full re-read from scratch genuinely expensive |
 | Partition-scheme mismatch across load types | Fixed at the read layer (this section) | Same fix, or a longer-term move to one consistent Bronze partitioning convention across load types (a larger, deliberately-deferred change — see 39.3's Alternatives) |
 
@@ -11963,10 +12033,21 @@ entirely with the newer one). A naive union — exactly what this
 project's `read_bronze_clicks` does today — double-counts every
 overlapping row, genuinely reproduced here (39.7: 10,406 rows instead of
 5,203). The real fix isn't at the read layer at all; it's deduplication,
-scoped to run *after* the union, keyed on `click_id`, keeping the
-most-recently-loaded version of any id that appears more than once — work
-this project has explicitly deferred to Section 41, not silently assumed
-away.
+scoped to run *after* the union, keyed on `click_id` — this project
+closed exactly this gap in Section 40. **Update (Section 40):** the
+answer above predicted "keeping the most-recently-loaded version of any
+id that appears more than once," the intuitive default for deduplication
+in general — Section 40's real implementation is simpler than that
+prediction, and deliberately so: `clicks` rows are insert-only per its
+own data contract (`contracts/source/clicks.yaml`'s `quality_rules`:
+never UPDATEd or DELETEd after insert), so every duplicate copy of a
+given `click_id` is byte-identical in its business columns — there is no
+"most recent version" to pick between, because the row never changes
+after it's first written. Plain `.dropDuplicates(["click_id"])` (keep
+any one copy) is correct and sufficient here; a freshest-wins strategy
+would only be necessary for a *mutable* source table (`urls`, for
+example, where `title`/`is_active` genuinely can change between
+snapshots) — see Section 40.1 for the full reasoning.
 
 *Concepts:* union vs. deduplication as genuinely different operations;
 full-load semantics ("this is everything, right now") as inherently
@@ -11985,5 +12066,367 @@ found and fixed once.
 *Common mistake:* assuming a fix that correctly resolves the reported
 failure mode has no other blind spots, rather than actively probing for
 the next adjacent scenario the same way this section's own 39.7 did.
+
+---
+
+## 40. Deduplication ✅✅
+
+### 40.1 Concept
+
+**Deduplication** here means: given a DataFrame that may contain more
+than one row for the same logical entity (a `click_id`), keep exactly
+one row per id and discard the rest. This section closes Section 39.7's
+real, reproduced bug directly: `read_bronze_clicks` unions every Bronze
+object it finds with no awareness that a full-load object's own
+semantics ("this is the entire table, right now") make it inherently
+overlapping with any older full-load object or any incremental batch it
+has already superseded — so once more than one such object coexists on
+disk, the same `click_id` legitimately appears more than once in the
+unioned DataFrame, and every downstream count is wrong (39.7's real,
+reproduced number: 10,406 rows instead of the correct 5,203).
+
+The specific strategy used here — plain `.dropDuplicates(["click_id"])`,
+keeping any one surviving copy with no notion of "freshest" — is a
+deliberate, narrower claim than "this is how to deduplicate," and this
+section is explicit about that scope: it is correct *because* `clicks`
+rows are insert-only at the source (`contracts/source/clicks.yaml`'s
+`quality_rules`: "rows are never UPDATEd or DELETEd after insert"), which
+means every duplicate copy of a given `click_id` is guaranteed
+byte-identical in its business columns — there is no meaningfully
+"newer" version to choose between. See ADR-018 (Section 29) for the full
+decision record, including why this reasoning does **not** generalize
+unconditionally to every table (`urls`, a mutable table, is the named
+counter-example).
+
+**This is renumbered ahead of Section 41 (Data Quality Framework)** —
+resequencing the still-planned part of Phase 2's table of contents, the
+same way Section 39 itself was retitled once real work revealed what it
+actually needed to be about (39.1). Data Quality Framework remains real,
+scoped, upcoming work; deduplication was pulled forward because Section
+39.7 handed this project a concrete, already-reproduced, already-priced
+bug to fix, rather than a general framework to design from first
+principles.
+
+### Why does this exist?
+
+Bronze, by ADR-016/017's own design, is a faithful, append-friendly
+record of what the source system produced at each extraction — nothing
+in Bronze's own contract prevents more than one full-load snapshot of a
+table from coexisting on disk at once (this project only avoided that by
+convention, not by any enforced rule, until now). Section 39 already
+established that Silver has to read *every* Bronze object it finds, not
+just the newest one — Bronze's own object-storage design (Section 18)
+deliberately keeps historical objects around rather than overwriting
+them in place, exactly the property that made the incremental-batch fix
+in Section 39 possible. That same property is what makes deduplication
+necessary here: "read everything" and "don't double-count anything" are
+two separate correctness requirements, and Section 39 only solved the
+first one. Any real orchestration gap — a full load accidentally run
+twice, a retry after a partial failure that doesn't clean up its own
+prior attempt, a manual re-run during an incident — reproduces exactly
+this scenario in production, not just in a deliberately-constructed test.
+
+### 40.2 Architecture
+
+Deduplication sits as a third, distinct stage in `run_silver_clicks_job`,
+after cleaning and before the Silver write — not fused into
+`clean_clicks`, and not run before it:
+
+```
+Bronze (N real objects, on disk)
+  │  read_bronze_clicks (Section 39: per-file reads + unionByName)
+  ▼
+raw unioned DataFrame  (bronze_count rows — may contain duplicate click_ids)
+  │  clean_clicks (Section 38: schema/timestamp/string normalization, drop unrecoverable rows)
+  ▼
+cleaned DataFrame  (cleaned_count rows — invalid rows already gone)
+  │  deduplicate_clicks (this section: dropDuplicates(["click_id"]))
+  ▼
+Silver DataFrame  (silver_count rows — written to data/silver/clicks)
+```
+
+Running deduplication *after* cleaning, not before, is deliberate: it
+needs a normalized `click_id` column to key on — the exact column
+`clean_clicks`'s schema-normalization step already produces — rather
+than keying on Bronze's still-inconsistent raw `id` (which Section 38.1
+already found needed its own type-coercion fix). Keying on the
+post-clean column also means deduplication never has to re-derive
+normalization logic a second time.
+
+### 40.3 Design Decision: plain key-based dedup, not freshest-wins
+
+See ADR-018 (Section 29) for the full decision record — context,
+decision, alternatives considered, trade-offs, and the one real
+assumption this component's correctness depends on (that `clicks`'
+insert-only contract rule continues to hold). Summarized here: plain
+`.dropDuplicates(["click_id"])`, not a `row_number()`-based
+freshest-wins window function, because every duplicate copy of a given
+`click_id` is provably identical, so there is nothing to rank between.
+
+### 40.4 Implementation
+
+`deduplicate_clicks` (new function, `transformations/src/analytics_transform/silver/transform_clicks.py`):
+
+```python
+def deduplicate_clicks(silver_df: DataFrame) -> DataFrame:
+    """Drop duplicate `click_id`s, keeping exactly one row per id.
+    ... (see the module's real docstring for the full reasoning — ADR-018)
+    """
+    return silver_df.dropDuplicates(["click_id"])
+```
+
+`run_silver_clicks_job` now runs three stages instead of two, and
+reports three independent counts instead of one conflated `dropped_rows`
+field — deliberately split, because "invalid" and "duplicate" are
+different failure modes with different root causes (a data-quality
+problem at the source vs. a pipeline/orchestration problem) and
+collapsing them into one number would hide which one actually happened
+on a given run:
+
+```python
+def run_silver_clicks_job(spark: SparkSession, bronze_root: Path, silver_path: str) -> dict[str, int]:
+    bronze_df = read_bronze_clicks(spark, bronze_root)
+    bronze_count = bronze_df.count()
+
+    cleaned_df = clean_clicks(bronze_df)
+    cleaned_count = cleaned_df.count()
+
+    silver_df = deduplicate_clicks(cleaned_df)
+    silver_count = silver_df.count()
+
+    silver_df.write.mode("overwrite").parquet(silver_path)
+
+    stats = {
+        "bronze_rows": bronze_count,
+        "invalid_rows_dropped": bronze_count - cleaned_count,
+        "duplicate_rows_removed": cleaned_count - silver_count,
+        "silver_rows": silver_count,
+    }
+    return stats
+```
+
+No new Makefile target — `make transform-silver-clicks` (Section 38/39)
+already runs `run_silver_clicks_job`, so it picks up deduplication
+automatically; only the printed stats dict's shape changed.
+
+### 40.5 How to Run
+
+```
+make transform-silver-clicks
+```
+
+### 40.6 How to Verify — ACTUAL OBSERVED results
+
+**Unit tests.** Three new tests added to
+`transformations/tests/unit/test_transform_clicks.py`, alongside the 15
+tests already there from Sections 38-39 — genuinely run, not typed up:
+
+```
+PYTHONPATH=ingestion/src:transformations/src python3 -m pytest transformations/tests/unit -v
+```
+
+Real result: **18 passed** (`test_deduplicate_clicks_keeps_one_row_per_duplicate_click_id`,
+`test_deduplicate_clicks_is_a_noop_when_there_are_no_duplicates`,
+`test_deduplicate_clicks_handles_more_than_two_copies_of_the_same_id`,
+plus the 15 from before, unchanged). `ruff check transformations/` and
+the full ingestion suite (`PYTHONPATH=ingestion/src python3 -m pytest
+ingestion/tests/unit -q`) were re-run too, to confirm this change didn't
+regress anything outside its own scope: `All checks passed!` and
+**80 passed**, both unchanged from Section 39.
+
+**Baseline run — correct, current Bronze state (no duplication present).**
+Real Bronze layout at this point: one full-load object (5,003 rows) +
+one incremental object (200 rows) = 5,203 real rows, no duplicates:
+
+```
+{'bronze_rows': 5203, 'invalid_rows_dropped': 0, 'duplicate_rows_removed': 0, 'silver_rows': 5203}
+```
+
+`duplicate_rows_removed: 0` here is itself a real, meaningful assertion
+— proof deduplication is a genuine no-op when there's nothing to
+deduplicate, not just untested in the empty case.
+
+**Reproducing Section 39.7's exact scenario, with the fix in place.**
+The same real reproduction 39.7 used: a second, "tomorrow-dated"
+full-load Bronze object was genuinely written
+(`ingestion_date=2026-09-21/clicks.parquet`, all 5,203 rows real
+Postgres held at that point, via the real `extract_full`/`build_bronze_key`
+functions, the same way 39.7 did it), left alongside the original
+`ingestion_date=2026-09-20` object (5,003 rows) and the incremental
+object (200 rows), and `make transform-silver-clicks` was run against
+all three real objects at once. Real result:
+
+```
+{'bronze_rows': 10406, 'invalid_rows_dropped': 0, 'duplicate_rows_removed': 5203, 'silver_rows': 5203}
+```
+
+This is exactly the predicted math (10,406 in, 5,203 real duplicates
+removed, 5,203 correct rows out) — genuinely confirmed by running the
+real pipeline against the real reproduced scenario, not asserted from
+the change alone. The test object was then removed
+(`rm -rf "data/bronze/clicks/ingestion_date=2026-09-21"`), restoring this
+project's real Bronze layout to its correct, current, two-object state,
+and the baseline run above was re-confirmed afterward
+(`duplicate_rows_removed: 0` again) to prove the restore was clean.
+
+### 40.7 The First Real Shuffle — `EXPLAIN (formatted)` Evidence
+
+Section 37.7 predicted the pipeline's first wide transformation (the
+first operation requiring a shuffle) would occur at the Gold-layer
+dimension join (Section 43, still planned). That prediction was wrong
+about *timing* — `dropDuplicates` gets there first, in this section —
+though right about *mechanism*: a shuffle is required whenever rows that
+share a key need to be physically co-located before an operation can
+produce a correct result, and `dropDuplicates(["click_id"])` needs
+exactly that (every copy of the same `click_id` has to land on the same
+partition before Spark can tell which copies are duplicates). Real,
+captured `EXPLAIN (formatted)` output on `deduplicate_clicks`'s result,
+run against the reproduced three-object (10,406-row) scenario above,
+confirms this directly — the physical plan is `SortAggregate → Sort →
+Exchange → SortAggregate → Sort → Union → [3× Scan parquet branches]`,
+and the `Exchange` node itself:
+
+```
+(16) Exchange
+Input [13]: [click_id#50L, ...]
+Arguments: hashpartitioning(click_id#50L, 200), ENSURE_REQUIREMENTS, [plan_id=50]
+```
+
+`hashpartitioning(click_id#50L, 200)` is the real, physical shuffle:
+every row is hash-partitioned by `click_id` into 200 partitions
+(Spark's default shuffle partition count) so that every copy of a given
+id ends up on the same partition together, before the second
+`SortAggregate` can collapse duplicates within each partition. Contrast
+this with `read_bronze_clicks`'s `unionByName` (Section 39.2's real
+`EXPLAIN`, no `Exchange` node — a narrow transformation, each branch
+processed independently) and `clean_clicks`'s per-row `.withColumn`/
+`.filter` calls (also narrow) — `dropDuplicates` is a structurally
+different kind of operation from everything in this pipeline before it,
+confirmed by the plan Spark actually produces, not by reasoning about
+`dropDuplicates` in the abstract.
+
+### 40.8 Production Considerations
+
+| Aspect | This repo (POC, this sandbox) | Production |
+|---|---|---|
+| Dedup key | `click_id` alone, sufficient because `clicks` is insert-only (ADR-018) | Same key; a mutable table (`urls`) would need a freshest-wins window function instead, not this pattern |
+| Shuffle cost | Trivial at 5,203-10,406 rows, `local[1]`/`local[*]` | Real cost at scale — `dropDuplicates`'s default 200 shuffle partitions (`spark.sql.shuffle.partitions`) is a real tuning knob once row counts grow, the same category of concern Section 45 (planned, joins/skew) will cover in depth |
+| Root-cause prevention | Not addressed — dedup treats the *symptom* (duplicate rows), not the *cause* (overlapping Bronze objects) | A retention policy that only ever keeps the latest full-load object per table, or an orchestration guard that refuses to start a new full load while a prior one's objects haven't been superseded/cleaned up, would prevent the scenario rather than just correctly recovering from it |
+| Observability | `duplicate_rows_removed` printed per run, not persisted anywhere | A genuinely nonzero `duplicate_rows_removed` in production is itself a signal worth alerting on — it means the orchestration assumption ADR-017 names (at most one full-load object per table at a time) was actually violated, not just a number to log and move past |
+
+### Principal Data Engineer Perspective
+
+The real discipline this section is built on is naming an assumption
+instead of hiding it. `.dropDuplicates(["click_id"])` is a two-line
+function — the actual engineering judgment is entirely in ADR-018's
+reasoning about *why* it's sufficient here (an insert-only contract
+guarantee) and *where it stops being sufficient* (a mutable table).
+Section 40.8's observability row makes the same point operationally: a
+nonzero `duplicate_rows_removed` isn't just a number this component
+correctly handles — it's evidence that an upstream assumption
+(ADR-017's "at most one full-load object exists at a time") was
+violated, and a Principal Engineer treats that as a signal worth
+surfacing, not just a case this code already patches over silently.
+Section 40.7's correction to Section 37.7's own prediction is the same
+discipline applied to this document itself: the original prediction was
+reasoned, explicit, and wrong about *when* — and the honest response is
+a visible correction in place, not a silent edit that hides that the
+project's own understanding changed as real work revealed more than the
+original reasoning anticipated.
+
+### 40.9 Principal Engineer Interview Questions
+
+**Q (Category: Distributed Systems / Correctness): "You need to
+deduplicate a DataFrame by key. When is `.dropDuplicates([key])` alone
+correct, and when do you need a `row_number()`/window-function
+freshest-wins strategy instead?"**
+
+*What's tested:* whether the candidate reasons about deduplication from
+the source table's actual mutability semantics, rather than reflexively
+reaching for the more general (and more expensive) window-function
+pattern every time.
+
+*What a weak answer looks like:* "Always use `row_number()` with an
+`ORDER BY`, it's safer" — not wrong as a universal fallback, but misses
+that it's solving a problem `dropDuplicates` doesn't have for every
+table, at a real, unnecessary shuffle-and-sort cost.
+
+*What a strong answer covers:* `.dropDuplicates([key])` is correct
+whenever every duplicate copy of a given key is guaranteed to be
+identical in the columns that matter — true for an insert-only,
+immutable source table (this project's real case: `clicks`, per its own
+data contract). A `row_number() OVER (PARTITION BY key ORDER BY
+<recency>) = 1` filter is required once duplicate copies of the same key
+can genuinely *differ* — a mutable table, where a later snapshot may
+carry an updated value the earlier one doesn't (this project's own named
+counter-example: `urls`, where `title`/`is_active` can change between
+Bronze snapshots). The deciding question is never "which pattern is more
+robust in the abstract" — it's "can two copies of the same key actually
+disagree, per this specific table's real contract."
+
+*Concepts:* mutability as the actual deciding factor for dedup strategy,
+not a stylistic preference; contract rules (`contracts/source/*.yaml`'s
+`quality_rules`) as the source of truth for this judgment, not an
+assumption made in the transformation code itself.
+
+*Expected follow-up:* "What breaks if that contract assumption is wrong
+— if `clicks` rows actually could be updated after insert, silently?" —
+Plain `dropDuplicates` would keep an arbitrary one of two genuinely
+different row versions, with no error, no warning, and no way to tell
+after the fact which version survived — a real, named risk (ADR-018's
+own "Consequences" section), not a hypothetical one, and the reason
+contract validation (Section 12) enforcing that rule matters as much as
+the dedup logic itself.
+
+*Common mistake:* treating "the dedup logic runs correctly" and "the
+dedup *strategy* is the right one for this table" as the same claim —
+the code can be bug-free and still be built on a wrong assumption about
+the data.
+
+**Q (Category: Spark Internals / Performance): "Why is `dropDuplicates`
+more expensive than a `filter` or a `withColumn` call on the same-sized
+DataFrame?"**
+
+*What's tested:* whether the candidate connects Spark's narrow/wide
+transformation vocabulary (Section 37.7) to a concrete cost difference,
+not just recites the terms.
+
+*What a weak answer looks like:* "It has to compare every row to every
+other row" — conceptually gesturing at the right idea but not naming the
+actual mechanism (a shuffle, not an all-pairs comparison).
+
+*What a strong answer covers:* `filter`/`withColumn` are narrow —
+each partition's rows can be processed independently, with no data
+movement between partitions or machines. `dropDuplicates` is wide — to
+correctly identify which rows share a key, every copy of that key has to
+be physically co-located on the same partition first, which requires a
+shuffle: writing data out partitioned by the key, then reading it back
+grouped correctly. This project's own real `EXPLAIN (formatted)` (Section
+40.7) shows the concrete evidence: an `Exchange(hashpartitioning(click_id,
+200))` node that doesn't exist anywhere in this pipeline's narrow
+operations (Section 38.7's `clean_clicks` plan, Section 39.6's
+`read_bronze_clicks`/`unionByName` plan).
+
+*Concepts:* shuffle as a physical, measurable cost, not an abstract
+label; `EXPLAIN (formatted)` as the tool that proves narrow/wide claims
+rather than asserting them.
+
+*Expected follow-up:* "This project predicted (Section 37.7) the first
+shuffle would happen at the Gold-layer join, not here. Is that a sign
+the original reasoning was flawed?" — No: the *mechanism* reasoning
+(joins require a shuffle) was correct; the *scope* was incomplete —
+`dropDuplicates` requiring the same underlying mechanism wasn't
+considered at all in Section 37.7, because deduplication itself hadn't
+been designed yet at that point in the project. This is a real example
+of a correct-but-incomplete prediction, not a wrong one — worth
+distinguishing in an interview setting, since conflating them either
+overstates the original mistake or understates the value of catching it
+later.
+
+*Common mistake:* assuming any operation on a DataFrame smaller than
+some intuitive threshold is automatically cheap — cost here comes from
+*what kind* of operation it is (narrow vs. wide), not primarily from row
+count, though row count obviously scales the cost once a shuffle is
+already required.
 
 ---

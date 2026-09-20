@@ -15,7 +15,11 @@ from datetime import UTC, datetime
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from analytics_transform.silver.transform_clicks import clean_clicks, read_bronze_clicks
+from analytics_transform.silver.transform_clicks import (
+    clean_clicks,
+    deduplicate_clicks,
+    read_bronze_clicks,
+)
 from pyspark.sql import Row, SparkSession
 from pyspark.sql.types import (
     DoubleType,
@@ -197,3 +201,60 @@ def test_read_bronze_clicks_unions_full_load_and_incremental(spark: SparkSession
 def test_read_bronze_clicks_raises_clear_error_when_nothing_exists(spark: SparkSession, tmp_path) -> None:
     with pytest.raises(FileNotFoundError, match="no bronze clicks files found"):
         read_bronze_clicks(spark, tmp_path)
+
+
+# --- deduplicate_clicks: real regression test for Section 39.7's
+# duplication bug (10,406 vs. correct 5,203 rows when two full-load
+# Bronze snapshots coexist). Operates on already-cleaned (Silver-shaped,
+# `click_id`-column) rows -- see the function's own docstring for why.
+
+SILVER_CLICKS_SCHEMA = StructType(
+    [
+        StructField("click_id", LongType(), nullable=True),
+        StructField("short_code", StringType(), nullable=True),
+        StructField("occurred_at", TimestampType(), nullable=True),
+        StructField("device_type", StringType(), nullable=True),
+        StructField("hashed_ip", StringType(), nullable=True),
+        StructField("user_id", LongType(), nullable=True),
+    ]
+)
+
+
+def _silver_df(spark: SparkSession, rows: list[Row]):
+    return spark.createDataFrame(rows, schema=SILVER_CLICKS_SCHEMA)
+
+
+def test_deduplicate_clicks_keeps_one_row_per_duplicate_click_id(spark: SparkSession) -> None:
+    # click_id=1 appears twice -- byte-identical business columns, exactly
+    # the shape a second, overlapping Bronze full-load snapshot produces
+    # (Section 39.7). click_id=2 is unique and must survive untouched.
+    rows = [
+        Row(click_id=1, short_code="abc123", occurred_at=TS, device_type="mobile", hashed_ip=VALID_HASH, user_id=42),
+        Row(click_id=1, short_code="abc123", occurred_at=TS, device_type="mobile", hashed_ip=VALID_HASH, user_id=42),
+        Row(click_id=2, short_code="xyz789", occurred_at=TS, device_type="desktop", hashed_ip=None, user_id=None),
+    ]
+    deduped_df = deduplicate_clicks(_silver_df(spark, rows))
+    assert deduped_df.count() == 2
+    assert {row.click_id for row in deduped_df.collect()} == {1, 2}
+
+
+def test_deduplicate_clicks_is_a_noop_when_there_are_no_duplicates(spark: SparkSession) -> None:
+    rows = [
+        Row(click_id=1, short_code="abc123", occurred_at=TS, device_type="mobile", hashed_ip=VALID_HASH, user_id=42),
+        Row(click_id=2, short_code="xyz789", occurred_at=TS, device_type="desktop", hashed_ip=None, user_id=None),
+        Row(click_id=3, short_code="qqq111", occurred_at=TS, device_type="tablet", hashed_ip=None, user_id=None),
+    ]
+    deduped_df = deduplicate_clicks(_silver_df(spark, rows))
+    assert deduped_df.count() == 3
+
+
+def test_deduplicate_clicks_handles_more_than_two_copies_of_the_same_id(spark: SparkSession) -> None:
+    # Simulates click_id=1 surviving into three separate overlapping
+    # Bronze objects at once (two full-load snapshots plus an
+    # incremental re-read) -- not just the two-copy case.
+    rows = [
+        Row(click_id=1, short_code="abc123", occurred_at=TS, device_type="mobile", hashed_ip=VALID_HASH, user_id=42)
+        for _ in range(3)
+    ]
+    deduped_df = deduplicate_clicks(_silver_df(spark, rows))
+    assert deduped_df.count() == 1
