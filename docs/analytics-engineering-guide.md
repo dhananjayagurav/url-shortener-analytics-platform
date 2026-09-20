@@ -15,8 +15,11 @@ built the way it is and *how to run it*, not a copy of its source.
 
 **Status of this document:** Phase 1 is complete as of Section 36 — every
 section in the table of contents below now has real content, and Section
-33 gives the full close-out summary. Phase 2 begins only when explicitly
-requested (Section 36). Sections are marked ✅ (implemented and
+33 gives the full close-out summary. **Phase 2 has now begun** (Sections
+37-38): its first real component — Bronze `clicks` → Silver `clicks`,
+genuinely built and run on Spark — is done; everything else in Phase 2's
+table of contents below is planned but not yet built, named explicitly
+rather than implied to exist. Sections are marked ✅ (implemented and
 documented) or ✅✅ (written to the full teaching template below); none
 remain marked ⏳. This is an honest, current map of the project, not a
 retroactive claim that every section was written to the same depth from
@@ -120,6 +123,38 @@ with the exact command to produce the real result yourself.
 34. [Phase 1 Completion Checklist](#34-phase-1-completion-checklist) ✅
 35. [Git Repository Review](#35-git-repository-review) ✅
 36. [What Phase 2 Will Add](#36-what-phase-2-will-add) ✅
+
+**Phase 2 — Data Lake, Transformation & Data Quality**
+37. [Why Distributed Processing? Introducing Spark](#37-why-distributed-processing-introducing-spark-) ✅✅
+38. [First Transformation: Bronze `clicks` → Silver `clicks`](#38-first-transformation-bronze-clicks-silver-clicks-) ✅✅
+39. Schema Evolution & Late-Arriving Data — *planned*
+40. Data Quality Framework (validation rules, quarantine, profiling) — *planned*
+41. Deduplication — *planned*
+42. Slowly Changing Dimensions (SCD Type 1 vs Type 2, implemented for real) — *planned*
+43. Gold Layer: dimension-key joins, populating `fact_clicks` — *planned*
+44. Small-File Problem & Compaction (Spark-side, Silver/Gold) — *planned*
+45. Join Strategies, Broadcast Joins & Data Skew — *planned*
+46. Partitioning Revisited (Spark write partitioning vs. Section 20's storage partitioning) — *planned*
+47. Incremental Transformations & Backfills — *planned*
+48. Table Formats (Iceberg / Delta / Hudi) — conceptual discussion — *planned*
+49. Transformation Testing Strategy (deep-dive) — *planned*
+50. Reconciliation & Lineage, extended to Silver/Gold — *planned*
+51. Extended Data Contracts (Silver/Gold) — *planned*
+52. Observability for Transformations — *planned*
+53. Phase 2 Failure Scenarios — *planned*
+54. Phase 2 Performance & Scale — *planned*
+55. Phase 2 Architectural Principles & ADRs (consolidated) — *planned*
+56. Phase 2 Hands-on Labs (index) — *planned*
+57. Phase 2 Interview Questions (consolidated) — *planned*
+58. Phase 2 Summary & Completion Checklist — *planned*
+
+This Phase 2 table of contents is deliberately a topic list, not a
+commitment to exactly these 20 section numbers in this exact order —
+Phase 1's own TOC grew and got renumbered more than once as sections were
+actually built (compare Section 33's close-out counts against this
+document's very first commits). What's real right now is Sections 37-38;
+everything from 39 onward is scope, not progress, and will be built one
+reviewed increment at a time, the same way Phase 1 was.
 
 ---
 
@@ -9679,6 +9714,52 @@ Section 24.8, not a permanent design choice. This is the same
 detect-don't-remediate posture ADR-013 formalized for Bronze file-layout
 health, applied here to test coverage instead of storage.
 
+### ADR-016: Local filesystem paths for the data lake, not real MinIO/S3 *(Phase 2, environment-driven)*
+
+**Context:** Phase 2's transformations need to read Bronze and write
+Silver/Gold somewhere. This project's own established storage layer is
+MinIO (ADR-002) — but this specific development sandbox has no way to run
+it: its Docker CLI has no daemon behind it (`docker ps` fails with "failed
+to connect to the docker API... no such file or directory", and
+`service docker start` fails on a permission error trying to raise
+`ulimit`, both genuinely attempted and observed, not assumed), and a
+standalone MinIO server binary is not reachable either (`curl` to
+`dl.min.io` fails with a 403 at the network proxy, confirming that host
+isn't on this sandbox's allowlist). **Decision:** `analytics_transform.config.TransformSettings`
+points `bronze_root`/`silver_root` at a local `data/` directory
+(gitignored) instead of a bucket; `scripts/write_local_bronze_clicks.py`
+produces a real Bronze `clicks` snapshot there by calling the actual,
+unmodified `extract_full()` against the actual, running Postgres and
+reusing `build_bronze_key()`'s own key format, rooted locally instead of
+at a bucket. **Alternatives considered:** (1) run `moto`'s S3-mock server
+so `object_store.py`'s real, unmodified `write_bronze()` could run
+completely as-is — rejected for this first milestone only because it adds
+a new dependency and a server-lifecycle concern to manage, not because
+it's a worse idea in general (worth revisiting once Phase 2 needs
+multiple tables' Bronze data at once, where local-path substitution starts
+costing more than a mocked S3 server would); (2) skip Bronze entirely and
+have the Spark job read directly from Postgres via JDBC — rejected because
+it would silently undo Section 1-27's entire ingestion layer for Phase 2's
+purposes, defeating the actual point of building Bronze as a decoupling
+boundary between OLTP and everything downstream (Section 18's "why object
+storage" reasoning applies exactly as much to Phase 2 as it did to
+Phase 1). **Trade-offs:** the local-path substitution keeps every other
+line of `transform_clicks.py`'s logic identical to what it would be
+against real S3 (Spark's local filesystem client and its S3A client both
+just implement the same `FileSystem` interface, so `clean_clicks()` itself
+never needed to know or care which one it's reading from) — at the cost of
+never having genuinely exercised Spark's S3A connector in this
+environment, an explicitly named gap (see Section 38.8) parallel to every
+other MinIO-touching path already named as untested in Phase 1 (Section
+14.6, 15.6, 17.6). **Consequences:** a real deployment (or a laptop with a
+working Docker daemon) changes exactly two lines —
+`bronze_root`/`silver_root` become `s3a://<bucket>/bronze` and
+`s3a://<bucket>/silver` — and adds `hadoop-aws`/`aws-java-sdk-bundle` to
+Spark's classpath; `scripts/write_local_bronze_clicks.py` becomes
+unnecessary entirely, since `make ingest-full` already writes real Bronze
+objects through the real `write_bronze()` path whenever real MinIO is
+reachable.
+
 ---
 
 ## 30. Hands-on Labs (index)
@@ -10189,3 +10270,1087 @@ point about test coverage being one fact, not two).
 Phase 2 begins only when explicitly requested — consistent with
 how this repository has been built so far, one reviewed increment at a
 time.
+
+**Update — Phase 2 has begun.** Sections 37-38, immediately following,
+are Phase 2's first genuine increment: an introduction to distributed
+processing and Spark, and a real, run Bronze `clicks` → Silver `clicks`
+transformation. Everything else this section named above — SCD, the data
+quality framework, Gold's dimension-key joins, and the rest — remains
+exactly as described here: real, scoped, upcoming work, not yet built.
+See Section 38's own "Production Considerations" for one new, concrete
+finding this first component surfaced that isn't in this list yet:
+Bronze's two partitioning schemes (full-load's `ingestion_date=`,
+incremental's `watermark_start=`/`watermark_end=`) are not compatible with
+Spark's automatic Hive-style partition discovery once a table has both
+kinds of Bronze object to read at once — a problem `clicks` doesn't yet
+have to solve for real (only one full-load-shaped Bronze snapshot exists
+in this environment so far) but will, the moment a genuine incremental
+Bronze batch needs to feed the same Silver table.
+
+---
+
+## Phase 2 — Data Lake, Transformation & Data Quality
+
+Phase 1 built the foundation: a real OLTP mirror, batch extraction, Bronze
+object storage, a committed (but empty) analytical star schema, and the
+operational tooling (checkpointing, reconciliation, contracts, PII
+classification) a real platform needs around ingestion. Phase 2's job is
+to actually populate that star schema — reading Bronze, cleaning and
+transforming it, and writing Silver and eventually Gold — using Apache
+Spark, the tool this scale of transformation work is actually built for.
+Sections 39 onward (the rest of Phase 2's table of contents, above) are
+planned, not built; this phase begins, like every increment before it,
+with one real component.
+
+## 37. Why Distributed Processing? Introducing Spark ✅✅
+
+### 37.1 Concept
+
+**Distributed processing** means splitting one computation across more
+than one machine (or more than one independent process on the same
+machine) so the machines work on different pieces of the data at the same
+time, then combine their partial results into one answer. **Apache
+Spark** is a distributed processing engine built specifically for exactly
+this kind of work on large tabular datasets: it takes a description of
+*what* transformation to run (filter these rows, rename that column, join
+these two tables) and figures out *how* to split the data and the work
+across however many CPU cores — or, on a real cluster, however many
+machines — are available, without the person writing the transformation
+having to manually decide which rows go where.
+
+Every Spark job has the same four moving parts, regardless of whether it
+runs on one laptop or a thousand-machine cluster:
+
+- **Driver** — the process running your code (`transform_clicks.py`,
+  here). It builds up the *plan* for what to compute, but does not do the
+  actual data processing itself.
+- **Executors** — the processes that actually read data, apply
+  transformations, and write output. A real cluster has many executors,
+  spread across many machines; this project's Phase 2 milestone runs in
+  **local mode**, where the driver and a handful of executor threads all
+  live inside one JVM process on one machine (see 37.3's Design Decision
+  for exactly why, and what changes for a real cluster).
+- **Cluster manager** — decides which physical machines executors run on
+  (YARN, Kubernetes, or Spark's own standalone manager, on a real
+  cluster). Local mode has no cluster manager at all — there's nothing to
+  allocate, since everything runs in one process.
+- **Job → Stages → Tasks** — Spark breaks one job (e.g. "read Bronze,
+  clean it, write Silver") into **stages**, and each stage into
+  **tasks** — one task per data **partition** (a partition here means an
+  independent, in-memory chunk of the DataFrame; not to be confused with
+  Section 20's *storage* partitioning, which is a directory-naming
+  scheme for files at rest — the two concepts share a name and a broad
+  family resemblance but are not the same mechanism, a distinction 37.7's
+  Alternatives section returns to). Section 38.7's real `EXPLAIN` output
+  shows exactly what this looks like for this project's actual first job.
+
+### Why does this exist?
+
+A single machine has a hard ceiling: one CPU (or a fixed number of cores),
+one amount of RAM, one disk. A dataset that fits comfortably in memory on
+one machine processes fine without any of this — which is exactly why
+Phase 1's `pandas`-based `extract_full` (Section 14) never needed Spark;
+this project's real `clicks` table, at 5,003 rows, still fits in a single
+`pd.DataFrame` with room to spare. The problem shows up at a scale this
+project doesn't have yet, but that any real analytics platform eventually
+does: once a table's row count and column width stop fitting in one
+machine's RAM, a single-process transformation either fails outright
+(`MemoryError`) or has to be rewritten to process the data in
+hand-managed chunks — which is exactly the "page through the table in
+bounded chunks" production alternative `extract_full`'s own docstring
+(Section 14) already names as the thing a truly large table would need
+that this project's POC doesn't do. Distributed processing is that
+rewrite, done once, generically, by a mature engine — instead of every
+transformation in a codebase reinventing its own ad hoc chunking logic.
+
+Concretely, here is why "just use pandas, but with bigger machines"
+eventually stops working, at increasing row counts for one table:
+
+| Rows | What breaks on a single machine |
+|---|---|
+| 1M | Usually still fine in pandas on a modern laptop — this is roughly where Section 27's benchmarks already probed query latency, not processing feasibility. |
+| 10M | Pandas still *works*, but a naive full-table transform (not just a read) starts costing real wall-clock time and RAM headroom, especially with several intermediate copies of the DataFrame in memory at once — a real cost pandas' eager, single-threaded execution model doesn't hide. |
+| 100M | Single-machine RAM becomes the binding constraint for most real instance sizes; vertical scaling (a bigger single machine) still *can* work, but gets expensive fast and still has a ceiling. |
+| 1B+ | Vertical scaling stops being a realistic answer at any reasonable cost; the computation genuinely needs to be split across multiple machines' worth of RAM and CPU at once — this is the point past which distributed processing isn't an optimization, it's the only way the job finishes at all. |
+
+**Vertical scaling** (a bigger single machine — more RAM, more cores, a
+faster disk) buys time but has a hard ceiling and a cost curve that gets
+steep well before that ceiling. **Horizontal scaling** (more machines,
+each modest) is what Spark is built for: add machines, not just bigger
+ones, and the same job finishes faster (more executors working the same
+total data in parallel) or handles more data in the same time. This
+project's real `clicks` table doesn't remotely need horizontal scaling
+today — Section 38's real benchmark shows exactly how far from that
+ceiling it is — but Spark is introduced *now*, in Phase 2, for the same
+reason this guide introduced contracts (Section 12) and idempotency
+(Section 17) before this project's actual scale demanded them: the
+concept and the code are worth understanding and building correctly from
+day one, on data small enough to reason about by hand, rather than
+retrofitted under pressure once a table's growth has already outpaced a
+single-machine tool.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+Imagine sorting a deck of 52 playing cards by rank. One person can do
+this alone, or four people can each take a quarter of the deck (13 cards
+each), sort their own quarter independently and in parallel, and then
+merge the four sorted quarters into one final sorted deck. The
+per-person sort is **embarrassingly parallel** — each person needs
+nothing from anyone else to sort their own 13 cards. The merge step is
+different: it genuinely needs all four sorted quarters present at once
+before it can produce a correct final answer. Spark's own vocabulary for
+this distinction is **narrow** vs. **wide** transformations (Section
+38.7 shows this concretely, in this project's own real execution plan):
+a narrow transformation (filtering, renaming a column, computing a new
+column from existing ones on the same row) needs only the data already
+sitting in one partition — like each person sorting their own 13 cards.
+A wide transformation (sorting the *entire* deck globally, grouping by a
+column, joining two datasets on a key) needs data to be regrouped across
+partitions first — the merge step, which Spark calls a **shuffle**, and
+which is the expensive part of any distributed job, because it means
+moving data across the network (or at least across process boundaries)
+rather than each worker just operating on what it already has in hand.
+
+### URL Shortener Example
+
+Two operations on this project's real `clicks` table make the narrow vs.
+wide distinction concrete:
+
+- `clicks.filter(clicks.device_type == "mobile")` — **narrow**. Every row
+  can be evaluated independently: "is *this* row's `device_type`
+  `'mobile'`?" needs nothing from any other row. Split `clicks` into four
+  partitions any way you like, filter each one independently, and the
+  union of the four results is exactly the same as filtering the whole
+  table at once. Section 38's real `clean_clicks()` transformation
+  (rename, cast, trim, coerce, filter) is, in its entirety, a chain of
+  narrow transformations — which is exactly what Section 38.7's real
+  `EXPLAIN` output shows: one stage, no shuffle.
+- `clicks.groupBy("device_type").count()` — **wide**. To know the total
+  count of `'mobile'` clicks, Spark needs *every* `'mobile'` row
+  gathered together in one place first, regardless of which partition
+  each one started in — rows with the same `device_type` living in
+  different partitions have to move across the network to be counted
+  together. This is a shuffle, and it's exactly the kind of operation
+  Section 43 (Gold layer, planned) will eventually need, once Silver
+  clicks gets joined against dimension tables and aggregated into
+  `fact_clicks`.
+
+### 37.2 Architecture
+
+```mermaid
+flowchart TD
+    subgraph Driver["Driver (transform_clicks.py, this laptop/sandbox)"]
+        Plan[Builds the logical plan:<br/>read -> clean_clicks -> write]
+    end
+    subgraph LocalMode["local[*] -- Spark's own in-process cluster manager"]
+        E1[Executor thread 1]
+        E2[Executor thread 2]
+        E3[Executor thread N]
+    end
+    Plan --> LocalMode
+    Bronze[(Bronze clicks<br/>data/bronze/clicks/ -- local, see ADR-016)] --> E1
+    Bronze --> E2
+    Bronze --> E3
+    E1 --> Silver[(Silver clicks<br/>data/silver/clicks/)]
+    E2 --> Silver
+    E3 --> Silver
+```
+
+**Readable ASCII equivalent:**
+
+```
+transform_clicks.py (driver)
+    |
+    | builds logical plan: read Bronze -> clean_clicks() -> write Silver
+    v
+local[*] (Spark's in-process "cluster" -- no real cluster manager, no
+          separate machines; N executor threads inside one JVM)
+    |
+    | each executor thread reads its own partition of Bronze clicks,
+    | applies the same narrow-transformation chain independently,
+    | writes its own partition of Silver clicks -- no shuffle needed
+    | (Section 38.7's real EXPLAIN confirms this for real)
+    v
+data/silver/clicks/ (one or more part-*.parquet files, one per partition
+                      that had data -- Section 38.6 shows the real,
+                      single-partition result this project's own row
+                      count produced)
+```
+
+A real production deployment replaces exactly two things in this
+picture, and nothing else: `local[*]` becomes a real cluster manager
+(YARN or Kubernetes, with executors genuinely spread across many
+machines), and the local `data/bronze`/`data/silver` paths become
+`s3a://` paths (ADR-016). `clean_clicks()` itself — the actual
+transformation logic — does not change at all, which is precisely the
+point of Spark's DataFrame API: the same code scales from one laptop's
+worth of data to a cluster's worth, without a rewrite.
+
+### 37.3 Design Decision: local mode for this milestone, not a real cluster
+
+**Context:** this project's real `clicks` table is 5,003 rows — nowhere
+near the scale that needs more than one machine (see 37.1's table).
+**Decision:** run Spark in `local[*]` mode (an in-process "cluster" using
+however many CPU cores this sandbox has) for Phase 2's first milestone,
+with no real cluster manager, no separate executor machines, and no
+cluster-specific configuration. **Alternatives considered:** standing up
+a real multi-node Spark cluster (even a small, Docker-Compose-based one)
+from the start. **Trade-offs:** local mode proves the *transformation
+logic* is correct and genuinely exercises Spark's real execution engine
+(not a mock) — but it does not, and cannot, prove anything about
+cluster-specific behavior: network shuffle cost across real machines,
+executor failure and recovery, or resource contention between concurrent
+jobs. This is the same "prove the logic now, prove the infrastructure
+scale-behavior when it's actually needed" posture this project already
+applied to Phase 1 — see Section 27's scale-design review, which
+deliberately separated "is the logic correct" from "does the current
+architecture survive 10x/100x growth" as two different questions with
+two different kinds of evidence. **Consequences:** every performance
+number in Section 38 is real, but bounded to what local mode on this
+sandbox's hardware can show — genuinely useful for verifying correctness
+and understanding Spark's own execution model (narrow vs. wide, stages,
+shuffles), not yet useful for cluster capacity planning, which is
+explicitly out of scope until this project's data volume gives it a real
+reason to be (mirroring ADR-004's same reasoning for deferring Kafka).
+
+### Alternatives
+
+Covered above. A second, narrower alternative also considered: using
+`pandas` with `pyarrow`-backed chunked reads instead of Spark at all, for
+this specific table's current size — rejected specifically because this
+project's stated purpose (Section 1) is learning the tools a Principal
+Data Engineer role actually uses at real scale, not the minimum tool this
+one table's current row count technically requires; Section 27 already
+established that `clicks`' own growth curve is the axis most likely to
+need real scale-out treatment first.
+
+### Trade-offs
+
+| | `local[*]` (chosen, this milestone) | Real cluster (deferred) |
+|---|---|---|
+| Proves transformation logic correct | Yes — real Spark execution engine, not mocked | Yes |
+| Proves cluster-scale behavior (shuffle cost across machines, executor failure/recovery) | No | Yes |
+| Infrastructure to stand up and maintain | None beyond `pyspark` itself | Real cluster manager, network config, multi-machine or multi-container setup |
+| Appropriate for this project's actual current data volume | Yes, by a wide margin (Section 27) | Not yet justified |
+
+### 37.4 Implementation
+
+---
+
+**CREATE:** `pyproject.toml` (edit) — add PySpark as an optional
+`transform` extra
+
+**PURPOSE:** Make Spark available to this project without forcing every
+Phase-1-only contributor to install a JVM-backed dependency they don't
+need.
+
+**DEPENDENCIES:** a JVM. This sandbox has OpenJDK 21.0.10 already
+installed; `pyspark` finds it via the standard `JAVA_HOME`/`PATH`
+mechanisms — no project-specific configuration needed.
+
+**IMPLEMENTATION GUIDE (write it yourself):** add a new
+`[project.optional-dependencies]` entry, `transform = ["pyspark==3.5.9"]`,
+separate from the existing `dev` extra; add `"transformations/src"` to
+`[tool.setuptools.packages.find]`'s `where` list and `"analytics_transform*"`
+to its `include` list, alongside the existing `ingestion/src`/
+`url_shortener_analytics*` entries. Do **not** add `transformations/tests`
+to `[tool.pytest.ini_options]`'s `testpaths` — see Section 38.6 for why
+`make test` must stay scoped to `ingestion/tests` only.
+
+**REFERENCE IMPLEMENTATION:** see the real, current
+[`pyproject.toml`](../pyproject.toml).
+
+**RUN:** `make install-transform` (`pip install -e ".[dev,transform]"`).
+
+**VERIFY:**
+
+```bash
+python3 -c "from pyspark.sql import SparkSession; \
+  s = SparkSession.builder.appName('smoke-test').master('local[*]').getOrCreate(); \
+  print('SPARK VERSION:', s.version); s.stop()"
+```
+
+**EXPECTED / ACTUAL OBSERVED** (genuinely run in this sandbox):
+
+```
+SPARK VERSION: 3.5.9
+```
+
+along with a real 2-row DataFrame `.show()` rendering correctly — Spark's
+real execution engine, running against this sandbox's real OpenJDK 21.0.10,
+not a mocked or simulated result.
+
+**TEST:** no dedicated unit test for the smoke check itself (it's an
+environment/installation verification, not application logic); Section
+38.6's real unit test run is what actually exercises Spark's DataFrame
+API against this project's code.
+
+---
+
+### 37.5 How to Run / How to Verify
+
+```bash
+make install-transform
+python3 -c "from pyspark.sql import SparkSession; \
+  s = SparkSession.builder.appName('smoke-test').master('local[*]').getOrCreate(); \
+  s.createDataFrame([(1,'a'),(2,'b')], ['id','val']).show(); \
+  print('SPARK VERSION:', s.version); s.stop()"
+```
+
+ACTUAL OBSERVED (this sandbox, PySpark 3.5.9, Java 21):
+
+```
++---+---+
+| id|val|
++---+---+
+|  1|  a|
+|  2|  b|
++---+---+
+
+SPARK VERSION: 3.5.9
+```
+
+One real environment fact worth naming explicitly, since it wasn't
+assumed but genuinely checked before choosing a PySpark version: Spark
+3.5.x's own release notes describe Java 21 support as newly added in that
+line (earlier 3.x releases target Java 8/11/17); this sandbox's installed
+JDK is 21.0.10, and the smoke test above genuinely ran without error —
+confirming compatibility empirically, in this environment, rather than
+assuming a version-compatibility claim from documentation without
+checking it here.
+
+### 37.6 Hands-on Exercise
+
+**LAB 24 — Feel the difference between a narrow and a wide transformation,
+directly.**
+
+```bash
+source .venv/bin/activate
+export DATABASE_URL="postgresql+psycopg://analytics:analytics@localhost:5432/analytics"
+PYTHONPATH=ingestion/src:transformations/src python3 -c "
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.appName('lab24').master('local[*]').getOrCreate()
+df = spark.read.parquet('data/bronze/clicks')
+
+# Narrow: filter only. Run .explain() and look for the ABSENCE of any
+# 'Exchange' node in the physical plan -- that's the shuffle operator,
+# and a narrow-only plan never has one.
+df.filter(df.device_type == 'mobile').explain()
+
+# Wide: groupBy + count. Run .explain() again and find the 'Exchange'
+# node this time -- that's Spark physically redistributing rows across
+# partitions so every device_type's rows land together before counting.
+df.groupBy('device_type').count().explain()
+spark.stop()
+"
+```
+
+Run both, and read the two physical plans side by side. The narrow
+query's plan has no `Exchange`; the wide query's does. This is the same
+distinction Section 38.7 shows for real against this project's own
+`clean_clicks()` transformation — this lab is the same exercise, run by
+you, against a deliberately *wide* query to see the contrast directly
+rather than only reading about it.
+
+### 37.7 Principal Data Engineer Interview Questions
+
+**Q (Category: Distributed Systems Fundamentals): "Your table has grown
+to 50 million rows. A colleague suggests just getting a bigger EC2
+instance and keeping the pandas pipeline. What's your response?"**
+
+*What's tested:* whether the candidate can articulate the real trade-off
+between vertical and horizontal scaling concretely, not just recite "use
+Spark for big data" as received wisdom.
+
+*What a weak answer looks like:* "Pandas can't handle big data, you need
+Spark" — true as a conclusion, but doesn't show the candidate understands
+*why*, or when the "just get a bigger machine" answer is actually fine.
+
+*What a strong answer covers:* it depends on where "50 million rows"
+actually sits relative to that specific instance's RAM and the
+transformation's own memory profile (a single filter is cheap; a
+multi-way join with several large intermediate copies is not) — a bigger
+single machine is often the right, simpler answer up to a real and
+findable ceiling (Section 37.1's row-count table gives rough orders of
+magnitude, not hard thresholds), and reaching for Spark before that
+ceiling is hit adds real operational complexity (a cluster to run, a
+different debugging model, shuffle-tuning knobs) for no corresponding
+benefit. The right answer names the actual constraint (RAM headroom for
+this specific job's peak memory use, not just row count in the abstract)
+and proposes measuring it, the same evidence-based posture Section 27's
+scale-design review already modeled for this project's own architecture
+decisions.
+
+*Concepts:* vertical vs. horizontal scaling; the real cost of premature
+infrastructure complexity; measuring before choosing, not defaulting to
+the "big data" tool reflexively.
+
+*Expected follow-up:* "How would you actually measure whether pandas is
+close to its ceiling for this specific job?" — Profile peak memory usage
+of the actual transformation (not just input file size) under
+production-representative data, the same way Section 26/27 measured real
+query latency rather than assuming it from row counts alone.
+
+*Common mistake:* answering as if "big data" tooling is always strictly
+better, rather than showing the judgment to know when it isn't yet
+justified — the same anti-pattern ADR-004 (batch before streaming) and
+ADR-013 (detect, don't auto-remediate) already push back against
+elsewhere in this project.
+
+**Q (Category: Spark Internals): "Explain the difference between a
+narrow and a wide transformation, and why the distinction matters for
+performance."**
+
+*What's tested:* whether the candidate can connect the abstract
+definition to a concrete, costly consequence (shuffle), not just recite
+the terms.
+
+*What a weak answer looks like:* "Narrow transformations are fast, wide
+transformations are slow" — true but shallow; doesn't explain *why*.
+
+*What a strong answer covers:* a narrow transformation (filter, map,
+column rename/cast) can be computed per-partition, entirely independently
+— Spark never needs to move a row from one partition to another to
+produce a correct result, so there's no network/shuffle cost, and the
+whole chain fuses into one stage (Section 38.7's real `EXPLAIN` output
+for this project's `clean_clicks()` is a concrete, run example: one
+stage, `Project`/`Filter` nodes only, no `Exchange`). A wide
+transformation (`groupBy`, `join`, a global `sort`) needs rows that share
+a key to be physically co-located before the operation can produce a
+correct result — Spark accomplishes this with a **shuffle**: writing
+each partition's rows out, keyed by the grouping/join column, then
+reading them back grouped correctly — genuinely expensive because it
+means disk I/O and network transfer proportional to the data being
+shuffled, not just CPU work. This is why join and groupBy-heavy pipelines
+need active tuning (partition counts, broadcast joins for a small table
+against a large one — Section 45, planned) that a purely narrow pipeline
+never has to think about.
+
+*Concepts:* shuffle as the actual, physical cost narrow/wide names;
+stage boundaries in Spark's execution plan; why this maps directly to
+real tuning work in later Phase 2 sections (joins, skew — Section 45).
+
+*Expected follow-up:* "Where in this project's *own* Section 38
+component would you expect the first wide transformation, and why?" — The
+moment Silver clicks gets joined against `dim_url`/`dim_user`/`dim_device`
+to populate `fact_clicks`'s surrogate keys (Section 43, Gold layer,
+planned) — a join is a wide transformation by construction, and one side
+of each of those joins is small enough (a handful of dimension rows) that
+a broadcast join (Section 45, planned) becomes the relevant optimization
+to reach for, rather than a full shuffle join.
+
+*Common mistake:* describing shuffles as something to avoid entirely,
+rather than as an unavoidable cost of certain *correct* computations that
+needs to be minimized and tuned, not eliminated outright — a join or a
+global aggregation genuinely cannot be computed without one.
+
+---
+
+## 38. First Transformation: Bronze `clicks` → Silver `clicks` ✅✅
+
+### 38.1 Concept
+
+This is Phase 2's first real component: a Spark job that reads Bronze
+`clicks` (the raw Parquet snapshot Section 14's `extract_full` produced),
+applies exactly four kinds of cleaning — schema normalization, timestamp
+normalization, string trimming, and basic validity checks — and writes
+the result as Silver `clicks`. **Silver**, in the Bronze/Silver/Gold
+vocabulary this project adopts for Phase 2, means "cleaned and
+schema-normalized, but not yet business-modeled" — Silver `clicks` is
+still one row per click event, at the same grain Bronze had it (Section
+8's grain decision doesn't change), just with its types, strings, and
+obviously-bad values fixed. **Gold** (Section 43, planned) is where
+Silver gets joined against dimension tables and reshaped into the
+star-schema `fact_clicks` Phase 1 already committed the DDL for
+(`sql/analytics/005_fact_clicks.sql`) — that reshaping is deliberately
+not part of this component.
+
+**What this component deliberately does NOT do**, named explicitly so the
+scope boundary is a decision, not an oversight: no deduplication (Section
+41, planned), no SCD (Section 42, planned — there's no *dimension* here to
+version; `clicks` is a fact-shaped event stream, not a slowly-changing
+entity), no quarantine table or full data-quality framework (Section
+40, planned — a bad row here is coerced or dropped in place, with a
+logged count, not routed anywhere for review), and no dimension-key join
+(Section 43, Gold, planned).
+
+### Why does this exist?
+
+Bronze data is, by design (Section 18's "why object storage" reasoning),
+exactly what the source system produced — Section 14's `extract_full`
+does not clean or validate anything, deliberately, because Bronze's whole
+job is to be a faithful, replayable copy of the source, not an opinion
+about what "clean" means. But nothing downstream — not a BI dashboard,
+not `fact_clicks`, not an ad hoc analytical query — can safely consume
+Bronze data directly, because "faithful copy of the source" also means
+"faithful copy of whatever the source's own imperfections are": a type
+that doesn't survive a round-trip through Parquet cleanly (this section's
+own real finding, below), a value slightly outside its contract's stated
+domain, incidental whitespace. Silver is the layer that absorbs that
+cleanup exactly once, so every downstream consumer gets the same,
+already-cleaned data instead of each one re-implementing its own
+validation logic against Bronze directly — the same "solve it once,
+centrally" reasoning Section 12's data contracts already apply to the
+*source* schema, now applied to the *transformation* boundary instead.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+A spreadsheet of survey responses, exported raw from a form tool: some
+respondents typed `"Male "` with a trailing space, some typed `"male"`
+lowercase, one row has an empty response where the "gender" question was
+skipped. Before you can safely `COUNT... GROUP BY gender`, you need
+exactly this section's four kinds of fix: normalize the type (make sure
+it's read as text, not accidentally inferred as something else),
+trim whitespace, decide what an out-of-vocabulary or missing value
+becomes (a documented `"prefer not to say"`/`"unknown"` bucket, not a
+silent drop, unless the row is truly unusable), and confirm every row has
+the fields a valid response actually needs. This is Silver, at any scale.
+
+### URL Shortener Example
+
+This project's real Bronze `clicks` snapshot (`data/bronze/clicks/`,
+5,003 real rows, produced from the real, seeded Postgres `clicks` table —
+see 38.5's "How to Run" for exactly how, given this environment has no
+real MinIO) has six source columns:
+`id, short_code, occurred_at, device_type, hashed_ip, user_id`. One real,
+genuinely surprising finding, worth walking through in full because it's
+the concrete motivation for "schema normalization" rather than an
+abstract idea: inspecting the real Bronze Parquet file's schema (via
+`pyarrow.parquet.read_table(...).schema`) shows `user_id` stored as a
+**`double`** (64-bit float), not an integer —
+
+```
+id: int64
+short_code: large_string
+occurred_at: timestamp[us, tz=UTC]
+device_type: large_string
+hashed_ip: large_string
+user_id: double
+```
+
+— even though `sql/source/002_hypothetical_users_and_clicks.sql` declares
+`user_id BIGINT`, and `contracts/source/clicks.yaml` declares it
+`type: integer`. This isn't a bug in the extraction code — it's a real,
+well-known `pandas` behavior: `user_id` is `NULL` for anonymous clicks
+(~70% of rows, per `schemas/source/clicks.md`), and `pandas`' integer
+dtype cannot represent a missing value at all — only its *float* dtype
+can, via `NaN`. So `pd.read_sql_table` silently promotes the whole column
+to `float64` the moment it contains even one `NULL`, and that's exactly
+the physical type that gets written to Parquet. Silver's schema
+normalization step exists, concretely, to put this back: `clean_clicks()`
+explicitly casts `user_id` back to a proper nullable `LongType`, and
+`user_id`'s `NULL` values survive that cast correctly (Spark's `LongType`
+*can* represent a missing value as a true null, unlike `pandas`' plain
+`int64`).
+
+### 38.2 Architecture
+
+```mermaid
+flowchart LR
+    PG[(Postgres<br/>clicks table<br/>5,003 real rows)]
+    Script[scripts/write_local_bronze_clicks.py<br/>real extract_full, local write -- ADR-016]
+    Bronze[(data/bronze/clicks/<br/>ingestion_date=.../clicks.parquet)]
+    Job[transformations/.../silver/transform_clicks.py<br/>clean_clicks -- Spark local mode]
+    Silver[(data/silver/clicks/<br/>part-*.parquet)]
+
+    PG --> Script --> Bronze --> Job --> Silver
+```
+
+**Readable ASCII equivalent:**
+
+```
+Postgres clicks (5,003 real rows)
+    |
+    | extract_full("clicks", engine) -- the real, unmodified Section 14 function
+    v
+scripts/write_local_bronze_clicks.py
+    | writes locally (data/bronze/...) instead of to real MinIO -- ADR-016
+    v
+data/bronze/clicks/ingestion_date=2026-09-20/clicks.parquet  (real Bronze snapshot)
+    |
+    | spark.read.parquet(...) -- Hive-style partition discovery picks up
+    | `ingestion_date` as an extra column here (see 38.7's real finding)
+    v
+transform_clicks.run_silver_clicks_job()
+    |
+    | clean_clicks(): rename+cast, trim, normalize timestamp,
+    | coerce/drop invalid rows, explicit .select() of the final 7 columns
+    v
+data/silver/clicks/part-00000-....snappy.parquet  (5,003 rows, 0 dropped
+                                                     -- see 38.6)
+```
+
+### 38.3 Design Decision: four specific cleaning steps, explicitly bounded
+
+**Context:** "clean the data" is not a specification — without an
+explicit, bounded list, a first transformation component tends to either
+do too little (leaving obvious problems for every downstream consumer to
+rediscover independently) or sprawl into deduplication/SCD/quarantine
+territory that belongs to later, dedicated milestones (Sections 40-43).
+**Decision:** exactly four kinds of cleaning, and nothing else: (1)
+schema normalization — `id` renamed to `click_id` (matching the column
+name `sql/analytics/005_fact_clicks.sql` already commits to for Gold,
+so Silver already speaks Gold's vocabulary rather than needing a second
+rename later) and every column cast to its intended Silver type; (2)
+timestamp normalization — `occurred_at` becomes a genuine Spark
+`TimestampType`; (3) string trimming — `short_code`, `device_type`,
+`hashed_ip`; (4) basic validity checks — an unrecognized `device_type` is
+coerced to the contract's own `'unknown'` member (matching `dim_device`'s
+existing Unknown-member convention, Section 10.3) rather than dropped; a
+malformed `hashed_ip` (not a 64-character hex string, per
+`contracts/source/clicks.yaml`'s own `quality_rules`) is nulled out, not
+the whole row; a row missing its primary key, its business timestamp, or
+its `short_code` is dropped outright, since none of those three has a
+sane default that makes the row meaningful. **Alternatives considered:**
+building the full data-quality quarantine framework (Section 40) as part
+of this same component, so "cleaning" and "quality" ship together.
+**Trade-offs:** shipping them together would mean this first, deliberately
+small milestone doesn't actually ship until quarantine routing, a
+violations table, and profiling all exist too — a much bigger unit of
+work with a much later "does it actually run" checkpoint. Splitting them
+means today's dirty-value handling (coerce/drop, logged only as an
+aggregate count) is a real but *simpler* interim posture than Section
+40's eventual per-row quarantine — an explicitly named, temporary gap
+(38.8), not a permanent design choice. **Consequences:** a device_type
+value this component coerces to `'unknown'` today leaves no per-row trace
+of what the original bad value actually was — only 38.6's real aggregate
+count (0, for this project's own clean seed data) shows anything happened
+at all. Section 40's quarantine framework is exactly the work that closes
+this gap, when it's built.
+
+### Alternatives
+
+A second, narrower alternative also considered and rejected for the
+`hashed_ip` validity check specifically: dropping the whole row when
+`hashed_ip` is malformed, the same treatment given to a missing
+`click_id`/`occurred_at`/`short_code`. Rejected because a click event is
+still a real, countable event even if its IP hash happens to be corrupt —
+losing the whole row over one non-critical, defense-in-depth field (this
+project's metrics catalog, Section 7.1, never joins or groups by
+`hashed_ip`) would throw away real signal for no analytical benefit;
+nulling just that one field preserves the row's value for every metric
+that doesn't need it.
+
+### Trade-offs
+
+| Field | Bad-value strategy chosen | Why |
+|---|---|---|
+| `click_id` (was `id`) | Drop row | No default makes a row without a primary key meaningful — it can't even be referenced later. |
+| `occurred_at` | Drop row | No default business timestamp is honest — a manufactured one would misrepresent when the click happened. |
+| `short_code` | Drop row (after trim, if empty) | An event with no identifiable URL can't be attributed to anything downstream. |
+| `device_type` | Coerce to `'unknown'` | Matches an existing, already-modeled Unknown convention (`dim_device`, Section 10.3) — not a special case, a reuse of one. |
+| `hashed_ip` | Null the field, keep the row | Non-critical to every metric in this project's catalog (Section 7.1); losing the whole row would cost more than it protects. |
+| `user_id` | Cast only, `NULL` preserved | `NULL` here is a *real*, meaningful value (anonymous click) per `schemas/source/clicks.md` — not a defect to fix. |
+
+### 38.4 Implementation
+
+---
+
+**CREATE:** `scripts/write_local_bronze_clicks.py` — real Bronze `clicks`
+snapshot, written locally
+
+**PURPOSE:** Produce a real Bronze `clicks` Parquet object for Spark to
+read, in an environment with no reachable MinIO/S3 (ADR-016) — by
+reusing, unmodified, the real `extract_full` and `build_bronze_key`
+functions this project already has, so nothing about the *data* is
+synthetic, only the *storage backend*.
+
+**DEPENDENCIES:** a running Postgres with the real, seeded `clicks` table
+(`make up && make seed`, or — as in this sandbox — a directly-running
+local Postgres 16 instance with the same schema and seed).
+
+**IMPLEMENTATION GUIDE (write it yourself):** call the real
+`extract_full("clicks", engine)` (Section 14) against a real
+`engine_from_settings(get_settings())`; compute the target key with the
+real `build_bronze_key("clicks", run_date)` (Section 17) — this returns
+the exact same relative key (`bronze/clicks/ingestion_date=.../clicks.parquet`)
+a real MinIO write would use; serialize the DataFrame to Parquet bytes
+with `pyarrow` (`pa.Table.from_pandas(df, preserve_index=False)` then
+`pq.write_table(..., compression="snappy")` — the same snappy compression
+`object_store.py`'s own `_dataframe_to_parquet_bytes` uses, for a
+byte-for-byte-comparable file); write those bytes to `data_root / key`
+after `mkdir(parents=True, exist_ok=True)` on the parent directory.
+
+**REFERENCE IMPLEMENTATION:** see the real, current
+[`write_local_bronze_clicks.py`](../scripts/write_local_bronze_clicks.py).
+
+**RUN:** `make write-local-bronze-clicks`
+
+**VERIFY:** `ls -la data/bronze/clicks/ingestion_date=*/clicks.parquet`
+
+**EXPECTED / ACTUAL OBSERVED** (genuinely run in this sandbox, against
+this sandbox's real, locally-running Postgres 16):
+
+```
+ts=... msg="extracting table (full load)" table='clicks'
+ts=... msg="extraction complete" columns=6 rows=5003 table='clicks'
+ts=... msg="wrote local bronze clicks snapshot" bytes=417763 rows=5003
+  path='.../data/bronze/clicks/ingestion_date=2026-09-20/clicks.parquet'
+wrote .../data/bronze/clicks/ingestion_date=2026-09-20/clicks.parquet
+```
+
+5,003 rows, 417,763 bytes — the real, current size of this project's
+real, seeded `clicks` table, extracted for real.
+
+**TEST:** no dedicated unit test for this script (it's a one-off operator
+script substituting for real infrastructure this sandbox lacks, the same
+category as `scripts/seed_sample_data.py` — neither has unit tests, by
+the same reasoning: their job is orchestrating already-tested real
+functions, not new logic of their own).
+
+---
+
+**CREATE:** `transformations/src/analytics_transform/config.py`,
+`transformations/src/analytics_transform/silver/transform_clicks.py` —
+`TransformSettings`, `clean_clicks`, `run_silver_clicks_job`
+
+**PURPOSE:** The actual transformation: pure cleaning logic
+(`clean_clicks`, unit-tested in isolation) plus a thin I/O wrapper
+(`run_silver_clicks_job`) that reads Bronze, calls it, and writes Silver.
+
+**DEPENDENCIES:** `pyspark` (Section 37.4), a real or locally-substituted
+Bronze `clicks` snapshot (the script above).
+
+**IMPLEMENTATION GUIDE (write it yourself):** `TransformSettings`
+(pydantic-settings `BaseSettings`, mirroring
+`url_shortener_analytics.config.Settings`'s own pattern) exposes
+`bronze_root`/`silver_root` properties over one `data_root` field,
+defaulting to `<repo root>/data` (ADR-016). `clean_clicks(bronze_df)` is a
+pure function — `DataFrame` in, `DataFrame` out, no I/O — chaining
+`withColumnRenamed`/`withColumn(...).cast(...)` for schema and timestamp
+normalization, `F.trim`/`F.lower` for string trimming, `F.when(...).otherwise(...)`
+for the `device_type`/`hashed_ip` validity checks, `.filter(...)` for the
+three unrecoverable-row conditions, and a final, deliberate `.select(...)`
+naming the exact seven output columns — see 38.7 for the real,
+run-and-observed reason that final `.select()` is load-bearing, not
+decorative. `run_silver_clicks_job(spark, bronze_path, silver_path)` reads
+Bronze, counts it, calls `clean_clicks`, counts the result, writes it with
+`.write.mode("overwrite").parquet(...)`, and returns a small stats dict —
+kept separate from `clean_clicks` specifically so unit tests can exercise
+the cleaning logic without ever touching a filesystem (see 38.6).
+
+**REFERENCE IMPLEMENTATION:** see the real, current
+[`config.py`](../transformations/src/analytics_transform/config.py) and
+[`transform_clicks.py`](../transformations/src/analytics_transform/silver/transform_clicks.py).
+
+**RUN:** `make transform-silver-clicks` (requires
+`make write-local-bronze-clicks` to have been run at least once first).
+
+**VERIFY:** see 38.6 and 38.7, below, for the real output, schema, and
+execution plan this produced.
+
+**TEST:** `transformations/tests/unit/test_transform_clicks.py` — see
+38.6.
+
+---
+
+### 38.5 How to Run
+
+```bash
+make install-transform             # pyspark + this project's own packages
+make write-local-bronze-clicks     # real Bronze clicks snapshot (ADR-016)
+make transform-silver-clicks       # Bronze clicks -> Silver clicks
+```
+
+### 38.6 How to Verify — ACTUAL OBSERVED results
+
+**Unit tests** — 10 new tests, built on deliberately dirty synthetic rows
+(mixed-case/whitespace `device_type`, a malformed `hashed_ip`, a `NULL`
+`click_id`/`occurred_at`, an empty and a whitespace-only `short_code`),
+run against a real, local, single-threaded (`local[1]`) `SparkSession` —
+not mocked; the same "unit tests use synthetic edge cases the real seeded
+data doesn't happen to exercise" reasoning Section 17.6's own note about
+`test_reconciliation.py` already applies:
+
+```bash
+$ make test-transform
+...
+transformations/tests/unit/test_transform_clicks.py::test_drops_rows_missing_required_fields PASSED
+transformations/tests/unit/test_transform_clicks.py::test_renames_id_to_click_id_and_casts_to_long PASSED
+transformations/tests/unit/test_transform_clicks.py::test_trims_short_code PASSED
+transformations/tests/unit/test_transform_clicks.py::test_normalizes_device_type_case_and_whitespace PASSED
+transformations/tests/unit/test_transform_clicks.py::test_coerces_unrecognized_device_type_to_unknown PASSED
+transformations/tests/unit/test_transform_clicks.py::test_nulls_malformed_hashed_ip_without_dropping_the_row PASSED
+transformations/tests/unit/test_transform_clicks.py::test_preserves_valid_hashed_ip PASSED
+transformations/tests/unit/test_transform_clicks.py::test_casts_user_id_to_long_and_preserves_null PASSED
+transformations/tests/unit/test_transform_clicks.py::test_occurred_at_is_timestamp_type PASSED
+transformations/tests/unit/test_transform_clicks.py::test_adds_silver_loaded_at_column PASSED
+
+10 passed in 10.71s
+```
+
+**Phase 1's full unit suite, re-run unchanged** (proving this increment
+touched nothing that regressed Phase 1):
+
+```bash
+$ PYTHONPATH=ingestion/src python3 -m pytest ingestion/tests/unit -q
+80 passed, 111 warnings in 7.20s
+```
+
+**The real job, run against the real Bronze snapshot:**
+
+```bash
+$ make transform-silver-clicks
+{'bronze_rows': 5003, 'silver_rows': 5003, 'dropped_rows': 0}
+```
+
+0 rows dropped, 0 rows with a coerced `device_type` — because this
+project's real, seeded `clicks` table already satisfies its own contract
+(`contracts/source/clicks.yaml`'s `quality_rules`) today. This is a real
+result, not a weak one: it confirms `clean_clicks` is a no-op on already-
+clean data (nothing it shouldn't touch got touched), while the unit tests
+above are what actually prove the coercion/drop paths work — the real run
+alone could never prove that, since nothing in today's real data exercises
+those paths.
+
+**Idempotency, genuinely checked** (not assumed from `.mode("overwrite")`
+alone): running `make transform-silver-clicks` twice in a row, without
+changing Bronze in between —
+
+```bash
+$ ls data/silver/clicks/*.parquet | wc -l
+1
+$ make transform-silver-clicks   # second run
+{'bronze_rows': 5003, 'silver_rows': 5003, 'dropped_rows': 0}
+$ ls data/silver/clicks/*.parquet | wc -l
+1
+```
+
+— still exactly one output file and the same counts both times: Spark's
+`overwrite` mode genuinely replaces the target directory's contents
+rather than appending to them, the same idempotency property Section 17
+built for Bronze writes, now confirmed for Silver writes too.
+
+**Real Silver output schema** (`pyarrow.parquet.read_table(...).schema`
+against the actual written file):
+
+```
+click_id: int64
+short_code: string
+occurred_at: timestamp[ns]
+device_type: string
+hashed_ip: string
+user_id: int64
+silver_loaded_at: timestamp[ns] not null
+```
+
+`user_id` is `int64` here, not `double` — the schema-normalization fix
+(38.1) genuinely took effect in the real output, not just in a unit
+test's in-memory assertion.
+
+**Lint:** `ruff check transformations/ scripts/write_local_bronze_clicks.py
+ingestion/ benchmarks/` — ACTUAL OBSERVED: `All checks passed!`, after one
+real, genuine fix (`ruff check --fix`, which also reordered a pre-existing
+import block in `ingestion/src/url_shortener_analytics/cli.py` — a
+harmless import-sort-only change, verified by re-running Phase 1's full
+80-test unit suite afterward, unchanged pass count).
+
+### 38.7 A real, genuine finding: Bronze's partition-discovery gotcha
+
+This is the most useful thing this component surfaced — not something
+designed on purpose, but something *found* by actually running Spark
+against this project's real Bronze layout, exactly the kind of discovery
+this guide's "no fabrication" rule exists to make room for instead of
+smoothing over.
+
+Reading `spark.read.parquet("data/bronze/clicks")` — the *directory*, not
+the file directly, since a real Bronze table can have many objects — does
+something `extract_full`'s own `pandas`-based reads never had to think
+about: Spark's Parquet reader auto-discovers **Hive-style partition
+columns** from directory names shaped `key=value`. Bronze's real full-load
+key format (`build_bronze_key`, Section 14) is
+`bronze/clicks/ingestion_date=2026-09-20/clicks.parquet` — and Spark
+correctly (if, at first, surprisingly) parsed `ingestion_date=2026-09-20`
+as a partition column, adding a real `ingestion_date` column to the read
+DataFrame that doesn't exist anywhere inside the Parquet file itself:
+
+```
+$ python3 -c "... bronze_df.printSchema() ..."
+root
+ |-- id: long (nullable = true)
+ |-- short_code: string (nullable = true)
+ |-- occurred_at: timestamp (nullable = true)
+ |-- device_type: string (nullable = true)
+ |-- hashed_ip: string (nullable = true)
+ |-- user_id: double (nullable = true)
+ |-- ingestion_date: date (nullable = true)
+```
+
+This is normal, well-documented Spark behavior for reading a genuinely
+partitioned Hive-style table — and it would be exactly the *right*
+behavior if every Bronze `clicks` object shared one partitioning scheme.
+But Section 15's incremental-load key format
+(`build_bronze_incremental_key`) partitions by
+`watermark_start=.../watermark_end=...` instead — a **different set of
+partition columns entirely**. The moment Silver needs to read both a
+full-load object and an incremental object for the same table in one
+`spark.read.parquet(...)` call (which Phase 2's later milestones will,
+once `clicks`' incremental Bronze objects actually start accumulating),
+Spark's automatic partition discovery has no single consistent column set
+to infer — this is a real, concrete instance of exactly the schema-
+evolution problem Section 39 (planned) exists to address, discovered here
+first, honestly, rather than designed for in advance.
+
+**The fix applied in this component, right now:** `clean_clicks`'s final
+`.select("click_id", "short_code", ..., "silver_loaded_at")` explicitly
+names every output column, silently dropping `ingestion_date` (or
+whatever else partition discovery happened to add) rather than passing it
+through. This makes Silver `clicks`'s schema stable regardless of which
+Bronze objects fed it — but it's a narrow fix for *this* component only,
+not a solved problem: it discards `ingestion_date` rather than deciding
+what to *do* with it (it's a real, potentially useful lineage/audit
+signal — when was this Bronze snapshot taken — that a more complete
+design would likely want to keep, under an unambiguous name, rather than
+throw away). That decision is explicitly deferred to Section 39/50
+(schema evolution, lineage — both planned), not made here by omission.
+
+### 38.8 Failure Scenario
+
+**What happens if this job runs against a Bronze snapshot that includes
+both a full-load object and several incremental objects, without any
+change to the code?**
+
+Per 38.7's real finding: Spark's partition discovery would see multiple,
+inconsistent partition-column sets across the objects it's trying to read
+as one table, and either fail outright (a schema-merge error) or silently
+produce a DataFrame with a partition-column schema that doesn't mean what
+a reader would expect (some rows have `ingestion_date` populated and
+`watermark_start`/`watermark_end` null, others the reverse) — this
+specific failure mode was reasoned through from Spark's own documented
+partition-discovery behavior and this project's own two real key formats,
+not fabricated, but has **not yet been observed directly** in this
+environment, since only one full-load-shaped Bronze object exists here so
+far (an honest DESIGN EXPECTATION, not an ACTUAL OBSERVED result — unlike
+everything in 38.6/38.7 above). The `.select()` fix in 38.7 already
+protects Silver `clicks`'s own *output* schema from this — but it does
+nothing about the read-time schema-merge failure that could occur
+*before* `.select()` ever runs, on a real mixed-object Bronze read. Fixing
+that for real is exactly the work Section 39 (schema evolution, planned)
+takes up — likely by reading full-load and incremental Bronze objects as
+two separate, explicitly-typed reads and unioning the results, rather
+than relying on Spark's automatic partition discovery across a
+mixed-scheme directory at all.
+
+### 38.9 Production Considerations
+
+| Aspect | This repo (POC, this sandbox) | Production |
+|---|---|---|
+| Storage backend | Local filesystem (`data/bronze`, `data/silver`) — ADR-016 | `s3a://<bucket>/bronze`, `s3a://<bucket>/silver`; Spark's own S3A connector (`hadoop-aws`), no change to `clean_clicks` |
+| Spark deployment | `local[*]`, in-process, one machine (Section 37.3) | Real cluster (YARN/Kubernetes), executors across many machines |
+| Bad-row handling | Coerce (`device_type`) or drop (unrecoverable fields), aggregate count only | Section 40's quarantine framework: per-row routing to a reviewable table, not just a count |
+| Mixed partition schemes | Not yet encountered (only one full-load Bronze object exists here) — Section 38.8's named, unobserved failure mode | Explicit per-load-type reads, unioned — Section 39 |
+| Idempotency | Verified for a single, repeated run of the same input (38.6) | Also needs to handle *upstream* Bronze changing between Silver runs — incremental Silver updates, not just full re-derivation each time (Section 47, planned) |
+| Scheduling | Manual (`make transform-silver-clicks`) | Orchestrated (a scheduler/orchestrator step, same open gap Section 15.8/26.8 already name for ingestion) |
+
+### Principal Data Engineer Perspective
+
+The real judgment call worth defending in this component is the
+`.select()` fix in 38.7 — and, more specifically, choosing to write it up
+as a *found* problem with a *narrow* fix and an explicitly *deferred*
+complete solution, rather than either ignoring it (it would have worked
+silently, today, on this project's own single-object Bronze layout) or
+over-engineering a full mixed-partition-scheme reader before any Bronze
+object actually needing one exists. This is the same "don't build it
+until it's earned" discipline Section 35 named for the benchmark
+`cleanup()` duplication, applied here to a schema-handling decision
+instead of a code-duplication one — and it's the kind of real, working-
+system discovery a Principal Engineer is expected to make *by actually
+running things against real data*, not by reasoning about Spark's
+partition-discovery behavior purely in the abstract. The second thing
+worth naming: this component's honest DESIGN EXPECTATION vs. ACTUAL
+OBSERVED split in 38.6-38.8 is deliberately visible, not smoothed over —
+a candidate (or an engineer on this project) should always be able to
+tell, from the guide alone, exactly which claims here have been verified
+against real execution and which haven't yet, the same standard this
+entire guide has held itself to since Section 1.
+
+### 38.10 Principal Engineer Interview Questions
+
+**Q (Category: Data Modeling — Bronze/Silver/Gold): "What's the actual
+difference between Bronze and Silver? Why not just clean the data during
+ingestion, before it ever lands in Bronze?"**
+
+*What's tested:* whether the candidate understands Bronze's purpose as a
+faithful, replayable copy of the source — not a design oversight that
+"forgot" to clean the data.
+
+*What a weak answer looks like:* "Silver is the clean version, Bronze is
+the raw version" — true but doesn't explain *why* keeping them separate
+matters.
+
+*What a strong answer covers:* cleaning during ingestion would mean
+Bronze is no longer a faithful copy of the source — if a cleaning rule
+later turns out to be wrong (an overly aggressive validity check, a
+timezone-normalization bug), there's no way to re-derive a corrected
+Silver from an already-cleaned Bronze; you'd need to re-extract from the
+*source* system, which may no longer have the exact same data
+(`schemas/source/clicks.md`'s own note: `occurred_at` is business time,
+and OLTP data changes/ages out). Keeping Bronze deliberately raw makes
+every Silver/Gold transformation rule **replayable** — a change to
+`clean_clicks` can be re-run against the same, unchanged Bronze data at
+any time, with no dependency on the source system's current state. This
+project's own real example (38.1): the `user_id` float/int quirk was
+discovered *because* Bronze preserved exactly what extraction produced,
+imperfections included — a cleaning-on-ingest design would have masked
+it, silently.
+
+*Concepts:* Bronze as an immutable, replayable system of record;
+separating "what happened" from "what we currently believe is correct
+about it"; reprocessability as a design property, not an afterthought.
+
+*Expected follow-up:* "If you found a bug in `clean_clicks` next month,
+what would you have to do?" — Fix the function, then simply re-run it
+against the same, unchanged Bronze data to produce a corrected Silver —
+no re-extraction from Postgres needed, precisely because Bronze already
+has everything Silver needs.
+
+*Common mistake:* treating Bronze/Silver/Gold as an arbitrary naming
+convention rather than a real architectural property (replayability)
+that has a concrete, costly consequence if collapsed into one layer.
+
+**Q (Category: Data Quality Judgment): "For `device_type`, you coerce
+invalid values to `'unknown'` instead of dropping the row. For a missing
+`short_code`, you drop the row instead of defaulting it. Why the
+different treatment?"**
+
+*What's tested:* whether the candidate can articulate a *principled* rule
+for when to coerce vs. drop, rather than applying one uniform policy
+everywhere out of convenience.
+
+*What a weak answer looks like:* "It depends on the field" — true, but
+doesn't say what it depends *on*.
+
+*What a strong answer covers:* the deciding question is whether a
+sensible, honest default exists. `device_type` already has a real,
+already-modeled "I don't know" value — `'unknown'`, matching
+`dim_device`'s existing convention (Section 10.3) — so coercing an
+unrecognized value there is not inventing information, it's correctly
+routing to a category that already means "not classified." `short_code`
+has no equivalent: there's no honest default URL a missing short code
+could stand in for, so keeping the row would mean fabricating an
+attribution that doesn't exist. The same reasoning is why `hashed_ip`
+gets nulled rather than dropped — it has an existing nullable slot in the
+contract already, and nothing downstream needs it to be non-null — while
+`click_id`/`occurred_at` get dropped, because neither has any default
+that wouldn't misrepresent the record.
+
+*Concepts:* coerce-vs-drop as a per-field decision grounded in whether a
+non-fabricated default exists, not a blanket policy; reusing an
+already-modeled "unknown" convention instead of inventing a new one.
+
+*Expected follow-up:* "Where does this reasoning break down at scale —
+what happens once there are 50 columns across 10 tables, each needing
+this same per-field judgment call made individually?" — This is exactly
+Section 40's data quality framework's job: making the coerce/drop/null
+decision a declared, per-column *rule* (likely alongside
+`contracts/source/*.yaml`'s existing `quality_rules`, the same
+co-location reasoning ADR-014 already applied to PII classification)
+rather than logic re-derived by hand inside every transformation
+function.
+
+*Common mistake:* treating "drop everything invalid" or "keep everything,
+coerce to a default" as a uniform, one-size-fits-all policy — the
+interview signal is in showing the decision is made per-field, on
+purpose, against a real repository's actual modeled conventions.
+
+---

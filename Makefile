@@ -1,4 +1,4 @@
-.PHONY: venv install up down logs ps db-shell ingest ingest-full create-analytics-schema validate-contracts check-stale-runs reconcile-bronze storage-stats benchmark-parquet benchmark-query-performance benchmark-extraction-time layout-report ingestion-history ingestion-summary pii-report test test-integration coverage lint fmt seed
+.PHONY: venv install install-transform up down logs ps db-shell ingest ingest-full create-analytics-schema validate-contracts check-stale-runs reconcile-bronze storage-stats benchmark-parquet benchmark-query-performance benchmark-extraction-time layout-report ingestion-history ingestion-summary pii-report test test-integration test-transform coverage lint fmt seed write-local-bronze-clicks transform-silver-clicks
 
 venv:
 	python3.12 -m venv .venv
@@ -6,6 +6,12 @@ venv:
 
 install:
 	pip install -e ".[dev]"
+
+# Phase 2 only -- pulls in pyspark (a JVM-backed dependency Phase 1 never
+# needs). See pyproject.toml's `transform` extra and
+# docs/analytics-engineering-guide.md, Phase 2, ADR-016.
+install-transform:
+	pip install -e ".[dev,transform]"
 
 up:
 	docker compose up -d
@@ -94,6 +100,13 @@ test:
 test-integration:
 	pytest -v -m integration
 
+# Phase 2 only. Explicit PYTHONPATH + path, same reason
+# benchmark-query-performance/benchmark-extraction-time need it: pytest's
+# own testpaths (pyproject.toml) stays scoped to ingestion/tests, so plain
+# `make test` never requires pyspark to be installed.
+test-transform:
+	PYTHONPATH=ingestion/src:transformations/src python3 -m pytest transformations/tests/unit -v
+
 # See docs/analytics-engineering-guide.md Section 24. Measured, not
 # gated -- no --cov-fail-under threshold yet (Section 24.3).
 coverage:
@@ -104,3 +117,15 @@ lint:
 
 fmt:
 	ruff format .
+
+# See docs/analytics-engineering-guide.md, Phase 2, ADR-016 and Section
+# 38. Writes a real Bronze `clicks` Parquet snapshot to the local
+# filesystem (data/bronze/...) using the real extract_full() function
+# against real Postgres -- this sandbox has no real MinIO to write to.
+write-local-bronze-clicks:
+	PYTHONPATH=ingestion/src python3 scripts/write_local_bronze_clicks.py
+
+# See docs/analytics-engineering-guide.md, Phase 2, Section 38. Requires
+# write-local-bronze-clicks to have been run at least once first.
+transform-silver-clicks:
+	PYTHONPATH=ingestion/src:transformations/src python3 transformations/src/analytics_transform/silver/transform_clicks.py

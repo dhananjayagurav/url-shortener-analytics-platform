@@ -23,6 +23,12 @@ dev = [
     "ruff>=0.6",
     "faker>=28.0",
 ]
+# Phase 2 only -- kept separate from `dev` so a Phase-1-only setup
+# (`make install`) never pulls in a JVM-backed dependency it doesn't need.
+# See docs/analytics-engineering-guide.md, Phase 2 Section 37.
+transform = [
+    "pyspark==3.5.9",
+]
 
 [project.scripts]
 ingest = "url_shortener_analytics.cli:main"
@@ -32,8 +38,8 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-where = ["ingestion/src"]
-include = ["url_shortener_analytics*"]
+where = ["ingestion/src", "transformations/src"]
+include = ["url_shortener_analytics*", "analytics_transform*"]
 
 [tool.ruff]
 line-length = 100

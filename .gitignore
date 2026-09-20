@@ -20,3 +20,10 @@ sample_data/generated/
 
 # Local benchmark output (raw numbers, not the benchmark code itself).
 benchmarks/results/
+
+# Local Bronze/Silver/Gold data lake root. This environment has no real
+# MinIO/S3 available (see Phase 2, ADR-016), so transformations read and
+# write Parquet under data/ on the local filesystem instead of a bucket.
+# Generated, never committed -- same convention as pg_data/ and
+# sample_data/generated/ above.
+data/

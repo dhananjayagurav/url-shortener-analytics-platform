@@ -47,12 +47,14 @@ the guide for why Kafka/Spark/Airflow are deliberately not here yet.
 |---|---|
 | `docs/analytics-engineering-guide.md` | The learning guide — concepts, architecture, ADRs, labs, interview prep. Start here. |
 | `ingestion/` | The Phase 1 ingestion package, its tests, and its config. |
+| `transformations/` | The Phase 2 transformation package (`analytics_transform`) — Bronze → Silver → Gold, on Spark. See `transformations/README.md`. |
 | `schemas/source/`, `sql/source/` | The real (and clearly-labeled hypothetical) source schema this platform extracts from. |
 | `schemas/analytics/`, `sql/analytics/` | The analytical (star schema) model — `dim_date`/`dim_url`/`dim_user`/`dim_device`/`fact_clicks`. Schema only; Phase 2 populates it. |
 | `contracts/` | Formal, machine-checked data contracts for the source tables — `make validate-contracts`. |
-| `scripts/` | One-off operator scripts (e.g. `seed_sample_data.py`), not part of the ingestion package itself. |
+| `scripts/` | One-off operator scripts (e.g. `seed_sample_data.py`, `write_local_bronze_clicks.py`), not part of either package itself. |
 | `benchmarks/` | Executable performance benchmarks (Parquet vs CSV/JSON; query performance and extraction time at scale). See `benchmarks/README.md`. |
 | `sample_data/` | Convention-only landing spot for locally generated files; nothing here is committed. |
+| `data/` | Local Bronze/Silver/Gold data lake root, Phase 2 only — this environment has no real MinIO/S3 (see ADR-016), so transformations read/write Parquet here instead of a bucket. Gitignored. |
 | `tests/` | Reserved for cross-phase end-to-end tests (empty in Phase 1 — see `ingestion/tests/` for what exists now). |
 
 ## Prerequisites
@@ -78,6 +80,11 @@ make ingest-full      # override: force a full load of every table (backfills/re
 
 make create-analytics-schema   # applies the star schema DDL (dim_*, fact_clicks) -- schema only, Phase 2 populates it
 make validate-contracts        # checks contracts/source/*.yaml against the real database
+
+# --- Phase 2 (optional; pulls in pyspark) ---
+make install-transform            # pip install -e ".[dev,transform]"
+make write-local-bronze-clicks    # real Bronze clicks Parquet snapshot, written locally -- see ADR-016
+make transform-silver-clicks      # Bronze clicks -> Silver clicks (Spark)
 ```
 
 ## Testing
@@ -85,6 +92,7 @@ make validate-contracts        # checks contracts/source/*.yaml against the real
 ```bash
 make test              # unit tests -- SQLite + mocked S3, no Docker required
 make test-integration   # requires `make up` first -- real Postgres + MinIO
+make test-transform     # Phase 2 -- real local[1] SparkSession, no Docker required
 make coverage           # unit-test coverage report -- measured, not gated yet
 ```
 
@@ -116,14 +124,21 @@ recorded, and a five-axis scale-design review has been run against real
 benchmark data. See the guide's Phase 1 Summary and Completion Checklist
 for the full close-out, including the specific, named gaps (not every
 item is "finished" — each remaining one is stated explicitly, not
-implied away) that carry into Phase 2. Phase 2 begins only when
-explicitly requested.
+implied away) that carry into Phase 2.
+
+**Phase 2: Data Lake, Transformation & Data Quality** — in progress. The
+first component is built and genuinely run: Bronze `clicks` → Silver
+`clicks` on real local Spark, reading a real Bronze snapshot pulled from
+the real (locally-running) Postgres. See `docs/analytics-engineering-guide.md`,
+Phase 2, Section 38, and `transformations/README.md`. Later milestones
+(SCD, the full data-quality/quarantine framework, Gold dimensional joins,
+and the rest of Phase 2's topics) are not yet built — each is named,
+not implied, in the guide's Phase 2 table of contents.
 
 ## Future phases
 
 | Phase | Focus |
 |---|---|
-| 2 | Data Lake, Transformation & Data Quality (Spark, Bronze/Silver/Gold, SCD) |
 | 3 | Analytical Serving, Orchestration & Observability |
 | 4 | Production Hardening, Performance, Governance & Principal-Level Design |
 
