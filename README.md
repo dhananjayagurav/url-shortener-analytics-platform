@@ -85,6 +85,7 @@ make validate-contracts        # checks contracts/source/*.yaml against the real
 ```bash
 make test              # unit tests -- SQLite + mocked S3, no Docker required
 make test-integration   # requires `make up` first -- real Postgres + MinIO
+make coverage           # unit-test coverage report -- measured, not gated yet
 ```
 
 ## Benchmarking

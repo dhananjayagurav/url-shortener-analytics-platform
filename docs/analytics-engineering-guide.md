@@ -99,7 +99,7 @@ with the exact command to produce the real result yourself.
 
 **Quality & Operations**
 23. [PII and Security](#23-pii-and-security-) ✅✅
-24. Testing (deep-dive) ⏳ *(tests exist now — see [Section 14.6](#146-how-to-test)*)
+24. [Testing (deep-dive)](#24-testing-deep-dive-) ✅✅
 25. Failure Scenarios (all 10) ⏳ *(one is demonstrated now — see [Section 14.7](#147-failure-scenario)*)
 26. Performance ⏳
 27. Scale Design ⏳
@@ -107,8 +107,8 @@ with the exact command to produce the real result yourself.
 **Reference**
 28. [Architectural Principles](#28-architectural-principles) ✅ *(introduced now, extended as more are demonstrated)*
 29. [Architecture Decision Records](#29-architecture-decision-records) ✅
-30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6; LAB 12 — Section 16.5; LAB 13 — Section 17.5; LAB 14 — Section 18.5; LAB 15 — Section 19.5; LAB 16 — Section 20.5; LAB 17 — Section 21.5; LAB 18 — Section 22.5; LAB 19 — Section 23.5)*
-31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, and 23.9)*
+30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6; LAB 12 — Section 16.5; LAB 13 — Section 17.5; LAB 14 — Section 18.5; LAB 15 — Section 19.5; LAB 16 — Section 20.5; LAB 17 — Section 21.5; LAB 18 — Section 22.5; LAB 19 — Section 23.5; LAB 20 — Section 24.5)*
+31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, and 24.9; Category I begins at 24.9)*
 32. Principal-Level Scenarios ⏳
 33. [Phase 1 Summary](#33-phase-1-summary-so-far) (running, updated each increment)
 34. [Phase 1 Completion Checklist](#34-phase-1-completion-checklist)
@@ -7457,6 +7457,479 @@ a check nobody runs guarantees nothing.
 
 ---
 
+## 24. Testing (deep-dive) ✅✅
+
+### 24.1 Concept
+
+This project has been testing itself since Section 6. Every increment
+since then has run `make test` and reported the result honestly. What's
+never happened is a section that steps back and asks: what actually
+makes a good test suite, why does this project split its tests into two
+separate directories, and what does "80 tests passing" actually prove,
+versus what it doesn't prove at all? This section is that step back.
+
+Two ideas anchor everything else here.
+
+The first is the **test pyramid**. Picture three layers stacked on top of
+each other. At the bottom, a wide base of fast, small, isolated **unit
+tests** — each one checks one function or one class, in memory, with no
+real database, no real network call, no real file on disk. In the
+middle, a smaller layer of **integration tests** — each one checks that
+two or more real pieces (your code and a real database, or your code and
+a real object store) actually work together. At the top, a thin sliver
+of **end-to-end tests** — each one drives the whole system the way a real
+user or a real scheduled job would. The pyramid shape is the point: you
+want many unit tests, fewer integration tests, and very few end-to-end
+tests, because each layer up costs more to run and more to maintain, and
+catches a narrower, later class of bug.
+
+The second idea is **test doubles**. A test double is a fake, controllable
+stand-in for something a unit test doesn't want to depend on for real —
+a real database connection, a real network call, a real clock. The most
+common kind, a **mock**, is an object that pretends to be the real thing,
+records how it was called, and lets the test tell it exactly what to
+return. This project's unit tests use `unittest.mock.MagicMock` as a
+stand-in for `boto3`'s real S3 client, and an in-memory SQLite database
+as a stand-in for real Postgres.
+
+### Why does this exist?
+
+A pipeline that reads from one real database and writes to one real
+object store has two genuinely different kinds of things that can go
+wrong. The first kind is a bug in your own logic: a watermark computed
+one row too early, a retry loop that doesn't actually retry, a
+classification function that silently accepts an invalid value. The
+second kind is a bug in how your code talks to the real world: a SQL
+dialect difference SQLite doesn't have but Postgres does, a real network
+timeout, an S3 API quirk a mock doesn't reproduce.
+
+Unit tests are built to catch the first kind, fast, and in large volume —
+this project's 80 of them run in about seven seconds, with no setup at
+all. Integration tests are built to catch the second kind, and they cost
+more to run: they need a real Postgres, and two of this project's three
+integration test files also need real MinIO, neither of which this
+sandbox has always had available for free. Neither kind of test can
+catch what the other one is built for. A pipeline with 100% passing unit
+tests and zero integration tests could still be completely broken
+against the one real database it will actually run against — SQLite and
+Postgres are not the same database, and Section 12's own docstring
+already names one concrete way they disagree (their type systems don't
+share an exact vocabulary, which is why contract validation compares
+coarse categories, not exact types).
+
+### Simple Example (generic, pre-URL-Shortener)
+
+Picture a function that charges a customer's credit card:
+
+```python
+def charge_card(payment_gateway, amount_cents: int) -> str:
+    if amount_cents <= 0:
+        raise ValueError("amount must be positive")
+    return payment_gateway.charge(amount_cents)
+```
+
+A unit test for the `ValueError` branch needs no real payment gateway at
+all — it can pass in `None` for `payment_gateway`, since that branch
+never touches it:
+
+```python
+def test_charge_card_rejects_a_non_positive_amount():
+    with pytest.raises(ValueError):
+        charge_card(None, amount_cents=0)
+```
+
+A unit test for the success path uses a mock, so the test never actually
+moves real money:
+
+```python
+def test_charge_card_calls_the_gateway_with_the_right_amount():
+    mock_gateway = MagicMock()
+    mock_gateway.charge.return_value = "txn_123"
+
+    result = charge_card(mock_gateway, amount_cents=500)
+
+    mock_gateway.charge.assert_called_once_with(500)
+    assert result == "txn_123"
+```
+
+Neither test proves the real payment gateway's API actually accepts a
+call shaped this way. Only an integration test, against a real sandbox
+account for that payment provider, can prove that.
+
+### URL Shortener Example
+
+This project's own version of that same charge-card mock is
+`test_reconciliation.py`'s `s3_client = MagicMock()`, with
+`s3_client.list_objects_v2.return_value` set to whatever object keys the
+test wants to pretend exist in Bronze — no real MinIO involved, and the
+test runs in milliseconds. Its own version of the in-memory database is
+`conftest.py`'s `sqlite_engine` fixture, used by every unit test in
+`ingestion/tests/unit/` that needs a real, queryable
+`ingestion_metadata` table without needing real Postgres running.
+
+The pyramid's middle layer lives in `ingestion/tests/integration/`: three
+files, each marked `@pytest.mark.integration` and excluded from `make
+test` by default (`pyproject.toml`'s `addopts = "-m 'not integration'"`).
+`test_contracts_integration.py` needs only real Postgres.
+`test_full_load_integration.py` and `test_incremental_load_integration.py`
+need real Postgres *and* real MinIO, since they exercise this project's
+actual `boto3` calls against a real S3-compatible endpoint, not a mock of
+one.
+
+### 24.2 Architecture
+
+```
+ ingestion/tests/
+   unit/                          <- wide base of the pyramid
+     conftest.py                    sqlite_engine fixture (shared)
+     test_*.py                      80 tests total, MagicMock for S3,
+                                     sqlite_engine for the database
+     runs via:  make test           (pytest -m "not integration", the
+                                      default -- see pyproject.toml)
+         │
+         │  proves: this project's OWN logic is correct, in isolation,
+         │  in about 7 seconds, with nothing external required
+         ▼
+   integration/                   <- middle layer of the pyramid
+     test_contracts_integration.py       needs: real Postgres only
+     test_full_load_integration.py       needs: real Postgres + real MinIO
+     test_incremental_load_integration.py needs: real Postgres + real MinIO
+     runs via:  make test-integration  (pytest -m integration)
+         │
+         │  proves: this project's code ACTUALLY WORKS against the real
+         │  systems it depends on, not just against a mock or a stand-in
+         ▼
+   (no end-to-end layer exists yet -- there's no scheduler, so there's
+    no "run the whole pipeline the way production would" test to write)
+
+ A THIRD, SEPARATE axis: coverage measurement.
+   make coverage  ->  pytest --cov=url_shortener_analytics --cov-report=term-missing
+   Measures which LINES the unit-test layer actually executes.
+   Says nothing by itself about whether the assertions are any good --
+   see Section 24.3 and 24.8 for why this project measures coverage
+   without gating on it yet.
+```
+
+### 24.3 Design Decision: measure coverage now, but don't gate on it yet
+
+**Context:** `pytest-cov` has been listed in `pyproject.toml`'s dev
+dependencies since this project's very first `pyproject.toml` was
+written. Nobody had ever actually run it. Running it for the first time,
+in this sandbox, for this section, produced a real number: 58% of this
+project's own source lines are exercised by the unit-test suite.
+
+**Decision:** wire up `make coverage` so that number is visible and
+reproducible on demand. Do not add a `--cov-fail-under` threshold to
+`pyproject.toml`'s `addopts`, and do not fail `make test` if coverage
+drops.
+
+**Consequences:** coverage becomes a number a developer can check, but
+nothing currently stops it from getting worse over time. Section 24.8
+names this as a real, temporary gap, not a permanent design choice.
+
+### Alternatives
+
+Set a hard threshold immediately (`--cov-fail-under=80`, enforced on
+every `make test` run). Or: leave `pytest-cov` uninstalled and unused, as
+it already was before this section — the actual status quo up to this
+point.
+
+### Trade-offs
+
+| | Measure only (chosen) | Measure and gate at a fixed threshold |
+|---|---|---|
+| Honesty about the real number | High — 58% is reported as exactly what it is | Risky — a number picked before seeing real coverage (like 80%) can be arbitrary, and this project's real number is currently well below it |
+| Forces new tests to be written today | No | Yes, immediately, possibly for the wrong reasons (chasing a number rather than testing what matters) |
+| Still better than the prior status quo | Yes — a real, visible number beats an unused, silently-declared dependency | Also yes, but the jump is bigger and better justified once there's a CI system to actually enforce it in |
+| Right choice for this project, right now | Yes — no CI exists yet to enforce a gate consistently, and a gate nobody enforces is worse than no gate at all, since it implies a guarantee that isn't real | Would be the right next step, once CI exists (Section 24.8) |
+
+This mirrors a choice this project has made before, in a different
+context: Section 21.3 chose to detect a problem (small Bronze files)
+without automatically fixing it, because automatic remediation without
+enough surrounding safety net can do more harm than the problem it
+solves. Measuring coverage without gating on it is the same shape of
+caution, applied to a testing concern instead of a storage one.
+
+### 24.4 Implementation
+
+**Implementation Guide (write-it-yourself):** add a `coverage` target to
+the `Makefile` that runs `pytest --cov=url_shortener_analytics
+--cov-report=term-missing`. `--cov=url_shortener_analytics` tells
+`pytest-cov` which package to measure — without it, coverage would
+report on `pytest`'s own internals, which is never what you want.
+`--cov-report=term-missing` prints not just a percentage per file, but
+the exact line numbers that were never executed, which is what makes the
+report actionable instead of just a number.
+
+**Reference Implementation** (`Makefile`, excerpt):
+
+```makefile
+# See docs/analytics-engineering-guide.md Section 24. Measured, not
+# gated -- no --cov-fail-under threshold yet (Section 24.3).
+coverage:
+	pytest --cov=url_shortener_analytics --cov-report=term-missing
+```
+
+### Hands-on Challenge (implement-yourself)
+
+Before running `make coverage` yourself, write down a guess: which file
+in `ingestion/src/url_shortener_analytics/` do you expect to have the
+*lowest* coverage percentage, and why? Then run it for real and check
+your guess against 24.6's real numbers below. A common wrong guess:
+assuming the least-tested file must be the newest or most complex one.
+The real answer is more structural than that — see 24.7 for the reasoning.
+
+### 24.5 Hands-on Exercise
+
+**LAB 20 — Run the real coverage report, then reproduce a real
+environment-mismatch failure on purpose.**
+
+First, the coverage report:
+
+```bash
+make coverage
+```
+
+Then, the break-then-fix half of this lab. `test_contracts_integration.py`
+needs real Postgres, and this sandbox has one — but its `settings`
+fixture, un-overridden, points at port 5433 (this project's
+docker-compose mapping), not the 5432 this sandbox's Postgres actually
+listens on. Run it once with no override, and read the real error:
+
+```bash
+pytest ingestion/tests/integration/test_contracts_integration.py -v -m integration
+```
+
+Then run it again, this time supplying the port your own Postgres
+actually uses:
+
+```bash
+DATABASE_URL="postgresql+psycopg://analytics:analytics@localhost:5432/analytics" \
+  pytest ingestion/tests/integration/test_contracts_integration.py -v -m integration
+```
+
+What to observe: the first run fails with a real
+`sqlalchemy.exc.OperationalError`, naming the exact port it tried and
+the exact reason (connection refused). The second run passes. Nothing
+about the *code* changed between the two runs — only the environment
+variable did. This is the same distinction Section 24.7 turns into this
+section's Failure Scenario: a test that depends on an assumption about
+its environment can fail for a reason that has nothing to do with a bug
+in the code it's testing.
+
+### 24.6 How to test
+
+```bash
+make test
+```
+
+ACTUAL OBSERVED, this sandbox:
+
+```
+80 passed in 6.66s
+```
+
+```bash
+make coverage
+```
+
+ACTUAL OBSERVED, this sandbox:
+
+```
+Name                                                           Stmts   Miss  Cover   Missing
+--------------------------------------------------------------------------------------------
+ingestion/src/url_shortener_analytics/cli.py                     222    222     0%   50-479
+ingestion/src/url_shortener_analytics/config.py                   15      0   100%
+ingestion/src/url_shortener_analytics/contracts.py                79      2    97%   102, 105
+ingestion/src/url_shortener_analytics/db.py                        9      9     0%   11-32
+ingestion/src/url_shortener_analytics/exceptions.py                6      0   100%
+ingestion/src/url_shortener_analytics/extract_full.py             29      0   100%
+ingestion/src/url_shortener_analytics/extract_incremental.py      34      0   100%
+ingestion/src/url_shortener_analytics/logging_setup.py            20     20     0%   13-48
+ingestion/src/url_shortener_analytics/metadata.py                 98     16    84%   56-57, 117-118, ...
+ingestion/src/url_shortener_analytics/object_store.py             78      1    99%   38
+ingestion/src/url_shortener_analytics/pii.py                      30      0   100%
+ingestion/src/url_shortener_analytics/reconciliation.py           22      0   100%
+--------------------------------------------------------------------------------------------
+TOTAL                                                            643    270    58%
+```
+
+`ruff check ingestion/ benchmarks/` was also run — ACTUAL OBSERVED: `All
+checks passed!`
+
+Both integration checks named in this section's Hands-on Exercise were
+also genuinely run. Without `DATABASE_URL` set, ACTUAL OBSERVED:
+
+```
+sqlalchemy.exc.OperationalError: (psycopg.OperationalError) connection failed:
+connection to server at "127.0.0.1", port 5433 failed: Connection refused
+```
+
+With it set to this sandbox's real port, ACTUAL OBSERVED:
+
+```
+1 passed in 0.96s
+```
+
+The other two integration files were also run, with the correct
+`DATABASE_URL`, to confirm today's real status. ACTUAL OBSERVED: 5
+failed, all with the same root cause —
+`botocore.exceptions.EndpointConnectionError: Could not connect to the
+endpoint URL: "http://localhost:9000/..."` — because this sandbox has no
+MinIO. This is not a new finding; it's the expected, already-named
+consequence of this sandbox having real Postgres but no Docker, and it
+was worth re-confirming for real, for this section, rather than assumed
+to still be true.
+
+### 24.7 Failure Scenario
+
+**What happens when a test's assumption about its environment is wrong,
+but the code under test is completely fine?**
+
+This is exactly what LAB 20 reproduced. `test_contracts_integration.py`'s
+`settings` fixture builds a plain `Settings()` object, which falls back
+to its class-level default connection string whenever no environment
+variable overrides it (`config.py`, Section 6) — and that default names
+port 5433, this project's docker-compose mapping. This sandbox's real
+Postgres, installed directly rather than through Docker, listens on the
+standard port 5432 instead. Running the test with no override produces a
+real, genuine failure: a connection-refused error, in the driver layer,
+before a single line of this project's own contract-validation code ever
+runs.
+
+The honest, easy-to-miss point: this failure proves nothing about
+whether `validate_all_contracts` works. It proves only that this one
+test's default settings don't match this one sandbox's specific
+Postgres port. A developer unfamiliar with this distinction could read a
+failing integration test, assume the code is broken, and start
+debugging `contracts.py` — the wrong place entirely. This is also why
+Section 24.1 stressed that unit tests and integration tests catch
+different bugs: a unit test using `sqlite_engine` never touches a real
+port number at all, so it can never fail this particular way, for better
+(no environment-mismatch false alarms) and for worse (it also can't
+catch a *real* connectivity problem the way this integration test just
+did, for real, in this exact sandbox).
+
+### 24.8 Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| Unit vs. integration separation | Two directories, one pytest marker, `addopts` excludes `integration` by default (Section 6) | Same structure, typically also split into separate CI jobs so integration tests don't block a fast unit-test-only feedback loop |
+| Coverage | Measured on demand (`make coverage`), not gated, 58% today | Measured on every CI run, gated at an agreed threshold, with the threshold raised over time rather than set once and forgotten |
+| CI | None — every check in this project has been run by hand, in this sandbox, and reported honestly as such | A pipeline that runs `make test`, `make lint`, and `make coverage` (with its gate) on every pull request, and `make test-integration` on a schedule or before a release, against real, ephemeral Postgres/MinIO containers |
+| Environment-mismatch failures (this section's Failure Scenario) | A developer has to already know this sandbox's port differs from docker-compose's, and pass `DATABASE_URL` by hand | A CI job's own environment is defined once, in one place (a docker-compose file or CI config), so no developer ever has to know or guess a port by hand |
+| Flaky-test handling | Not yet a concern — no test in this suite has ever been observed to fail non-deterministically | A quarantine mechanism (a marker, or a separate "known flaky" job) once a real flaky test is found, so one intermittent test can't block every other developer's CI run |
+| Test data management | Hand-written fixtures (`seeded_clicks`, `VALID_CONTRACT`) and this project's own `scripts/seed_sample_data.py` | Same idea at larger scale, often generated with a library like Faker (already a dev dependency here, listed in `pyproject.toml`, but not yet used by any test in this suite — a smaller version of the same "declared but unused" pattern this section found with `pytest-cov`) |
+
+### Principal Data Engineer Perspective
+
+The habit worth defending here is the same one this guide has practiced
+since Section 16: actually running the thing before writing about it,
+instead of describing what a coverage report would probably say. `58%`
+is a real number, and it's genuinely lower in places than a casual guess
+might predict — `cli.py` sits at a flat 0%, not because nobody cares
+about it, but because its command functions are thin wrappers (parse
+config, build an engine, call the real logic, log the result), and every
+one of the *real* decisions inside them lives in functions like
+`run_full_load` or `classify_all_contracts`, which already have direct,
+dedicated unit tests. A shallow reading of "0% coverage" would call this
+untested. A more careful reading asks what, specifically, would break if
+that 0% stayed 0% forever — and the honest answer is: real bugs, but a
+narrower class of them than the number alone suggests (argument parsing,
+logging field names, exit codes — not the actual business logic those
+functions call into).
+
+The second thing worth naming is the discovery pattern itself, not just
+its result. `pytest-cov` sat declared, unused, for every prior section
+of this guide. Nobody was lying about it — nobody had looked. The fix
+here wasn't clever; it was running one command that had always been
+available and reporting what it actually said. That's a smaller version
+of exactly what Section 22 did for `watermark_start`, and Section 23 did
+for the `validate-contracts`-vs-`pii-report` gap: the useful skill isn't
+writing correct code the first time, it's habitually checking whether
+something declared as done actually is, on a schedule, rather than once.
+
+### 24.9 Principal Engineer Interview Questions
+
+**Q (Category I: Testing Strategy — this closes the forward reference
+`ingestion/tests/integration/README.md` has carried since Section 12):
+"Your unit tests all pass. Does that mean your pipeline works?"**
+
+*What's tested:* whether the candidate understands the specific,
+narrower claim a passing unit-test suite actually makes, versus the
+broader claim non-technical stakeholders often assume it makes.
+
+*What a weak answer looks like:* "Yes, if the tests pass, the code
+works" — treats "the code's own logic is internally consistent" as the
+same claim as "the system works end-to-end," which it isn't.
+
+*What a strong answer covers:* no — passing unit tests prove this
+project's own logic behaves correctly against the specific inputs and
+mocks each test constructs. They say nothing about whether the real
+Postgres dialect actually matches what SQLite let a test get away with,
+or whether the real S3 API returns exactly the shape a `MagicMock`
+was told to return. This project's own `test_contracts_integration.py`
+is a real, demonstrated example: it passed cleanly here in this sandbox
+only once pointed at the correct real port — no unit test could have
+caught that port mismatch at all, because no unit test touches a real
+port.
+
+*Concepts:* the test pyramid; what a mock proves versus what it doesn't;
+the difference between "internally consistent" and "correct against the
+real world."
+
+*Expected follow-up:* "Given limited time before a release, would you
+rather add ten more unit tests or one more integration test?" — Depends
+entirely on what's already covered: if the pyramid's middle layer is
+thin relative to real integration risk (as this project's currently is —
+two of three integration files have never once run against real MinIO
+in this environment), the integration test usually buys more confidence
+per hour spent, precisely because it's the layer nothing else can
+substitute for.
+
+*Common mistake:* treating "we have good test coverage" as one single
+fact, rather than two separate facts — how much of the code runs during
+tests, and how well the real world is represented while it does.
+
+**Q: "You just found that `pytest-cov` had been declared as a dependency
+for the whole life of this project but never run. Whose fault is that,
+and what would you change to make sure it doesn't happen again?"**
+
+*What's tested:* whether the candidate reaches for blame or for a
+process fix, and whether they can name a concrete mechanism rather than
+a vague intention.
+
+*What a weak answer looks like:* "Whoever added the dependency should
+have used it" — assigns blame to an individual, and proposes nothing
+that would actually prevent a repeat.
+
+*What a strong answer covers:* this isn't really about one person
+forgetting something once — it's about a declared intention with no
+enforcement mechanism behind it, which will drift every time, for
+whoever's working on the project. The fix isn't "remember harder"; it's
+removing the need to remember at all — wiring the coverage command into
+CI (Section 24.8) so it runs on every change whether or not anyone
+thinks to run it by hand, the same way `ruff check` already runs
+automatically rather than depending on a developer remembering to lint.
+
+*Concepts:* the gap between a declared intention (a dependency in a
+manifest file) and an enforced behavior (something that actually runs);
+automation as the fix for "someone forgot," rather than individual
+diligence.
+
+*Expected follow-up:* "What's the smallest first step toward that, given
+this project has no CI at all yet?" — Even before a full CI pipeline
+exists, a `pre-commit` hook or a documented pre-merge checklist that
+runs `make test && make coverage` closes most of the gap immediately,
+without needing the larger infrastructure investment a full CI system
+represents.
+
+*Common mistake:* proposing a full CI/CD platform as the only acceptable
+answer, when the actual, immediately available first step is much
+smaller and could ship today.
+
+---
+
 ## 28. Architectural Principles
 
 Introduced here, demonstrated incrementally as more of Phase 1 is built.
@@ -7770,68 +8243,78 @@ the same posture unless a specific, named reason justifies auto-remediation.
 
 ## 33. Phase 1 Summary (so far)
 
-**What we've built in this increment:** PII and Security (Section 23),
-turning two earlier one-off decisions — Section 7.2's `hashed_ip`
-reasoning and Section 10.4's `dim_user`-excludes-`email` decision — into
-one repeatable process every source column now goes through. Genuinely
-new code: a required `pii` field (`none` / `pseudonymized` / `direct`)
-added to every column in all three `contracts/source/*.yaml` files;
-`pii.py`, with `classify_table` and `classify_all_contracts`, built as a
-thin layer over Section 12's existing `contracts.load_contract` rather
-than a second, separate loader; and a new `pii-report` CLI command. 7
-new unit tests (73 → 80).
+**What we've built in this increment:** Testing (deep-dive, Section 24),
+the first section that steps back from writing new pipeline code and
+asks what this project's 80 unit tests actually prove, what they don't,
+and why the test suite is split into two directories in the first place.
+Genuinely new code is small on purpose: a `make coverage` target
+(`pytest --cov=url_shortener_analytics --cov-report=term-missing`), run
+for the first time ever against this project, since `pytest-cov` had
+been declared as a dev dependency since this project's very first
+`pyproject.toml` but never actually invoked. No new unit tests were
+added this increment — this section is about measuring and explaining
+the 80 that already existed, not growing the count further.
 
-**A note on this increment specifically:** the real finding here is a
-gap between two checks that look like they'd overlap, but don't. `make
-validate-contracts` (Section 12) never looks at the new `pii` field at
-all — it only compares type and nullability. A new column could ship
-with a full schema and no PII classification, pass `validate-contracts`
-cleanly, and only get caught by `make pii-report`, run separately, by
-hand. This was proven directly in this sandbox, not assumed: a
-schema-valid contract with an undeclared `pii` field passed
-`validate_contract` with zero violations, then raised `ContractError`
-from `classify_table` on the very next line (Section 23.6). Section
-23.2's architecture diagram also surfaces a second, quieter finding:
-`fact_clicks` has never carried a `hashed_ip` column, since Section 11,
-but nothing before this section had named that as a PII-driven decision
-the way Section 10.4 named `dim_user`'s `email` exclusion.
+**A note on this increment specifically:** two real findings came out of
+finally running tools that had been sitting unused. First, coverage:
+58% of this project's own source lines are exercised by the unit-test
+suite, with `cli.py` at a flat 0% (its command functions are thin
+wrappers around already-tested logic, explained in 24's Principal
+Perspective) and `metadata.py` at 84% (its `except Exception -> raise
+MetadataError` branches, in every function, have never once been
+exercised by a test). Second, a genuine environment-mismatch bug in this
+project's own integration test suite: `test_contracts_integration.py`'s
+`settings` fixture defaults to port 5433 (docker-compose's mapping), but
+this sandbox's real, non-Docker Postgres listens on 5432 — reproduced as
+a real `OperationalError`, then fixed for this one run with a
+`DATABASE_URL` override, and written up as Section 24's Failure
+Scenario. The test's own docstring had claimed it was "NOT YET EXECUTED
+in this sandbox," which was also stale — it has passed here, with the
+override, in this and prior increments; that docstring is now fixed too.
 
 **Concepts taught so far, at full depth:** the real application's
 architecture and schema, OLTP vs. OLAP, full load and incremental-load
 ingestion (watermarks, idempotency, checkpointing, Bronze reconciliation),
 the entire data modeling layer (Sections 7-12), the Storage block in
 full (Sections 18-21), `ingestion_metadata` as this pipeline's control
-plane (Section 22), and now PII classification: the real difference
-between pseudonymization and anonymization, why a hashed value is still
-personal data, and why this project chose to classify PII inside its
-existing data contracts rather than in a separate registry (Section 23).
+plane (Section 22), PII classification (Section 23), and now testing
+strategy itself: the test pyramid, what a mock proves versus what it
+doesn't, why unit tests and integration tests catch genuinely different
+classes of bug, and why this project chose to measure code coverage
+without gating on it yet (Section 24).
 
-**Known limitations, stated honestly:** `pii-report` and
-`validate-contracts` are two separate commands, and only the
-classification check named in this increment's own note above closes
-the gap between them by describing it — the gap itself is still open;
-neither is wired into any CI gate, since this repo has none yet. PII
-classification does not inspect column *content* — `original_url` is
-classified `none`, but a URL's own query string could in principle carry
-personal data, and this section's tooling would not catch that
-(Section 23.1/23.8). No encryption at rest, no access control on Bronze
-objects, no right-to-erasure mechanism, and no audit logging exist for
-any of this project's `direct` or `pseudonymized` columns — all named
-plainly as "not built" in Section 23.8's Production Considerations table,
-not glossed over as already handled. The three-way classification itself
-(`none`/`pseudonymized`/`direct`) is this project's own simplification;
-real privacy frameworks (GDPR in particular) draw finer distinctions this
-section does not attempt to fully cover. What *was* genuinely verified
-in this sandbox this increment: `pii-report` run against the real,
-committed contracts, producing the exact four-column result reported in
-Section 23.1; the missing-`pii`-field and invalid-`pii`-value failure
-cases, each confirmed to raise `ContractError` with the specific column
-name included; and the `validate-contracts`-passes-while-`pii-report`-fails
-gap, reproduced directly against a real SQLite engine.
+**Known limitations, stated honestly:** coverage is measured but not
+enforced — nothing currently stops the real 58% number from getting
+worse over time, a gap named explicitly in Section 24.3 and 24.8 as
+temporary, not as a permanent design choice; `cli.py`'s command
+functions remain untested directly, by deliberate scope decision this
+increment rather than an oversight — closing that gap would mean writing
+roughly a dozen new mocked tests, judged lower-value right now than the
+findings this section actually surfaced; two of the three integration
+test files (`test_full_load_integration.py`,
+`test_incremental_load_integration.py`) still cannot run in this
+sandbox at all, since neither Docker nor real MinIO exist here — their 5
+failures were reconfirmed genuinely this increment, with the real root
+cause (`botocore.exceptions.EndpointConnectionError`, port 9000
+unreachable) shown rather than assumed; there is still no CI system of
+any kind, so every check in this project, including this increment's,
+has been run by hand and reported honestly as such; `Faker`, also
+declared as a dev dependency since early in this project, remains
+unused by any test in this suite (it is used only by
+`scripts/seed_sample_data.py`) — a smaller version of the same
+declared-but-unused pattern this section found with `pytest-cov`, named
+here rather than silently fixed, since fixing it isn't this increment's
+scope. What *was* genuinely verified in this sandbox this increment: the
+real coverage report, in full; both the failing and the passing run of
+`test_contracts_integration.py`, with the exact real error message shown
+for the failing one; and a fresh run of all three integration test
+files together, confirming today's real pass/fail status rather than
+citing a prior increment's numbers from memory.
 
-**Immediate next increment:** Testing (deep-dive, Section 24) or Failure
-Scenarios (Section 25), now that 80 unit tests and three increments'
-worth of Failure Scenario subsections exist to consolidate, or
+**Immediate next increment:** Failure Scenarios (Section 25), now that
+18 separate Failure Scenario subsections exist across this guide
+(seven in the data-modeling sections, eleven numbered ones from Section
+14.7 through this increment's 24.7) to consolidate into one index, or
 Performance (Section 26); whichever the reader wants to tackle next.
 
 ---
@@ -7859,13 +8342,13 @@ Performance (Section 26); whichever the reader wants to tackle next.
 | File layout health reporting implemented | ✅ Done (detect-only) | `object_store.get_file_layout_report`, `layout-report` CLI command, Section 21, ADR-013 | No auto-compaction, by deliberate design (ADR-013); 8 MB small-file threshold is a POC default, not empirically derived (Section 21.8) |
 | Ingestion metadata deep-dive completed | ✅ Done | `watermark_start` gap found and fixed, `get_run_history`, `get_ingestion_summary`, `ingestion-history`/`ingestion-summary` CLI commands, Section 22 | `get_run_history` has no pagination guard on `limit` (Section 22.8) |
 | PII identified | ✅ Done | Every column in `contracts/source/*.yaml` now declares `pii` (`none`/`pseudonymized`/`direct`); `pii.py`, `pii-report` CLI command, Section 23 | Not content-inspecting — `original_url` query strings aren't scanned (Section 23.8); no encryption/access-control/erasure mechanism built yet (Section 23.8) |
-| Tests implemented | ✅ Done (unit + partial integration) | 80 passing unit tests (up from 38 four increments ago); the contracts integration test, and prior increments' `metadata.py` additions, genuinely passed against a real (non-Docker) local Postgres in this sandbox; this increment's PII classification tests, including the real-contracts-directory test, all genuinely run | Full-load, incremental-load, and reconciliation integration tests still need real MinIO, not available here — user should run `make up && make test-integration` locally for the complete suite |
-| Failure scenarios tested | ✅ Partial | Sections 7-12 (data modeling), 14.7, 15.7, 16.7, 17.7, 18.7, 19.7, 20.7, 21.7, 22.7, 23.7 | Remaining named in Section 25's index |
+| Tests implemented | ✅ Done (unit + partial integration) | 80 passing unit tests (unchanged this increment — Section 24 measures and explains the existing suite rather than growing it); coverage now measured for the first time, 58% (`make coverage`, Section 24); the contracts integration test genuinely re-confirmed passing against real, non-Docker local Postgres in this sandbox | Coverage is measured, not gated (Section 24.3); `cli.py`'s command functions (0% coverage) remain untested directly, a named scope decision (Section 24's Principal Perspective); full-load/incremental-load integration tests still need real MinIO, not available here — user should run `make up && make test-integration` locally for the complete suite |
+| Failure scenarios tested | ✅ Partial | Sections 7-12 (data modeling), 14.7, 15.7, 16.7, 17.7, 18.7, 19.7, 20.7, 21.7, 22.7, 23.7, 24.7 | Remaining named in Section 25's index |
 | Performance benchmark completed | ✅ Partial | Parquet vs. CSV/JSON, Section 19, genuinely run at two scales | Extraction-time-at-scale and partition-pruning real-network-latency benchmarks not yet run, Section 26 |
-| Architecture diagrams completed | ✅ Partial | 10+ diagrams so far, including the full star schema ER diagram (Section 10.1) and Sections 18/20/21/22/23's object-storage, partition-pruning, file-layout, control-plane, and PII-classification/data-flow diagrams | More land with later sections (data lifecycle, failure/recovery, final architecture) |
-| ADRs documented | ✅ 13 of 13+ planned | Section 29 | No new ADR this increment — Section 23's design decision (classify PII inside contracts, not a separate registry) is documented in Section 23.3 but not yet promoted to its own numbered ADR |
-| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9 | Remaining categories not yet covered, Section 31 |
-| Hands-on labs completed | ✅ Partial | LAB 1-19 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation, LAB 14 storage growth/idempotency, LAB 15 Parquet benchmark, LAB 16 partition pruning, LAB 17 file-layout report, LAB 18 watermark_start fix + metadata readers, LAB 19 PII report break/fix) | LAB 20+ |
+| Architecture diagrams completed | ✅ Partial | 10+ diagrams so far, including the full star schema ER diagram (Section 10.1) and Sections 18/20/21/22/23/24's object-storage, partition-pruning, file-layout, control-plane, PII-classification, and test-pyramid diagrams | More land with later sections (data lifecycle, failure/recovery, final architecture) |
+| ADRs documented | ✅ 13 of 13+ planned | Section 29 | No new ADR this increment — Section 24's design decision (measure coverage now, gate on it later) is documented in Section 24.3 but not yet promoted to its own numbered ADR |
+| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, 24.9 (Category I begins here) | Remaining categories not yet covered, Section 31 |
+| Hands-on labs completed | ✅ Partial | LAB 1-20 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation, LAB 14 storage growth/idempotency, LAB 15 Parquet benchmark, LAB 16 partition pruning, LAB 17 file-layout report, LAB 18 watermark_start fix + metadata readers, LAB 19 PII report break/fix, LAB 20 coverage report + integration-test port break/fix) | LAB 21+ |
 | README updated | ✅ Done | `README.md` | — |
 | Git repository clean | ✅ Done | Section 35 | — |
 | No secrets committed | ✅ Done | `.gitignore`, `.env.example` reviewed | — |

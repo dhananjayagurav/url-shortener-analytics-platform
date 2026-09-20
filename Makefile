@@ -1,4 +1,4 @@
-.PHONY: venv install up down logs ps db-shell ingest ingest-full create-analytics-schema validate-contracts check-stale-runs reconcile-bronze storage-stats benchmark-parquet layout-report ingestion-history ingestion-summary pii-report test test-integration lint fmt seed
+.PHONY: venv install up down logs ps db-shell ingest ingest-full create-analytics-schema validate-contracts check-stale-runs reconcile-bronze storage-stats benchmark-parquet layout-report ingestion-history ingestion-summary pii-report test test-integration coverage lint fmt seed
 
 venv:
 	python3.12 -m venv .venv
@@ -81,6 +81,11 @@ test:
 
 test-integration:
 	pytest -v -m integration
+
+# See docs/analytics-engineering-guide.md Section 24. Measured, not
+# gated -- no --cov-fail-under threshold yet (Section 24.3).
+coverage:
+	pytest --cov=url_shortener_analytics --cov-report=term-missing
 
 lint:
 	ruff check .

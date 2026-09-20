@@ -8,8 +8,18 @@ Requires:
 See docs/analytics-engineering-guide.md, Section 12, and
 ingestion/tests/integration/README.md.
 
-NOT YET EXECUTED in this sandbox -- no Docker daemon available here. The
-unit test `test_validate_all_contracts_against_the_real_contracts_directory`
+Genuinely executed in this sandbox against a real, non-Docker local
+Postgres 16 (there's no Docker daemon here, so no MinIO -- see Section
+24's "How to test" for exactly how this one test can run without it,
+while the other two integration test files below it still can't). The
+`settings` fixture's un-overridden default points at port 5433 (this
+project's docker-compose mapping); this sandbox's real Postgres listens
+on the standard 5432, so running this file here requires
+`DATABASE_URL=postgresql+psycopg://analytics:analytics@localhost:5432/analytics`
+in the environment -- confirmed genuinely necessary by first running
+without it and observing a real `OperationalError: connection to server
+at "127.0.0.1", port 5433 failed: Connection refused` (Section 24.7).
+The unit test `test_validate_all_contracts_against_the_real_contracts_directory`
 (SQLite) already exercises the same contract files against a hand-built
 matching schema; this test is the stronger proof, against the actual
 `sql/source/*.sql`-created tables.
