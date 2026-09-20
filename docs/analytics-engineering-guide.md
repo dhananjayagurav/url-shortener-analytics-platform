@@ -100,15 +100,15 @@ with the exact command to produce the real result yourself.
 **Quality & Operations**
 23. [PII and Security](#23-pii-and-security-) ✅✅
 24. [Testing (deep-dive)](#24-testing-deep-dive-) ✅✅
-25. Failure Scenarios (all 10) ⏳ *(one is demonstrated now — see [Section 14.7](#147-failure-scenario)*)
+25. [Failure Scenarios (all 10)](#25-failure-scenarios-all-10-) ✅✅
 26. Performance ⏳
 27. Scale Design ⏳
 
 **Reference**
 28. [Architectural Principles](#28-architectural-principles) ✅ *(introduced now, extended as more are demonstrated)*
 29. [Architecture Decision Records](#29-architecture-decision-records) ✅
-30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6; LAB 12 — Section 16.5; LAB 13 — Section 17.5; LAB 14 — Section 18.5; LAB 15 — Section 19.5; LAB 16 — Section 20.5; LAB 17 — Section 21.5; LAB 18 — Section 22.5; LAB 19 — Section 23.5; LAB 20 — Section 24.5)*
-31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, and 24.9; Category I begins at 24.9)*
+30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6; LAB 12 — Section 16.5; LAB 13 — Section 17.5; LAB 14 — Section 18.5; LAB 15 — Section 19.5; LAB 16 — Section 20.5; LAB 17 — Section 21.5; LAB 18 — Section 22.5; LAB 19 — Section 23.5; LAB 20 — Section 24.5; LAB 21 — Section 25.5)*
+31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, 24.9, and 25.9; Category I: 24.9-25.9)*
 32. Principal-Level Scenarios ⏳
 33. [Phase 1 Summary](#33-phase-1-summary-so-far) (running, updated each increment)
 34. [Phase 1 Completion Checklist](#34-phase-1-completion-checklist)
@@ -7930,6 +7930,498 @@ smaller and could ship today.
 
 ---
 
+## 25. Failure Scenarios (all 10) ✅✅
+
+### 25.1 Concept
+
+Every section since Section 2 has ended with its own **Failure
+Scenario** subsection: one specific question, starting with "what
+happens if...", answered honestly about this project's own real code.
+By the end of Section 24, 18 of these exist, scattered one per section,
+each written at the moment its own section was built. Nobody had ever
+stepped back and asked: as a set, what do these 18 actually cover? Are
+some of them really the same underlying failure, described twice in
+different words? Is there a failure class this pipeline is exposed to
+that no section has covered at all? This section is that step back.
+
+The TOC named this section "Failure Scenarios (all 10)" from very early
+in this project's planning, before any of the 18 individual write-ups
+existed. That number was a placeholder guess, not a count anyone had
+actually done. Having now read all 18 side by side, the honest count of
+genuinely distinct *mechanisms* — not sections, mechanisms — comes out
+to exactly 10. That's not forced to match the placeholder; it's what
+naturally fell out of grouping 18 specific write-ups by *why* they fail,
+not by which section they happen to live in. Two different sections can
+fail for the same underlying reason; this section's job is to notice
+that and say so.
+
+The second idea this section introduces is a **verification tier**. Not
+every one of the 18 write-ups was established the same way. Some were
+genuinely triggered, in this sandbox, with real output shown (Section
+16.7's stale-run detection, for one). Some were carefully traced through
+the actual committed code, correctly, but never literally executed
+(Section 15.7's watermark-checkpoint gap). Some are architectural
+reasoning about a system this POC doesn't have running yet — a real,
+loaded OLTP database, or a populated analytical layer — so there's
+nothing to actually go trigger (Section 2's buffer-cache contention).
+Calling all three "a failure scenario" without distinguishing them would
+blur exactly the ACTUAL OBSERVED / DESIGN EXPECTATION line this guide
+has enforced everywhere else. This section draws that line explicitly,
+for the first time, across the whole set.
+
+### Why does this exist?
+
+A list of 18 independent write-ups, each correct on its own, is still
+hard to use as an operational reference. An on-call engineer paged at
+2 a.m. doesn't think "let me check Section 17.7" — they think "Bronze
+looks wrong, what are the possible reasons, and which ones has this team
+actually confirmed can happen?" A taxonomy organized by *mechanism*
+answers that question directly: it groups failures by their root cause,
+not by which part of the codebase happened to be under construction when
+someone wrote about them. That's also a real professional practice
+outside this project — an incident runbook or a chaos-engineering
+program is built exactly this way, as a catalog of *failure modes*, not
+as a diary of when each one was noticed.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+Picture a small team that has shipped bug postmortems for a year,
+scattered across a dozen incident documents: "checkout crashed because
+the payment API timed out," "signup crashed because the email API timed
+out," "password reset crashed because the SMS API timed out." Read one
+at a time, these look like three unrelated incidents in three unrelated
+features. Grouped by mechanism, they're the same failure, three times:
+*this system has no timeout or retry policy for any third-party API
+call, anywhere.* The value isn't in the individual postmortems — each
+one was already correct — it's in noticing the pattern only visible once
+they're read together.
+
+### URL Shortener Example
+
+This project's own version of that pattern: Section 17.7 asks "should
+`reconcile-bronze` auto-delete an orphaned object?" and Section 21.7
+asks "can `avg_bytes` alone hide a real small-file problem?" Read
+separately, these look like two unrelated storage questions. Read
+together, under this section's taxonomy, they're both instances of
+**"a summary or a cleanup action, built without enough information to
+be safe automatically"** — one is about deleting based on an incomplete
+picture (an orphan might be legitimate, not garbage), the other is about
+alerting based on an incomplete statistic (a mean might hide real skew).
+Section 25.2's table makes groupings like this explicit for the full
+set of 18.
+
+### 25.2 Architecture
+
+```
+ 10 mechanism-based categories, each grounded in real, already-written
+ sections -- not new speculation. Tier: A = genuinely triggered with real
+ observed output; B = traced through the real code, not literally
+ executed; C = architectural reasoning, nothing exists yet to trigger it
+ against.
+
+  1. Cross-workload resource contention
+     Section 2's Failure Scenario                                [C]
+
+  2. Partial / crashed execution (a checkpoint never gets written)
+     Section 14.7                                                 [A] <- upgraded this increment
+     Section 15.7                                                 [B]
+
+  3. Stuck / stale execution, with an inherent detection trade-off
+     Section 16.7                                                 [A]
+
+  4. Storage-vs-record drift (what's recorded diverges from reality)
+     Section 17.7                                                 [B]
+
+  5. Infrastructure / dependency unavailability
+     Section 18.7                                                 [A]
+
+  6. Format / tooling incompatibility
+     Section 19.7                                                 [A] <- upgraded this increment
+
+  7. An optimization that backfires outside its designed range
+     Section 20.7                                                 [B]
+
+  8. Aggregate statistics that hide real skew
+     Section 21.7                                                 [A]
+
+  9. Silent, long-lived detection gaps (something checks nothing)
+     Section 9's Failure Scenario                                 [C]
+     Section 12's Failure Scenario                                [C]
+     Section 22.7                                                 [A]
+     Section 23.7                                                 [A]
+
+ 10. Human/process drift -- a rule enforced by nothing but a comment
+     Section 7's Failure Scenario                                 [C]
+     Section 8's Failure Scenario                                 [C]
+     Section 10's Failure Scenario                                [C]
+     Section 11's Failure Scenario                                [C]
+     Section 24.7                                                 [A]
+
+ Totals across all 18 entries: 8 Tier A, 3 Tier B, 7 Tier C.
+ This section adds ZERO new entries to the list -- it reclassifies two
+ (14.7, 19.7) from a lower tier to Tier A, by actually going and
+ triggering them for real in this sandbox (25.4/25.6 below).
+```
+
+Category 9 and category 10 are the two biggest groups, and that's worth
+noticing on its own. Six of this project's 18 failure scenarios are, at
+bottom, about a rule that exists only as a comment, a doc, or a column
+nobody wired up — not about a crash, a timeout, or bad infrastructure.
+That's a real signal about where this project's actual risk concentrates
+right now: less in "the system falls over," more in "a real property
+quietly stops being true and nothing notices."
+
+### 25.3 Design Decision: build the index as a table inside the guide, honestly tiered, adding no new failure-scenario write-ups
+
+**Context:** 18 failure scenarios already exist, each already correct
+and already committed. The question this section answers isn't "what
+new failures should we write up" — it's "how should the existing 18 be
+organized, and how honest should this section be about how solid each
+one actually is."
+
+**Decision:** one table (25.2 above), inside this guide, grouping the
+existing 18 by mechanism into 10 categories, with an explicit
+verification tier per entry. No new failure-scenario write-ups were
+added. Two entries were upgraded from a lower tier to Tier A, by
+actually triggering them for real (25.4/25.6).
+
+**Consequences:** this index can go stale the moment a 19th Failure
+Scenario is added to a future section and nobody updates this table —
+named honestly as this section's own Failure Scenario, 25.7 below.
+
+### Alternatives
+
+A separate `FAILURE_MODES.md` file, decoupled from the guide, that a
+runbook or on-call rotation could reference more directly. Also
+considered: writing seven brand-new failure-scenario demonstrations, one
+per Tier C entry, to force every category to Tier A immediately.
+
+### Trade-offs
+
+| | One table inside the guide (chosen) | A separate FAILURE_MODES.md file | Force every entry to Tier A now |
+|---|---|---|---|
+| Stays in sync with the 18 source write-ups | Easier — same file, same section-numbering scheme already in use | Harder — a second file is exactly the "two sources that can drift" pattern Section 23.3 already argued against for a different concern | N/A — doesn't address staleness at all |
+| Honest about what's actually verified today | Yes — tiers are stated plainly, nothing pretended | Same, if maintained the same way | Would require inventing tests for things this POC's own environment can't yet run (Section 2's real OLTP load, Phase 2's not-yet-built transform) |
+| Effort this increment | Low — an index plus two real, genuinely useful upgrades | Higher — a new file, a new place to keep current | Very high, and some of it isn't honestly possible yet without fabricating results |
+| Right choice, right now | Yes | Not yet — revisit once a real on-call rotation exists and needs a document shaped for paging, not teaching | No — this project's own "never fabricate" rule doesn't have a shortcut, even for a section about failure |
+
+### 25.4 Implementation
+
+**Implementation Guide (write-it-yourself):** pick any two Tier B or
+Tier C entries from 25.2 that your own environment can actually exercise
+today, and go trigger them for real. This section chose Section 14.7 (a
+crashed run, leaving a stuck `running` row) and Section 19.7 (a Parquet
+file read by a tool that doesn't understand the format), because both
+are cheap to reproduce without needing infrastructure this sandbox
+doesn't have (no real MinIO required for either).
+
+For 14.7: start a real run with `metadata.start_run`, deliberately never
+call `finish_run_success` or `finish_run_failure` (this *is* the
+simulated crash), backdate `started_at` so the row looks old enough to
+be stale, then call `find_stale_running_runs` and confirm it's found.
+
+For 19.7: write a real, small Parquet file to local disk with
+`DataFrame.to_parquet`, then read its raw bytes the way a text editor or
+`cat` would, and confirm the result is unreadable binary, not the
+readable text a CSV or JSON-lines file would produce at the same call
+site.
+
+**Reference Implementation** (ad hoc verification scripts, not
+committed as permanent test files — see 25.8 for why a permanent
+regression test wasn't the right call here):
+
+```python
+# 14.7, reproduced for real against this sandbox's Postgres:
+run_id = metadata.start_run(engine, "section25_crash_sim", "clicks", load_type="full")
+# ... no finish_run_success/finish_run_failure ever runs -- the crash ...
+with engine.begin() as conn:
+    conn.execute(
+        text("UPDATE ingestion_metadata SET started_at = now() - interval '90 minutes' WHERE run_id = :rid"),
+        {"rid": run_id},
+    )
+stale = metadata.find_stale_running_runs(engine, max_runtime_minutes=60, pipeline_name="section25_crash_sim")
+assert len(stale) == 1
+```
+
+```python
+# 19.7, reproduced for real:
+df.to_parquet("/tmp/demo.parquet", engine="pyarrow")
+# raw bytes, the way `cat`/a text editor would read them:
+with open("/tmp/demo.parquet", "rb") as f:
+    header = f.read(4)
+assert header == b"PAR1"   # Parquet's real magic bytes, not readable text
+```
+
+Walking through the first script: `start_run` genuinely inserts a
+`status='running'` row and returns its `run_id`, exactly like a real
+full-load call would. The `UPDATE` is the only part that wouldn't happen
+in a real crash — a real process can't rewrite its own `started_at`
+after dying — but it's a faithful stand-in for "enough real time has
+passed since this row was created," which is the only thing
+`find_stale_running_runs` actually checks (Section 16). Everything after
+that line runs exactly the same code path a real production crash would
+hit.
+
+Walking through the second script: `to_parquet` writes a real, valid
+Parquet file — the exact same call `object_store.write_bronze` makes
+internally (Section 14), just to local disk instead of S3. Reading its
+first four bytes and finding `PAR1` — Parquet's actual, real magic-byte
+signature — is a direct, checkable proof that this format is binary by
+construction, not asserted from documentation.
+
+### Hands-on Challenge (implement-yourself)
+
+Pick one of the 7 Tier C entries from 25.2 and write down, concretely,
+what would need to exist in this project before it could become
+Tier A. For Section 2's OLTP-contention scenario: what's missing isn't
+more code — it's a *real load-testing setup* against a real,
+traffic-bearing Postgres instance, which is a materially bigger lift
+than anything this section demonstrates. For Section 10's Unknown-member
+scenario: what's missing is Phase 2's transform actually existing, since
+there's no running code yet that *could* forget the convention. Naming
+the specific missing precondition, per entry, is more useful than just
+labeling something "not tested yet."
+
+### 25.5 Hands-on Exercise
+
+**LAB 21 — Reproduce both of this section's real upgrades yourself.**
+
+```bash
+DATABASE_URL="postgresql+psycopg://analytics:analytics@localhost:5432/analytics" \
+  python3 -c "
+from sqlalchemy import create_engine, text
+from url_shortener_analytics import metadata
+
+engine = create_engine('postgresql+psycopg://analytics:analytics@localhost:5432/analytics')
+run_id = metadata.start_run(engine, 'lab21_demo', 'clicks', load_type='full')
+with engine.begin() as conn:
+    conn.execute(text(\"UPDATE ingestion_metadata SET started_at = now() - interval '90 minutes' WHERE run_id = :rid\"), {'rid': run_id})
+stale = metadata.find_stale_running_runs(engine, max_runtime_minutes=60, pipeline_name='lab21_demo')
+print('stale runs found:', len(stale))
+with engine.begin() as conn:
+    conn.execute(text(\"DELETE FROM ingestion_metadata WHERE pipeline_name = 'lab21_demo'\"))
+"
+```
+
+Expect `stale runs found: 1`. Then, separately:
+
+```bash
+python3 -c "
+import pandas as pd
+pd.DataFrame({'id': [1], 'short_code': ['abc123']}).to_parquet('/tmp/lab21.parquet')
+print(open('/tmp/lab21.parquet', 'rb').read(4))
+"
+```
+
+Expect `b'PAR1'`. What to observe in both: neither command needed
+Docker, MinIO, or any infrastructure beyond this sandbox's own real
+Postgres and a Python environment with `pyarrow` installed — the same
+"cheap enough to actually go run it" reasoning that made these the right
+two entries to upgrade this increment, out of the ten remaining
+non-Tier-A entries.
+
+### 25.6 How to test
+
+Both of 25.4's scripts were run for real, in this sandbox, against real
+local Postgres 16. ACTUAL OBSERVED (14.7):
+
+```
+started run: 4d9c91ac-fec1-4565-985e-4d566ec6f068
+row status: running | completed_at: None
+stale runs found: 1
+ - clicks full 4d9c91ac-fec1-4565-985e-4d566ec6f068
+watermark after crash (should be 0, stuck row ignored): 0
+cleaned up
+```
+
+The last line confirms Section 14.7's second claim too: a stuck
+`running` row doesn't corrupt `get_last_watermark`'s reads (it returned
+`0`, correctly ignoring the crashed row, exactly as the section says a
+row with `status != 'success'` is invisible to that function).
+
+ACTUAL OBSERVED (19.7):
+
+```
+0000000   P   A   R   1 025 004 025   0 025   .   L 025 006 025  \0 022
+...
+0004160   R   1
+```
+
+The file both starts and ends with the literal bytes `PAR1` — Parquet's
+real format signature, appearing at both the header and the footer —
+with unreadable binary in between. `head -c 300 file.parquet` on the
+real 2,162-byte file this sandbox wrote produced exactly the kind of
+garbled, unreadable-as-text output 19.7 describes, with only small
+recognizable fragments (the string column's actual values, `abc123` and
+`xyz789`) visible inside the surrounding binary noise.
+
+```bash
+make test
+```
+
+ACTUAL OBSERVED, this sandbox:
+
+```
+80 passed in 6.72s
+```
+
+Unchanged from Section 24 — this increment adds no new permanent test
+files (25.8 explains why), so the count doesn't move. `ruff check
+ingestion/ benchmarks/` was also re-run — ACTUAL OBSERVED: `All checks
+passed!`
+
+### 25.7 Failure Scenario
+
+**What happens when a 19th Failure Scenario gets added to a future
+section, and nobody updates this index?**
+
+This is the honest, self-referential answer, and it's exactly the same
+mechanism as category 9's Section 9 and Section 12 entries — a document
+describing a piece of code, with nothing mechanically checking that the
+two stay in sync. Nothing about `docs/analytics-engineering-guide.md`'s
+structure enforces that every `### Failure Scenario` / `### X.7 Failure
+Scenario` heading gets a row in 25.2's table. A future increment could
+add Section 26.7, forget this section exists, and this index would
+silently become an *undercount* — not wrong about what it does contain,
+just incomplete about what actually exists.
+
+This is a real, currently-open gap, not a hypothetical one, and this
+section cannot close it about itself: any mechanical check enforcing
+"every Failure Scenario heading has a corresponding row here" would need
+to be written as actual code (a small script grepping for both patterns
+and diffing them), and that code doesn't exist yet. Naming this honestly
+here, rather than implying this index is self-maintaining, is the point
+— see 25.8 for what closing it would actually take.
+
+### 25.8 Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| Failure catalog | One table, inside the guide, updated by hand each time a new Failure Scenario is written (25.7's named gap) | A linter/CI check that fails the build if a new `Failure Scenario` heading has no matching catalog entry — closes 25.7 mechanically instead of relying on memory |
+| Chaos engineering | None — every failure in this catalog is either reasoned about or manually, deliberately triggered once, by hand, for this section | A scheduled "game day," or an automated chaos tool, that randomly injects a subset of these failures (kill a run mid-flight, drop a dependency) against a staging environment on a recurring basis |
+| Runbooks | This guide's prose *is* the runbook, currently | Each Tier-A entry becomes a short, standalone on-call runbook: symptom, real cause, exact command to confirm, exact command to remediate |
+| Postmortem process | None — this is a teaching project, not an incident-driven one | Every real production incident becomes a candidate new entry in this same catalog, keeping it grounded in what has actually happened, not just what could |
+| Regression protection | The two scripts in 25.4 were run once, by hand, and are not committed as permanent tests (a deliberate choice — see below) | Each Tier-A scenario gets a permanent, CI-run regression test, so a future code change that silently reintroduces a fixed failure mode is caught automatically |
+
+25.4's two scripts were deliberately kept as ad hoc, run-once
+demonstrations rather than promoted to `ingestion/tests/unit/`. The
+reasoning: `find_stale_running_runs` and Parquet's binary format are
+*already* covered by this project's real unit tests (`test_metadata.py`,
+and Parquet round-tripping implicitly by every test that reads back a
+written Bronze object). Adding a second, near-duplicate test whose only
+new contribution is restating the same assertion in a "failure scenario"
+frame would grow the test count without growing real coverage — the
+same discipline Section 24.8 already applied when deciding not to chase
+coverage percentage for its own sake.
+
+### Principal Data Engineer Perspective
+
+The habit worth defending here is resisting the pull to make the numbers
+match a plan written before the real work existed. This section could
+have quietly padded its taxonomy to hit exactly "10" by splitting a
+category that didn't need splitting, or quietly folded two genuinely
+different mechanisms together to avoid landing on 11. Instead, the real
+grouping was done first, from the actual 18 write-ups, and the number 10
+is reported because that's genuinely what the honest grouping produced
+— not because the TOC said so three months of project-time ago. A
+principal-level review of a document like this asks "did the taxonomy
+drive the number, or did the number drive the taxonomy" — and the
+honest answer here needs to be the first one, every time, or the whole
+exercise becomes theater.
+
+The second thing worth naming: the 8/3/7 tier split is itself the most
+useful output of this section, more than the number 10. It says, in one
+glance, that this project's storage and metadata layers (categories 3,
+5, 6, 8, and half of 9) are the best-verified parts of the whole system,
+while its data-modeling conventions (all of category 10, and half of
+category 9) remain entirely reasoned-about, because the code that could
+violate them — Phase 2's transform — doesn't exist yet. That's not a
+flaw in this project; it's an accurate map of where real risk currently
+concentrates, and a much more useful thing to hand a new team member
+than "18 failure scenarios exist," un-tiered.
+
+### 25.9 Principal Engineer Interview Questions
+
+**Q: "You're told a project has documented 'all its failure scenarios.'
+What's the first follow-up question you'd ask?"**
+
+*What's tested:* whether the candidate treats "documented" as a
+meaningful claim on its own, or immediately probes for how each entry
+was actually established.
+
+*What a weak answer looks like:* "That's great, sounds thorough" —
+accepts the claim at face value.
+
+*What a strong answer covers:* "How was each one verified — actually
+triggered, reasoned through the code, or purely architectural?" A list
+of failure scenarios with no verification tier attached tells you
+nothing about how much to trust it. This project's own 18 split roughly
+8/3/7 across three tiers once actually audited — a number that would
+have stayed invisible if "documented" had been treated as a single,
+undifferentiated fact.
+
+*Concepts:* the difference between documentation existing and
+documentation being verified; verification tiers as a way to make that
+difference visible instead of implicit.
+
+*Expected follow-up:* "Which tier would you prioritize upgrading first,
+with limited time?" — Not automatically Tier C, and not automatically
+the ones closest to Tier A already: the right answer weighs how *likely*
+each mechanism is to actually occur in production against how *cheap*
+it is to upgrade, the same reasoning this section used to pick 14.7 and
+19.7 (both cheap, both plausible) over Section 2's OLTP-contention
+scenario (plausible, but not cheap — it needs real load-testing
+infrastructure this project doesn't have yet).
+
+*Common mistake:* treating every Tier C entry as equally urgent to fix,
+rather than recognizing that some (Section 2's) are blocked on
+infrastructure investment far bigger than a documentation gap, while
+others (this project's own 25.7) are cheap to close with a small script
+whenever someone gets to it.
+
+**Q: "This section found that 6 of 18 failure scenarios are really about
+a rule enforced by nothing but a comment or a doc. What does that tell
+you about where to focus next, if you only had time for one
+investment?"**
+
+*What's tested:* whether the candidate can turn a pattern spotted across
+many small findings into one prioritized, defensible recommendation.
+
+*What a weak answer looks like:* "Fix all of them" — doesn't prioritize,
+and treats six different specific gaps as one undifferentiated todo
+item.
+
+*What a strong answer covers:* the shared mechanism across all six is
+"a property that matters, with no system checking it" — which points at
+one general investment, not six specific ones: some kind of automated
+drift-detection layer (schema-doc-vs-real-table diffing, for Section 9
+and 12's entries; a CI check tying documentation headings to this
+catalog, for 25.7's own gap) that catches an entire *class* of future
+violation, rather than patching each instance by hand as it's separately
+discovered. This mirrors the same reasoning Section 22 and 23 already
+demonstrated on a smaller scale — finding one instance of a
+comment-only rule (`watermark_start` going unpopulated, a missing `pii`
+field) and asking whether the *general* pattern, not just that one
+instance, needs a structural fix.
+
+*Concepts:* recognizing when several specific findings share one root
+cause; investing in a class of fix rather than a pile of individual
+patches.
+
+*Expected follow-up:* "Isn't that just moving the problem — now you have
+to trust the drift-detector itself is correct and gets maintained?" —
+Yes, honestly, and that's a real, worthwhile trade: one piece of
+enforcement code, reviewed and tested like any other code in this
+project, is still easier to keep correct over time than six independent
+human habits, each equally easy to individually forget.
+
+*Common mistake:* proposing "more documentation" or "better training" as
+the fix for a problem whose actual root cause is the complete absence of
+any mechanical check — training helps once; a mechanical check helps
+every time, including for people who never got the training.
+
+---
+
 ## 28. Architectural Principles
 
 Introduced here, demonstrated incrementally as more of Phase 1 is built.
@@ -8243,79 +8735,75 @@ the same posture unless a specific, named reason justifies auto-remediation.
 
 ## 33. Phase 1 Summary (so far)
 
-**What we've built in this increment:** Testing (deep-dive, Section 24),
-the first section that steps back from writing new pipeline code and
-asks what this project's 80 unit tests actually prove, what they don't,
-and why the test suite is split into two directories in the first place.
-Genuinely new code is small on purpose: a `make coverage` target
-(`pytest --cov=url_shortener_analytics --cov-report=term-missing`), run
-for the first time ever against this project, since `pytest-cov` had
-been declared as a dev dependency since this project's very first
-`pyproject.toml` but never actually invoked. No new unit tests were
-added this increment — this section is about measuring and explaining
-the 80 that already existed, not growing the count further.
+**What we've built in this increment:** Failure Scenarios (Section 25),
+the first section that reads all 18 existing Failure Scenario subsections
+side by side, instead of one at a time, and asks what they actually are
+as a set. The result: a taxonomy of 10 distinct failure *mechanisms* —
+not sections, mechanisms — that every one of the 18 maps onto cleanly,
+plus an honest verification tier per entry (genuinely triggered, traced
+through real code, or purely architectural reasoning). No brand-new
+failure-scenario write-ups were added. Two existing entries were
+upgraded from a lower tier to Tier A by actually triggering them for
+real in this sandbox: Section 14.7's crashed-mid-run scenario (a real
+`ingestion_metadata` row, started for real, deliberately never
+finished, backdated, and genuinely caught by `find_stale_running_runs`)
+and Section 19.7's Parquet-is-binary claim (a real Parquet file written
+to disk, its first four bytes read directly and confirmed to be `PAR1`,
+not readable text).
 
-**A note on this increment specifically:** two real findings came out of
-finally running tools that had been sitting unused. First, coverage:
-58% of this project's own source lines are exercised by the unit-test
-suite, with `cli.py` at a flat 0% (its command functions are thin
-wrappers around already-tested logic, explained in 24's Principal
-Perspective) and `metadata.py` at 84% (its `except Exception -> raise
-MetadataError` branches, in every function, have never once been
-exercised by a test). Second, a genuine environment-mismatch bug in this
-project's own integration test suite: `test_contracts_integration.py`'s
-`settings` fixture defaults to port 5433 (docker-compose's mapping), but
-this sandbox's real, non-Docker Postgres listens on 5432 — reproduced as
-a real `OperationalError`, then fixed for this one run with a
-`DATABASE_URL` override, and written up as Section 24's Failure
-Scenario. The test's own docstring had claimed it was "NOT YET EXECUTED
-in this sandbox," which was also stale — it has passed here, with the
-override, in this and prior increments; that docstring is now fixed too.
+**A note on this increment specifically:** the TOC has called this
+section "Failure Scenarios (all 10)" since long before any of the 18
+individual write-ups existed — a placeholder number set during early
+planning, not a count anyone had verified. The honest, bottom-up grouping
+done for this increment happened to land on exactly 10 mechanisms, and
+that number is reported because it's genuinely what fell out of the
+grouping, not because it was forced to match the placeholder (25.1
+addresses this directly, since a padded or squeezed taxonomy would be
+exactly the kind of dishonesty this guide has avoided everywhere else).
+The more interesting number is the tier split: of 18 total entries,
+8 are Tier A (genuinely triggered, real output shown), 3 are Tier B
+(correctly traced through real code, never literally executed), and 7
+are Tier C (architectural reasoning only, since the system needed to
+trigger them — a real loaded OLTP instance, or Phase 2's not-yet-built
+transform — doesn't exist yet in this project). Six of those seven
+Tier C entries, plus two of the Tier A ones, share one root cause worth
+naming on its own: a rule enforced by nothing but a comment or a
+document, not by any running check.
 
 **Concepts taught so far, at full depth:** the real application's
 architecture and schema, OLTP vs. OLAP, full load and incremental-load
 ingestion (watermarks, idempotency, checkpointing, Bronze reconciliation),
 the entire data modeling layer (Sections 7-12), the Storage block in
 full (Sections 18-21), `ingestion_metadata` as this pipeline's control
-plane (Section 22), PII classification (Section 23), and now testing
-strategy itself: the test pyramid, what a mock proves versus what it
-doesn't, why unit tests and integration tests catch genuinely different
-classes of bug, and why this project chose to measure code coverage
-without gating on it yet (Section 24).
+plane (Section 22), PII classification (Section 23), testing strategy
+(Section 24), and now failure taxonomy itself: grouping failures by
+mechanism rather than by which section happened to introduce them, and
+distinguishing a genuinely triggered failure from one that's only been
+reasoned through on paper (Section 25).
 
-**Known limitations, stated honestly:** coverage is measured but not
-enforced — nothing currently stops the real 58% number from getting
-worse over time, a gap named explicitly in Section 24.3 and 24.8 as
-temporary, not as a permanent design choice; `cli.py`'s command
-functions remain untested directly, by deliberate scope decision this
-increment rather than an oversight — closing that gap would mean writing
-roughly a dozen new mocked tests, judged lower-value right now than the
-findings this section actually surfaced; two of the three integration
-test files (`test_full_load_integration.py`,
-`test_incremental_load_integration.py`) still cannot run in this
-sandbox at all, since neither Docker nor real MinIO exist here — their 5
-failures were reconfirmed genuinely this increment, with the real root
-cause (`botocore.exceptions.EndpointConnectionError`, port 9000
-unreachable) shown rather than assumed; there is still no CI system of
-any kind, so every check in this project, including this increment's,
-has been run by hand and reported honestly as such; `Faker`, also
-declared as a dev dependency since early in this project, remains
-unused by any test in this suite (it is used only by
-`scripts/seed_sample_data.py`) — a smaller version of the same
-declared-but-unused pattern this section found with `pytest-cov`, named
-here rather than silently fixed, since fixing it isn't this increment's
-scope. What *was* genuinely verified in this sandbox this increment: the
-real coverage report, in full; both the failing and the passing run of
-`test_contracts_integration.py`, with the exact real error message shown
-for the failing one; and a fresh run of all three integration test
-files together, confirming today's real pass/fail status rather than
-citing a prior increment's numbers from memory.
+**Known limitations, stated honestly:** this index can go stale the
+moment a future section adds a 19th Failure Scenario and nobody updates
+Section 25.2's table — named explicitly, and honestly not closed, as
+this section's own Failure Scenario (25.7), since closing it would need
+an actual CI check that doesn't exist yet; the 7 Tier C entries remain
+Tier C, genuinely, because this project doesn't yet have the
+infrastructure (a real, loaded OLTP instance for Section 2's scenario)
+or the code (Phase 2's transform, for the four data-modeling
+convention-drift scenarios) that would let anyone actually trigger them;
+this section's own tiering judgment calls are stated as judgment calls,
+not as an exact science — a reasonable reviewer could draw the Tier A/B
+line in a slightly different place for an entry like Section 17.7, which
+has a genuinely unit-tested detection mechanism underneath a still-only-
+reasoned-about "should this auto-remediate" question. What *was*
+genuinely verified in this sandbox this increment: both upgraded
+scenarios, run for real, with their exact real output shown in 25.6 —
+the stale-run detection against real Postgres, and the Parquet
+magic-byte check against a real file written to disk.
 
-**Immediate next increment:** Failure Scenarios (Section 25), now that
-18 separate Failure Scenario subsections exist across this guide
-(seven in the data-modeling sections, eleven numbered ones from Section
-14.7 through this increment's 24.7) to consolidate into one index, or
-Performance (Section 26); whichever the reader wants to tackle next.
+**Immediate next increment:** Performance (Section 26), now that Section
+19's Parquet benchmark and Section 20's partition-pruning numbers exist
+as a real starting point, or Scale Design (Section 27); whichever the
+reader wants to tackle next.
 
 ---
 
@@ -8343,12 +8831,12 @@ Performance (Section 26); whichever the reader wants to tackle next.
 | Ingestion metadata deep-dive completed | ✅ Done | `watermark_start` gap found and fixed, `get_run_history`, `get_ingestion_summary`, `ingestion-history`/`ingestion-summary` CLI commands, Section 22 | `get_run_history` has no pagination guard on `limit` (Section 22.8) |
 | PII identified | ✅ Done | Every column in `contracts/source/*.yaml` now declares `pii` (`none`/`pseudonymized`/`direct`); `pii.py`, `pii-report` CLI command, Section 23 | Not content-inspecting — `original_url` query strings aren't scanned (Section 23.8); no encryption/access-control/erasure mechanism built yet (Section 23.8) |
 | Tests implemented | ✅ Done (unit + partial integration) | 80 passing unit tests (unchanged this increment — Section 24 measures and explains the existing suite rather than growing it); coverage now measured for the first time, 58% (`make coverage`, Section 24); the contracts integration test genuinely re-confirmed passing against real, non-Docker local Postgres in this sandbox | Coverage is measured, not gated (Section 24.3); `cli.py`'s command functions (0% coverage) remain untested directly, a named scope decision (Section 24's Principal Perspective); full-load/incremental-load integration tests still need real MinIO, not available here — user should run `make up && make test-integration` locally for the complete suite |
-| Failure scenarios tested | ✅ Partial | Sections 7-12 (data modeling), 14.7, 15.7, 16.7, 17.7, 18.7, 19.7, 20.7, 21.7, 22.7, 23.7, 24.7 | Remaining named in Section 25's index |
+| Failure scenarios tested | ✅ Done (consolidated) | All 18 failure scenarios across Sections 2, 7-12, 14-24 now indexed into 10 mechanism categories with an honest verification tier each (8 Tier A, 3 Tier B, 7 Tier C), Section 25 | 7 Tier C entries remain architectural reasoning only, honestly named as blocked on infrastructure or code this project doesn't have yet (Section 25.2); this index itself can go stale (Section 25.7, not yet closed) |
 | Performance benchmark completed | ✅ Partial | Parquet vs. CSV/JSON, Section 19, genuinely run at two scales | Extraction-time-at-scale and partition-pruning real-network-latency benchmarks not yet run, Section 26 |
-| Architecture diagrams completed | ✅ Partial | 10+ diagrams so far, including the full star schema ER diagram (Section 10.1) and Sections 18/20/21/22/23/24's object-storage, partition-pruning, file-layout, control-plane, PII-classification, and test-pyramid diagrams | More land with later sections (data lifecycle, failure/recovery, final architecture) |
-| ADRs documented | ✅ 13 of 13+ planned | Section 29 | No new ADR this increment — Section 24's design decision (measure coverage now, gate on it later) is documented in Section 24.3 but not yet promoted to its own numbered ADR |
-| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, 24.9 (Category I begins here) | Remaining categories not yet covered, Section 31 |
-| Hands-on labs completed | ✅ Partial | LAB 1-20 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation, LAB 14 storage growth/idempotency, LAB 15 Parquet benchmark, LAB 16 partition pruning, LAB 17 file-layout report, LAB 18 watermark_start fix + metadata readers, LAB 19 PII report break/fix, LAB 20 coverage report + integration-test port break/fix) | LAB 21+ |
+| Architecture diagrams completed | ✅ Partial | 10+ diagrams so far, including the full star schema ER diagram (Section 10.1) and Sections 18/20/21/22/23/24/25's object-storage, partition-pruning, file-layout, control-plane, PII-classification, test-pyramid, and failure-taxonomy diagrams | More land with later sections (data lifecycle, failure/recovery, final architecture) |
+| ADRs documented | ✅ 13 of 13+ planned | Section 29 | No new ADR this increment — Section 25 added no new architectural decision, only a consolidated index of existing ones |
+| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, 24.9-25.9 (Category I: Testing/Failure Strategy) | Remaining categories not yet covered, Section 31 |
+| Hands-on labs completed | ✅ Partial | LAB 1-21 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation, LAB 14 storage growth/idempotency, LAB 15 Parquet benchmark, LAB 16 partition pruning, LAB 17 file-layout report, LAB 18 watermark_start fix + metadata readers, LAB 19 PII report break/fix, LAB 20 coverage report + integration-test port break/fix, LAB 21 crash-sim + Parquet magic-bytes repro) | LAB 22+ |
 | README updated | ✅ Done | `README.md` | — |
 | Git repository clean | ✅ Done | Section 35 | — |
 | No secrets committed | ✅ Done | `.gitignore`, `.env.example` reviewed | — |
