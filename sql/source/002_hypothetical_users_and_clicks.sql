@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS clicks (
     short_code  VARCHAR(16) NOT NULL,
     occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     device_type VARCHAR(16) NOT NULL DEFAULT 'unknown', -- mobile | desktop | tablet | unknown
-    hashed_ip   VARCHAR(64),                             -- SHA-256 hex digest, never a raw IP -- see Section 20 (PII)
+    hashed_ip   VARCHAR(64),                             -- SHA-256 hex digest, never a raw IP -- see Section 23 (PII)
     user_id     BIGINT                                   -- NULL for anonymous clicks
 );
 

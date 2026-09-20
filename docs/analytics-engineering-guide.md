@@ -98,7 +98,7 @@ with the exact command to produce the real result yourself.
 22. [Ingestion Metadata (deep-dive)](#22-ingestion-metadata-deep-dive-) ✅✅
 
 **Quality & Operations**
-23. PII and Security ⏳
+23. [PII and Security](#23-pii-and-security-) ✅✅
 24. Testing (deep-dive) ⏳ *(tests exist now — see [Section 14.6](#146-how-to-test)*)
 25. Failure Scenarios (all 10) ⏳ *(one is demonstrated now — see [Section 14.7](#147-failure-scenario)*)
 26. Performance ⏳
@@ -107,8 +107,8 @@ with the exact command to produce the real result yourself.
 **Reference**
 28. [Architectural Principles](#28-architectural-principles) ✅ *(introduced now, extended as more are demonstrated)*
 29. [Architecture Decision Records](#29-architecture-decision-records) ✅
-30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6; LAB 12 — Section 16.5; LAB 13 — Section 17.5; LAB 14 — Section 18.5; LAB 15 — Section 19.5; LAB 16 — Section 20.5; LAB 17 — Section 21.5; LAB 18 — Section 22.5)*
-31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, and 22.9)*
+30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6; LAB 12 — Section 16.5; LAB 13 — Section 17.5; LAB 14 — Section 18.5; LAB 15 — Section 19.5; LAB 16 — Section 20.5; LAB 17 — Section 21.5; LAB 18 — Section 22.5; LAB 19 — Section 23.5)*
+31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, and 23.9)*
 32. Principal-Level Scenarios ⏳
 33. [Phase 1 Summary](#33-phase-1-summary-so-far) (running, updated each increment)
 34. [Phase 1 Completion Checklist](#34-phase-1-completion-checklist)
@@ -872,8 +872,8 @@ event detail.
 **Stated honestly:** "coarse geo info" from the real requirement is
 explicitly out of scope for this catalog — there's no IP-geolocation step
 anywhere in this pipeline (`clicks.hashed_ip` is hashed specifically to
-avoid needing to resolve real IPs to locations; see Section 23, PII,
-planned), and adding it would mean a new source column, a new dimension,
+avoid needing to resolve real IPs to locations; see Section 23, PII and
+Security), and adding it would mean a new source column, a new dimension,
 and a defensible privacy story, none of which this increment builds. It's
 named here rather than silently dropped, matching this project's
 established pattern (compare Section 33's other honestly-stated gaps).
@@ -1523,7 +1523,8 @@ analytical layer. Section 7's entire metrics catalog only ever needs
 so there is no analytical requirement pulling `email` into this model at
 all. Given that, keeping it out is the conservative default: every column
 that reaches the analytical layer is one more place PII (Section 23,
-planned) has to be tracked, access-controlled, and eventually governed;
+formally: `email` is this project's only `direct`-category column) has
+to be tracked, access-controlled, and eventually governed;
 not including a column nothing needs is simpler than including it and
 then having to justify, audit, and restrict it later. This is a "shaped by
 actual requirements" decision, in the same spirit as Section 7's
@@ -6993,6 +6994,469 @@ feature-specific.
 
 ---
 
+## 23. PII and Security ✅✅
+
+### 23.1 Concept
+
+**PII** stands for personally identifiable information. It means any data
+that identifies one specific, real person, either by itself or combined
+with other data.
+
+This project has touched PII twice already, without ever naming the
+topic directly. Section 7.2 noted that `clicks.hashed_ip` is hashed
+specifically to avoid resolving real IP addresses to locations. Section
+10.4 explained why `dim_user` leaves `users.email` out of the analytical
+model. Both were real decisions, made for real reasons. Neither was part
+of a repeatable process. This section builds that process: a way to
+classify every source column once, check that the classification never
+goes stale, and make the result visible to anyone who asks.
+
+Three categories cover every column this project has:
+
+- **none** — the column carries no personal data at all.
+- **pseudonymized** — the column stands in for a real identity, but
+  doesn't reveal it by itself. A hashed IP address is pseudonymized. So
+  is a bare foreign-key integer like `user_id`.
+- **direct** — the column identifies one person on its own, with nothing
+  else needed. An email address is direct.
+
+Pseudonymized data is still personal data. This surprises people coming
+to privacy law for the first time. Hashing an IP address with SHA-256
+doesn't erase who it belongs to. The same IP always produces the same
+hash. Anyone who can join that hash back to a real IP, or who sees the
+same hash show up across many records, can still track one person's
+activity. **Anonymization** is different: it means the link back to a
+real person has been destroyed, not just disguised. Nothing in this
+project's `clicks` table is anonymized. `hashed_ip` and `user_id` are
+both pseudonymized, and both are still personal data under a strict
+reading of most privacy regulations (GDPR is the clearest example, and
+the one this section uses as its reference point, without claiming to be
+comprehensive legal advice about any one jurisdiction).
+
+### Why does this exist?
+
+A source database usually has a reason to hold personal data. A `users`
+table needs `email` to send a password reset link. An analytics platform
+is different. It copies data out of that source system, again and again,
+into new places: Bronze objects, a data warehouse, a BI tool's cache, a
+data scientist's notebook. Every one of those copies is a new place the
+same personal data now lives. Every new place is a new thing to secure,
+a new thing to include in a breach-notification plan, and a new thing a
+person's "delete my data" request now has to reach.
+
+An analytics engineer who never asks "does this column carry personal
+data, and does it need to be here" widens that blast radius by default,
+one pipeline at a time, without ever making an active decision to do so.
+Section 10.4 already pushed back against that default once, for one
+column, in one table. This section turns that same instinct into
+something every column in every contract has to answer, not something
+that only happens when someone happens to think of it.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+Picture a generic e-commerce system with a `customers` table:
+
+| Column | PII category | Why |
+|---|---|---|
+| `id` | none | An internal surrogate key. Meaningless outside this database. |
+| `email` | direct | Identifies one real person by itself. |
+| `favorite_color` | none | A preference. Nobody is identified by liking blue. |
+| `device_fingerprint_hash` | pseudonymized | A hashed value used for fraud detection. Doesn't show a raw device ID, but the same device always hashes the same way, so it can still track one person's sessions over time. |
+
+Nothing here is specific to URL shorteners. Any system that stores an
+email address, or hashes a value that traces back to one person, faces
+this same three-way classification.
+
+### URL Shortener Example
+
+This project has exactly three source contracts: `urls.yaml`,
+`users.yaml`, and `clicks.yaml` (Section 12). Running the classification
+this section builds against the real, committed contracts finds four
+columns:
+
+| Table | Column | PII category |
+|---|---|---|
+| `users` | `email` | direct |
+| `urls` | `user_id` | pseudonymized |
+| `clicks` | `user_id` | pseudonymized |
+| `clicks` | `hashed_ip` | pseudonymized |
+
+`users.email` is this project's only `direct` column. It's also the only
+one Section 10.4 already had a name for. `urls.user_id` and
+`clicks.user_id` are pseudonymized for the same reason as each other: a
+bare integer means nothing alone, but joined against `users.id`, it
+names exactly which account a URL or a click belongs to. `clicks.hashed_ip`
+is pseudonymized for the reason explained in 23.1 above: hashing isn't
+anonymizing.
+
+Every other column in every other contract — `short_code`,
+`original_url`, `occurred_at`, `device_type`, `plan_type`, and the rest —
+is classified `none`. `original_url` deserves one honest caveat: a URL's
+own query string could, in principle, carry an email address or a name
+(a password-reset link is a common real-world example). This
+classification doesn't inspect URL content, so that risk isn't caught
+here. It's named as a stated limitation in 23.8, not silently ignored.
+
+### 23.2 Architecture
+
+```
+ contracts/source/*.yaml  (Section 12)
+   Every column already declares: name, type, nullable, description.
+   This section adds one more REQUIRED field: pii (none | pseudonymized | direct).
+         │
+         │ pii.classify_all_contracts()
+         │   -- reuses contracts.load_contract() from Section 12,
+         │      does not re-implement YAML loading
+         ▼
+ pii.py
+   For each contract: require every column's `pii` field present and
+   valid (raises ContractError if not -- see 23.7's Failure Scenario).
+   Returns one PiiColumn per column where pii != "none".
+         │
+         │ `make pii-report`
+         ▼
+ operator sees, e.g. (ACTUAL OBSERVED, this sandbox):
+   users.email        -> direct
+   urls.user_id       -> pseudonymized
+   clicks.user_id     -> pseudonymized
+   clicks.hashed_ip   -> pseudonymized
+
+────────────────────────────────────────────────────────────────────────
+ Separately, the DATA ITSELF flows through this pipeline like this:
+
+   users.email (direct)
+       │  extract_full: SELECT * -- every column, unmasked (Section 14)
+       ▼
+   Bronze (bronze/users/.../users.parquet) -- RAW, includes email as-is
+       │
+       │  dim_user's DDL simply has no email column (Section 10.4,
+       │  an explicit, already-documented decision)
+       ▼
+   analytical layer -- no email anywhere
+
+   clicks.hashed_ip (pseudonymized)
+       │  extract_incremental: SELECT * -- already hashed at the SOURCE,
+       │                                   before this pipeline ever sees it
+       ▼
+   Bronze (bronze/clicks/.../clicks.parquet) -- hashed, as it arrived
+       │
+       │  fact_clicks's DDL simply has no hashed_ip column either --
+       │  true since Section 11, but never named as a PII decision
+       │  until this section
+       ▼
+   analytical layer -- no hashed_ip either
+```
+
+The second half of this diagram is this section's real finding. Bronze
+holds `users.email` completely unmasked, because `extract_full` reads
+every column of every configured table with no exceptions (Section 14's
+`pd.read_sql_table` call takes no column list). That's a genuine gap,
+named plainly in 23.8. What keeps it from reaching further is
+`dim_user`'s schema, and that decision was already made and written down
+in Section 10.4, before this section existed. `clicks.hashed_ip` never
+reaches the analytical layer either, for the same structural reason
+(`fact_clicks` simply has no column for it), but nobody had framed that
+as a PII decision before now. Both facts came from re-reading the actual
+committed DDL against this section's classification, not from assuming
+the earlier sections got it right.
+
+### 23.3 Design Decision: classify PII inside the existing data contract, not a separate registry
+
+**Context:** every source column already has one canonical description,
+in one place — `contracts/source/*.yaml` (Section 12). A PII
+classification needs to live somewhere too, and it needs to answer the
+same question a schema contract already answers: "what does this column
+actually contain?"
+
+**Decision:** add `pii` as a required field on every column inside the
+existing contract files. No new file, no second source of truth.
+
+**Consequences:** a column can never have a schema but no PII
+classification, or a PII classification for a column that doesn't exist.
+Both are structurally impossible when they live in the same list.
+
+### Alternatives
+
+A separate `pii_registry.yaml`, mapping `table.column` to a category,
+checked on its own schedule. This is a common real-world pattern —
+larger companies often do exactly this, because a data-governance team
+owns PII policy and a data-platform team owns schema, and those are two
+different teams with two different review processes.
+
+### Trade-offs
+
+| | Inside the contract (chosen) | Separate registry |
+|---|---|---|
+| Can drift out of sync with the schema | No — one list describes both | Yes — a new column can be added to the contract and never added to the registry |
+| Ownership matches team boundaries | Not by itself — one team edits both concerns | Cleaner in a larger org, where governance and platform teams differ |
+| Enforcement | One function (`_require_pii_declared`) blocks a contract from loading incompletely classified | Needs its own separate check, run on its own schedule, against its own file |
+| Right choice for this project | Yes — one team, one repo, and the drift risk of a second file is a real, concrete cost | Not yet — would be worth revisiting once a governance team actually exists as a separate owner |
+
+This is the same reasoning Section 12 already used once, for a different
+question: one canonical source beats two sources that can quietly
+disagree. This section applies that same principle to a compliance
+concern instead of a purely technical one.
+
+### 23.4 Implementation
+
+**Implementation Guide (write-it-yourself):** add a `pii` field to every
+column in all three files under `contracts/source/`. Then write a small
+module, `pii.py`, with two functions. The first, `classify_table`, takes
+one already-loaded contract dictionary and returns every column where
+`pii != "none"`. Before it returns anything, it must check that every
+single column actually has a `pii` key, and that the value is one of
+`none`, `pseudonymized`, or `direct` — raise on anything else, using the
+same `ContractError` Section 12 already defined, rather than a brand new
+exception type. The second function, `classify_all_contracts`, loops
+over every `*.yaml` file in `contracts/source/` and calls the first
+function on each one. Reuse `contracts.load_contract` for the YAML
+parsing — don't write a second YAML loader.
+
+**Reference Implementation** (`ingestion/src/url_shortener_analytics/pii.py`, excerpt):
+
+```python
+VALID_PII_CATEGORIES = {"none", "pseudonymized", "direct"}
+
+
+def _require_pii_declared(contract: dict[str, Any]) -> None:
+    table = contract["table"]
+    undeclared = [c["name"] for c in contract["columns"] if "pii" not in c]
+    if undeclared:
+        raise ContractError(
+            f"contract '{table}' is missing a 'pii' classification for "
+            f"column(s): {', '.join(undeclared)}"
+        )
+    invalid = {c["name"]: c["pii"] for c in contract["columns"] if c["pii"] not in VALID_PII_CATEGORIES}
+    if invalid:
+        raise ContractError(
+            f"contract '{table}' has invalid 'pii' value(s) {invalid} -- "
+            f"must be one of {sorted(VALID_PII_CATEGORIES)}"
+        )
+
+
+def classify_table(contract: dict[str, Any]) -> list[PiiColumn]:
+    _require_pii_declared(contract)
+    return [
+        PiiColumn(table=contract["table"], column=c["name"], category=c["pii"], description=c.get("description", ""))
+        for c in contract["columns"]
+        if c["pii"] != "none"
+    ]
+```
+
+Walking through `_require_pii_declared`, one piece at a time: the first
+block collects every column name missing a `pii` key at all. If any
+exist, it raises immediately, and the error message names every missing
+column, not just the first one — the same "report everything wrong in
+one pass" habit Section 12's `validate_contract` already established.
+The second block checks the columns that DO have a `pii` key, but where
+the value itself is wrong (a typo like `"sort-of"` instead of
+`"pseudonymized"`). It also raises, with the actual bad values shown.
+`classify_table` calls this check first, before doing anything else.
+That ordering matters: a contract with even one undeclared or invalid
+column raises immediately, and the caller never sees a partial,
+misleading result.
+
+### Hands-on Challenge (implement-yourself)
+
+Before looking at the full `pii.py` file, try writing `_require_pii_declared`
+yourself from just the description two paragraphs up. Then compare your
+version against the real one. A common shortcut: checking only for a
+missing `pii` key, and skipping the second check for an invalid value.
+Ask yourself what happens if someone writes `pii: Direct` (capitalized)
+in a contract file — would your version catch it silently passing
+through as neither `none` nor a real category?
+
+### 23.5 Hands-on Exercise
+
+**LAB 19 — Run the real PII report, then break it on purpose.**
+
+First, the happy path:
+
+```bash
+make pii-report
+```
+
+ACTUAL OBSERVED, this sandbox:
+
+```
+ts=... msg="pii column" category='pseudonymized' column='hashed_ip' table='clicks'
+ts=... msg="pii column" category='pseudonymized' column='user_id' table='clicks'
+ts=... msg="pii column" category='pseudonymized' column='user_id' table='urls'
+ts=... msg="pii column" category='direct' column='email' table='users'
+ts=... msg="pii report complete" columns_found=4
+```
+
+(Exit code confirmed `0`.)
+
+Now break it. Open `contracts/source/urls.yaml` in a scratch copy, and
+delete the `pii: pseudonymized` line under `user_id` entirely. Run
+`make pii-report` again against that copy. Confirm two things: the
+command now exits `1`, and the log line names `user_id` specifically as
+the missing column, not just "something is wrong with urls.yaml." Then
+undo your edit and confirm `make pii-report` passes again. This is the
+same "break it, then fix it, and confirm you understand why each state
+looks the way it does" exercise this project has used before for the
+Bronze reconciliation and stale-run detection labs — the fix isn't the
+point; watching the failure mode actually happen, and reading its exact
+message, is.
+
+### 23.6 How to test
+
+```bash
+make test
+```
+
+ACTUAL OBSERVED, this sandbox:
+
+```
+80 passed in 6.76s
+```
+
+That's 7 new tests over the 73 from the previous increment: three cover
+`classify_table`'s happy path (returns only non-`none` columns, reports
+the right category per column, returns real `PiiColumn` instances), one
+confirms an all-`none` contract returns an empty list, two confirm the
+missing-field and invalid-value cases both raise `ContractError`, and
+one runs `classify_all_contracts` against the real, committed
+`contracts/source/*.yaml` files and asserts the exact four-column result
+shown in 23.1 and 23.5 above. `ruff check ingestion/ benchmarks/` was run
+against every file this section touched — ACTUAL OBSERVED: `All checks
+passed!`
+
+One further check, specific to this section's Failure Scenario below,
+was also run directly in this sandbox: a contract with a schema-valid
+but PII-undeclared column was validated with `contracts.validate_contract`
+first, then classified with `pii.classify_table`. ACTUAL OBSERVED:
+
+```
+validate_contract passed: True violations: []
+classify_table raised ContractError: contract 'widgets' is missing a 'pii' classification for column(s): secret
+```
+
+### 23.7 Failure Scenario
+
+**What happens when someone adds a new column to a contract, and it has
+a real schema (a type, a nullability rule) but no `pii` field?**
+
+The check above answers this directly, and it's a genuine, currently
+real gap in this project: `make validate-contracts` — Section 12's main
+schema-contract gate, the one most likely to run in CI once this project
+has any — passes cleanly. `validate_contract` never looks at `pii` at
+all; it only compares type and nullability. The new column's missing PII
+classification is caught **only** by `make pii-report`, and only if
+someone remembers to run it separately. There is currently no single
+command that runs both checks together, and no CI wiring in this repo at
+all yet (a gap already named honestly in Section 33's running list).
+
+This means, today, a column carrying an email address could be added to
+`clicks.yaml` tomorrow, ship through `make validate-contracts` with a
+clean pass, and only get flagged the next time someone happens to run
+`make pii-report` by hand. That's a real ordering problem, not a
+hypothetical one — see 23.8 for what closing it would take.
+
+### 23.8 Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| PII classification | `pii.py`, required field per contract column, checked on demand via `make pii-report` | Same idea, but wired into the same CI gate as schema validation, so a missing classification blocks a merge, not just a manual report |
+| Bronze encryption at rest | None demonstrated — local MinIO with no server-side encryption configured | SSE-S3 or SSE-KMS enabled on the bucket, with `direct`-classified columns getting the strongest available option |
+| Access control on Bronze | None — any credential with bucket access reads every object, including raw `users.email` | Column- or object-level access control, or a separate, more tightly-scoped bucket/prefix for objects known to carry `direct` PII |
+| Right to erasure (GDPR "right to be forgotten") | No mechanism at all — Bronze objects are immutable, date-partitioned Parquet files (Section 20), and one person's row could be scattered across many of them | A defined process: locate every object containing a given `user_id`, rewrite each one without that person's rows, and log that the deletion happened — genuinely hard against immutable, partitioned storage, and worth naming as hard rather than pretending it's simple |
+| `original_url` query-string PII | Not inspected — a stated limitation of this classification (23.1) | Content-scanning or redaction on ingest, if `original_url` values are ever expected to carry personal data in practice |
+| Audit logging | None — nothing records who ran `pii-report`, or who read a Bronze object containing `email` | Every read of a `direct`-classified object logged, retained, and reviewable |
+
+### Principal Data Engineer Perspective
+
+The judgment call worth defending here is the same one Section 18.7 made
+for a different gap: naming the CI-ordering problem in 23.7 plainly,
+instead of quietly wiring `pii-report` into `validate-contracts` without
+comment, or — worse — not noticing the two checks were separate at all.
+A classification system that exists but that nothing forces anyone to
+run is a real risk, not a solved problem, and a senior reviewer will ask
+"what stops someone from shipping a new column with no PII review" long
+before they ask whether the classification categories themselves are
+well chosen.
+
+The second thing worth naming plainly: this section closes one specific,
+narrow gap — every column now has a declared classification — while
+leaving open several much larger ones next to it. Encryption at rest,
+access control, and the right-to-erasure story in the table above are
+all still just "not built," not "built imperfectly." A junior engineer
+often treats "we classified our PII" as equivalent to "we handle PII
+correctly." A principal-level review keeps those two claims separate,
+and says clearly which one this increment actually delivers.
+
+### 23.9 Principal Engineer Interview Questions
+
+**Q: "You hash an IP address with SHA-256 before storing it. Is the
+result still personal data? Why or why not?"**
+
+*What's tested:* whether the candidate understands the real difference
+between pseudonymization and anonymization, not just the vocabulary.
+
+*What a weak answer looks like:* "No, it's hashed, so it's anonymous
+now" — treats hashing as if it destroys the link back to a real person.
+
+*What a strong answer covers:* no, it's still personal data. SHA-256 is
+deterministic: the same input IP always produces the same output hash.
+That means the hash can still be used to track one person's activity
+over time, even without ever recovering the original IP. It can also be
+reversed by brute force for a small, guessable input space (IPv4 has
+only about 4.3 billion possible values — a rainbow table over all of
+them is entirely feasible). True anonymization would need to break the
+link back to the original value entirely, not just disguise it.
+
+*Concepts:* pseudonymization vs. anonymization; deterministic hashing as
+a re-identification risk, not a privacy guarantee.
+
+*Expected follow-up:* "What would make this genuinely harder to reverse
+or re-link?" — A keyed hash (HMAC with a secret key, not plain SHA-256),
+which at least removes the brute-force-the-whole-input-space attack,
+though it still doesn't make the result anonymous in the strict sense —
+the same key always produces the same output for the same input.
+
+*Common mistake:* conflating "I can't easily read the original value" with "this is no longer personal data" — the legal and technical bar for anonymization is much higher than that.
+
+**Q: "Your PII classification lives inside the same YAML file as your
+schema contract. What's the failure mode of that choice, and how would
+you catch it?"**
+
+*What's tested:* whether the candidate can find the actual weak point in
+a design they'd otherwise agree with, not just defend the choice in the
+abstract.
+
+*What a weak answer looks like:* "There's no failure mode, it's just
+better" — every design choice trades something away; not naming it is a
+red flag.
+
+*What a strong answer covers:* co-locating the two concerns means they
+can't drift apart from each other, but it doesn't mean the classification
+is actually enforced anywhere useful. In this project, `validate-contracts`
+(the schema check) and `pii-report` (the PII check) are two separate
+commands, and only one of them is likely to run in CI by default. A new
+column can pass schema validation while missing its PII classification
+entirely, and nothing stops that from shipping. The fix is procedural,
+not structural: run both checks in the same CI job, or fold the PII
+check into `validate_contract` itself so a contract can't pass validation
+at all without a complete, valid `pii` field on every column.
+
+*Concepts:* co-locating related data doesn't automatically mean
+co-enforcing it; a check that exists but isn't wired into the actual
+gate people rely on provides much weaker protection than it appears to.
+
+*Expected follow-up:* "Would you fold the PII check into `validate_contract`,
+or keep it as a separate command?" — Reasonable answers on both sides:
+folding it in guarantees it always runs together with schema validation,
+but conflates two different concerns (schema correctness vs. governance)
+into one function's responsibility, which section 12's own contracts.py
+docstring already treats as worth keeping conceptually distinct even if the enforcement is unified.
+
+*Common mistake:* assuming that because a check function exists and has
+tests, the property it checks for is actually guaranteed in practice —
+a check nobody runs guarantees nothing.
+
+---
+
 ## 28. Architectural Principles
 
 Introduced here, demonstrated incrementally as more of Phase 1 is built.
@@ -7306,98 +7770,69 @@ the same posture unless a specific, named reason justifies auto-remediation.
 
 ## 33. Phase 1 Summary (so far)
 
-**What we've built in this increment:** File Layout (Section 21) and
-Ingestion Metadata's own deep-dive (Section 22), closing out the Storage
-block and giving this pipeline its first genuinely operational,
-health-reporting view over both the data it has written (Bronze object
-sizes) and the control-plane table that has been recording every run
-since Section 13. Genuinely new code: `object_store.get_file_layout_report`
-(per-table object count, avg/min/max byte size, and an explicit
-`small_file_count` below an 8 MB default threshold, wired into a new
-`layout-report` CLI command); a real, previously-undiscovered gap fixed —
-`ingestion_metadata.watermark_start` had existed in the schema since
-Section 13 but no code path had ever written to it, confirmed NULL
-against real Postgres before the fix and non-NULL after — closed by
-threading `watermark_start` through `metadata.finish_run_success` and
-both call sites in `extract_incremental.run_incremental_load`; and two
-new general-purpose metadata readers, `metadata.get_run_history` (most
-recent N runs, any status, most-recent-first — the first reader in this
-module not scoped to a single status) and `metadata.get_ingestion_summary`
-(per-table aggregated run health via SQL `FILTER (WHERE ...)`, wired into
-a new `ingestion-summary` CLI command). 10 new unit tests (63 → 73); one
-new ADR (013).
+**What we've built in this increment:** PII and Security (Section 23),
+turning two earlier one-off decisions — Section 7.2's `hashed_ip`
+reasoning and Section 10.4's `dim_user`-excludes-`email` decision — into
+one repeatable process every source column now goes through. Genuinely
+new code: a required `pii` field (`none` / `pseudonymized` / `direct`)
+added to every column in all three `contracts/source/*.yaml` files;
+`pii.py`, with `classify_table` and `classify_all_contracts`, built as a
+thin layer over Section 12's existing `contracts.load_contract` rather
+than a second, separate loader; and a new `pii-report` CLI command. 7
+new unit tests (73 → 80).
 
-**A note on this increment specifically:** the `watermark_start` gap is
-the thing most worth calling out, because it's exactly the kind of thing
-this guide keeps insisting on finding by actually re-reading code against
-its schema rather than assuming past sections got everything right. It
-was found by grepping `metadata.py` for `watermark_start` and getting
-zero matches, then confirming the gap concretely against real Postgres
-16 before touching any code — the same "verify before you fix, and prove
-the fix against real infrastructure afterward" discipline this guide
-followed for the `uuid.UUID`-vs-`str` cross-dialect quirk in Section
-16.6. Section 22.3's Design Decision also puts this increment's SQL
-aggregation choice in explicit contrast with Section 16's Python-side
-time-cutoff computation — same-looking problem ("compute something over
-`ingestion_metadata` rows"), opposite-looking answer, both individually
-correct because portability is a per-feature property of a specific SQL
-construct, not a blanket rule to apply uniformly; `FILTER (WHERE ...)`
-was confirmed to work against this sandbox's actual SQLite 3.45.1 before
-being relied on, not assumed from "modern enough."
+**A note on this increment specifically:** the real finding here is a
+gap between two checks that look like they'd overlap, but don't. `make
+validate-contracts` (Section 12) never looks at the new `pii` field at
+all — it only compares type and nullability. A new column could ship
+with a full schema and no PII classification, pass `validate-contracts`
+cleanly, and only get caught by `make pii-report`, run separately, by
+hand. This was proven directly in this sandbox, not assumed: a
+schema-valid contract with an undeclared `pii` field passed
+`validate_contract` with zero violations, then raised `ContractError`
+from `classify_table` on the very next line (Section 23.6). Section
+23.2's architecture diagram also surfaces a second, quieter finding:
+`fact_clicks` has never carried a `hashed_ip` column, since Section 11,
+but nothing before this section had named that as a PII-driven decision
+the way Section 10.4 named `dim_user`'s `email` exclusion.
 
 **Concepts taught so far, at full depth:** the real application's
 architecture and schema, OLTP vs. OLAP, full load and incremental-load
 ingestion (watermarks, idempotency, checkpointing, Bronze reconciliation),
 the entire data modeling layer (Sections 7-12), the Storage block in
-full — the flat-key, whole-object-write model underlying every S3-API
-call this codebase makes (Section 18); columnar vs. row-oriented storage
-with real measured size/read-time differences at two scales (Section
-19); Hive-style partitioning and genuine partition pruning for full-load
-keys (Section 20); file layout as a question distinct from partitioning —
-file *count* and *size* within a partition, not which column values
-split it, and why a mean alone can hide a skewed size distribution
-(Section 21); and `ingestion_metadata` treated explicitly as this
-pipeline's control plane and audit table, with a full column-by-column
-walkthrough of what each field means operationally and two new
-general-purpose query functions built for it (Section 22).
+full (Sections 18-21), `ingestion_metadata` as this pipeline's control
+plane (Section 22), and now PII classification: the real difference
+between pseudonymization and anonymization, why a hashed value is still
+personal data, and why this project chose to classify PII inside its
+existing data contracts rather than in a separate registry (Section 23).
 
-**Known limitations, stated honestly:** `get_file_layout_report`
-detects small-file accumulation but never compacts, merges, or rewrites
-anything — the same detect-don't-remediate posture Section 17.7
-established for Bronze reconciliation, now formalized a second time as
-its own ADR (ADR-013) rather than left as an implicit repeated pattern;
-the 8 MB small-file threshold is a POC-simplification default, not a
-value derived from this project's actual query-engine read-parallelism
-characteristics (Section 21.8); `get_run_history` and
-`get_ingestion_summary` are read-only reporting, with no CLI-level
-pagination guard on `get_run_history`'s `limit`, so a caller requesting
-an unbounded history against a long-lived production table would pull
-every matching row in one query (Section 22.8's stated gap); the three
-CLI commands named as lacking top-level exception handling in the prior
-increment (`check-stale-runs`, `reconcile-bronze`, `storage-stats`) still
-have that gap, joined now by `layout-report` and `ingestion-summary`,
-which share the same unpatched pattern; partition pruning is still scoped
-to full-load's date-partitioned keys only (ADR-012, unchanged this
-increment); no scheduler yet; the star schema is designed and
-DDL-committed but **not yet populated**; data contracts cover the source
-layer only; no PII classification section yet. This sandbox still has no
-Docker daemon and no real MinIO, so `get_file_layout_report`'s real-bucket
-behavior remains proven only against a mocked S3 client, honestly labeled
-DESIGN EXPECTATION for anything beyond that mock. What *was* genuinely
-verified in this sandbox this increment: the `watermark_start` fix and
-both new `metadata.py` query functions, each proven against real local
-Postgres 16 (not just SQLite) via dedicated verification scripts, with
-the recurring `uuid.UUID`-vs-`str` cross-dialect quirk handled again along
-the way; and `FILTER (WHERE ...)` support, confirmed directly against
-this sandbox's real SQLite 3.45.1 before being relied on.
+**Known limitations, stated honestly:** `pii-report` and
+`validate-contracts` are two separate commands, and only the
+classification check named in this increment's own note above closes
+the gap between them by describing it — the gap itself is still open;
+neither is wired into any CI gate, since this repo has none yet. PII
+classification does not inspect column *content* — `original_url` is
+classified `none`, but a URL's own query string could in principle carry
+personal data, and this section's tooling would not catch that
+(Section 23.1/23.8). No encryption at rest, no access control on Bronze
+objects, no right-to-erasure mechanism, and no audit logging exist for
+any of this project's `direct` or `pseudonymized` columns — all named
+plainly as "not built" in Section 23.8's Production Considerations table,
+not glossed over as already handled. The three-way classification itself
+(`none`/`pseudonymized`/`direct`) is this project's own simplification;
+real privacy frameworks (GDPR in particular) draw finer distinctions this
+section does not attempt to fully cover. What *was* genuinely verified
+in this sandbox this increment: `pii-report` run against the real,
+committed contracts, producing the exact four-column result reported in
+Section 23.1; the missing-`pii`-field and invalid-`pii`-value failure
+cases, each confirmed to raise `ContractError` with the specific column
+name included; and the `validate-contracts`-passes-while-`pii-report`-fails
+gap, reproduced directly against a real SQLite engine.
 
-**Immediate next increment:** PII and Security (Section 23) — now that
-`clicks.hashed_ip` and `dim_user`'s email exclusion have been mentioned
-as partial mitigations several times without their own formal treatment —
-or Testing (deep-dive, Section 24) / Failure Scenarios (Section 25), now
-that 73 unit tests and two increments' worth of Failure Scenario
-subsections exist to consolidate; whichever the reader wants to tackle
-next.
+**Immediate next increment:** Testing (deep-dive, Section 24) or Failure
+Scenarios (Section 25), now that 80 unit tests and three increments'
+worth of Failure Scenario subsections exist to consolidate, or
+Performance (Section 26); whichever the reader wants to tackle next.
 
 ---
 
@@ -7423,14 +7858,14 @@ next.
 | Partitioning implemented | ✅ Done (single file per partition; pruning added) | Hive-style date/watermark-scoped keys since Sections 14-15, formalized in Section 18.2; genuine partition-pruned listing for full-load tables, `list_bronze_keys_for_date_range`, Section 20, ADR-012 | Not true multi-file-per-partition splitting; pruning not extended to incremental's watermark-range keys (named scope boundary, Section 20.3) |
 | File layout health reporting implemented | ✅ Done (detect-only) | `object_store.get_file_layout_report`, `layout-report` CLI command, Section 21, ADR-013 | No auto-compaction, by deliberate design (ADR-013); 8 MB small-file threshold is a POC default, not empirically derived (Section 21.8) |
 | Ingestion metadata deep-dive completed | ✅ Done | `watermark_start` gap found and fixed, `get_run_history`, `get_ingestion_summary`, `ingestion-history`/`ingestion-summary` CLI commands, Section 22 | `get_run_history` has no pagination guard on `limit` (Section 22.8) |
-| PII identified | ⏳ Not started | `clicks.hashed_ip` already avoids raw IPs by construction | Formal classification table, Section 23 |
-| Tests implemented | ✅ Done (unit + partial integration) | 73 passing unit tests (up from 38 three increments ago); the contracts integration test, and prior increments' `metadata.py` additions, genuinely passed against a real (non-Docker) local Postgres in this sandbox; this increment's `watermark_start` fix and both new metadata readers re-verified against that same real Postgres | Full-load, incremental-load, and reconciliation integration tests still need real MinIO, not available here — user should run `make up && make test-integration` locally for the complete suite |
-| Failure scenarios tested | ✅ Partial | Sections 7-12 (data modeling), 14.7, 15.7, 16.7, 17.7, 18.7, 19.7, 20.7, 21.7, 22.7 | Remaining named in Section 25's index |
+| PII identified | ✅ Done | Every column in `contracts/source/*.yaml` now declares `pii` (`none`/`pseudonymized`/`direct`); `pii.py`, `pii-report` CLI command, Section 23 | Not content-inspecting — `original_url` query strings aren't scanned (Section 23.8); no encryption/access-control/erasure mechanism built yet (Section 23.8) |
+| Tests implemented | ✅ Done (unit + partial integration) | 80 passing unit tests (up from 38 four increments ago); the contracts integration test, and prior increments' `metadata.py` additions, genuinely passed against a real (non-Docker) local Postgres in this sandbox; this increment's PII classification tests, including the real-contracts-directory test, all genuinely run | Full-load, incremental-load, and reconciliation integration tests still need real MinIO, not available here — user should run `make up && make test-integration` locally for the complete suite |
+| Failure scenarios tested | ✅ Partial | Sections 7-12 (data modeling), 14.7, 15.7, 16.7, 17.7, 18.7, 19.7, 20.7, 21.7, 22.7, 23.7 | Remaining named in Section 25's index |
 | Performance benchmark completed | ✅ Partial | Parquet vs. CSV/JSON, Section 19, genuinely run at two scales | Extraction-time-at-scale and partition-pruning real-network-latency benchmarks not yet run, Section 26 |
-| Architecture diagrams completed | ✅ Partial | 10+ diagrams so far, including the full star schema ER diagram (Section 10.1) and Sections 18/20/21/22's object-storage, partition-pruning, file-layout, and control-plane diagrams | More land with later sections (data lifecycle, failure/recovery, final architecture) |
-| ADRs documented | ✅ 13 of 13+ planned | Section 29 | ADR-013 (detect-don't-auto-compact file layout, formalizing the same posture as Section 17.7) added this increment; a bronze-key-storage-vs-recompute decision is documented in Section 17.3 but not yet promoted to its own numbered ADR |
-| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9 | Remaining categories not yet covered, Section 31 |
-| Hands-on labs completed | ✅ Partial | LAB 1-18 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation, LAB 14 storage growth/idempotency, LAB 15 Parquet benchmark, LAB 16 partition pruning, LAB 17 file-layout report, LAB 18 watermark_start fix + metadata readers) | LAB 19+ |
+| Architecture diagrams completed | ✅ Partial | 10+ diagrams so far, including the full star schema ER diagram (Section 10.1) and Sections 18/20/21/22/23's object-storage, partition-pruning, file-layout, control-plane, and PII-classification/data-flow diagrams | More land with later sections (data lifecycle, failure/recovery, final architecture) |
+| ADRs documented | ✅ 13 of 13+ planned | Section 29 | No new ADR this increment — Section 23's design decision (classify PII inside contracts, not a separate registry) is documented in Section 23.3 but not yet promoted to its own numbered ADR |
+| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9 | Remaining categories not yet covered, Section 31 |
+| Hands-on labs completed | ✅ Partial | LAB 1-19 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation, LAB 14 storage growth/idempotency, LAB 15 Parquet benchmark, LAB 16 partition pruning, LAB 17 file-layout report, LAB 18 watermark_start fix + metadata readers, LAB 19 PII report break/fix) | LAB 20+ |
 | README updated | ✅ Done | `README.md` | — |
 | Git repository clean | ✅ Done | Section 35 | — |
 | No secrets committed | ✅ Done | `.gitignore`, `.env.example` reviewed | — |

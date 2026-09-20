@@ -2,6 +2,9 @@
 # schemas/source/clicks.md and ADR-008). This is the table Section 15's
 # incremental load and Section 10's fact_clicks both depend on most
 # heavily. See docs/analytics-engineering-guide.md, Section 12.
+#
+# Every column also declares `pii`. This is a required field, not an
+# optional one -- see pii.py and Section 23 for the full reasoning.
 
 table: clicks
 version: 1
@@ -16,27 +19,40 @@ columns:
   - name: id
     type: integer
     nullable: false
+    pii: none
     description: Surrogate PK, autoincrement, strictly insertion-ordered. Section 15's watermark column.
   - name: short_code
     type: text
     nullable: false
+    pii: none
     description: Unenforced reference to urls.short_code -- no FK constraint.
   - name: occurred_at
     type: timestamp
     nullable: false
+    pii: none
     description: Business time of the click. Not the watermark column -- see ADR-005.
   - name: device_type
     type: text
     nullable: false
+    pii: none
     description: "mobile | desktop | tablet | unknown. Default 'unknown'."
   - name: hashed_ip
     type: text
     nullable: true
-    description: SHA-256 hex digest. Never a raw IP, by construction.
+    pii: pseudonymized
+    description: >
+      SHA-256 hex digest. Never a raw IP, by construction. Still
+      classified as pseudonymized, not none -- a one-way hash of an IP
+      address is pseudonymized personal data, not anonymized data, since
+      the same source IP always hashes to the same digest. See Section 23.
   - name: user_id
     type: integer
     nullable: true
-    description: NULL for anonymous clicks. Unenforced reference to users.id.
+    pii: pseudonymized
+    description: >
+      NULL for anonymous clicks. Unenforced reference to users.id. Same
+      reasoning as urls.user_id -- identifies a specific account's click
+      history once joined against `users`.
 
 quality_rules:
   - "id is monotonically increasing (BIGSERIAL) -- required for Section 15's watermark to be correct"

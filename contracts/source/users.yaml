@@ -1,6 +1,9 @@
 # Data contract for the source `users` table (HYPOTHETICAL -- see
 # schemas/source/users.md and ADR-008). See
 # docs/analytics-engineering-guide.md, Section 12.
+#
+# Every column also declares `pii`. This is a required field, not an
+# optional one -- see pii.py and Section 23 for the full reasoning.
 
 table: users
 version: 1
@@ -14,18 +17,27 @@ columns:
   - name: id
     type: integer
     nullable: false
+    pii: none
     description: Surrogate PK, autoincrement.
   - name: email
     type: text
     nullable: false
-    description: Unique. Never leaves Bronze in raw form in the analytical layer.
+    pii: direct
+    description: >
+      Unique. Directly identifies one natural person by itself, with no
+      other data needed -- Section 23's one "direct" column. Reaches
+      Bronze unmasked today (full load extracts every column); excluded
+      from dim_user by Section 10.4's design decision, so it never
+      reaches the analytical layer.
   - name: plan_type
     type: text
     nullable: false
+    pii: none
     description: "FREE | PREMIUM. Not a database-level enum -- see quality_rules."
   - name: created_at
     type: timestamp
     nullable: false
+    pii: none
     description: Set at insert.
 
 quality_rules:

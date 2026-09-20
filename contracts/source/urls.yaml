@@ -5,6 +5,11 @@
 # `type` values are coarse categories, not exact SQL types -- see
 # contracts.py's module docstring for why exact cross-dialect type
 # comparison was rejected.
+#
+# Every column also declares `pii`. This is a required field, not an
+# optional one -- see pii.py and docs/analytics-engineering-guide.md,
+# Section 23, for why it lives here instead of a separate registry, and
+# for what "none" / "pseudonymized" / "direct" each mean.
 
 table: urls
 version: 1
@@ -18,34 +23,49 @@ columns:
   - name: id
     type: integer
     nullable: false
+    pii: none
     description: Surrogate PK, autoincrement.
   - name: short_code
     type: text
     nullable: true
+    pii: none
     description: Unique, indexed. Nullable due to id-first generation strategy.
   - name: original_url
     type: text
     nullable: false
-    description: The destination URL.
+    pii: none
+    description: >
+      The destination URL. Not classified as PII by this contract, but
+      see Section 23's stated limitation -- a URL's own query string can
+      genuinely carry personal data (an email address in a reset link,
+      for example), and this classification does not inspect URL content.
   - name: created_at
     type: timestamp
     nullable: false
+    pii: none
     description: Set at insert.
   - name: expires_at
     type: timestamp
     nullable: true
+    pii: none
     description: Present in schema; not enforced anywhere in application code.
   - name: user_id
     type: integer
     nullable: true
-    description: Unenforced reference to users.id -- no FK constraint.
+    pii: pseudonymized
+    description: >
+      Unenforced reference to users.id -- no FK constraint. A bare
+      integer reveals nothing by itself, but joined against `users` it
+      identifies exactly which account owns this URL -- see Section 23.
   - name: is_active
     type: boolean
     nullable: false
+    pii: none
     description: Default true.
   - name: deleted_at
     type: timestamp
     nullable: true
+    pii: none
     description: Soft-delete marker.
 
 quality_rules:

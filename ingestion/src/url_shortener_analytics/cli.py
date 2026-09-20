@@ -1,7 +1,7 @@
 """Command-line entrypoint: `python -m url_shortener_analytics.cli <command>`
 (or the `ingest` console script installed by pyproject.toml).
 
-Nine commands:
+Ten commands:
 
 - `run`                -- dispatch each table in pipelines.yaml to full or
                           incremental load, per its configured `load_type`.
@@ -36,12 +36,15 @@ Nine commands:
 - `ingestion-summary`  -- one row per source table: successful/failed run
                           counts, total rows written, last success time.
                           See the guide's Section 22.
+- `pii-report`         -- every column any contract in contracts/source/
+                          classifies as carrying personal data, and at
+                          what sensitivity. See the guide's Section 23.
 
 See docs/analytics-engineering-guide.md, "Full Load Ingestion -> How to
 Run", Section 15 "How to Run", Section 12 "How to Run", Section 16 "How to
 Run", Section 17 "How to Run", Section 18 "How to Run", Section 21 "How to
-Run", and Section 22 "How to Run", for the exact commands and expected
-output.
+Run", Section 22 "How to Run", and Section 23 "How to Run", for the exact
+commands and expected output.
 """
 
 from __future__ import annotations
@@ -62,6 +65,7 @@ from url_shortener_analytics.extract_full import run_full_load
 from url_shortener_analytics.extract_incremental import run_incremental_load
 from url_shortener_analytics.logging_setup import configure_logging
 from url_shortener_analytics.object_store import get_bucket_stats, get_file_layout_report, get_s3_client
+from url_shortener_analytics.pii import classify_all_contracts
 from url_shortener_analytics.reconciliation import reconcile_bronze
 
 logger = logging.getLogger(__name__)
@@ -336,6 +340,35 @@ def ingestion_summary_command(config_path: Path = DEFAULT_PIPELINE_CONFIG) -> in
     return 0
 
 
+def pii_report_command(contracts_dir: Path = DEFAULT_CONTRACTS_DIR) -> int:
+    """Print every column any contract in `contracts_dir` classifies as
+    carrying personal data, and at what sensitivity (see the guide's
+    Section 23). Exits 1 if any contract is missing a `pii` declaration
+    or has an invalid one -- this is a check, not just a report, since a
+    column silently missing its classification is the one failure mode
+    this command exists to catch."""
+    settings = get_settings()
+    configure_logging(settings.log_level)
+
+    try:
+        pii_columns = classify_all_contracts(contracts_dir)
+    except ContractError:
+        logger.exception("pii classification could not be completed")
+        return 1
+
+    if not pii_columns:
+        logger.info("no columns classified as carrying personal data")
+        return 0
+
+    for col in pii_columns:
+        logger.info(
+            "pii column",
+            extra={"table": col.table, "column": col.column, "category": col.category},
+        )
+    logger.info("pii report complete", extra={"columns_found": len(pii_columns)})
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="ingest", description="url-shortener-analytics-platform ingestion CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -410,6 +443,14 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to pipelines.yaml (default: ingestion/configs/pipelines.yaml)",
     )
 
+    pii_report_parser = subparsers.add_parser(
+        "pii-report", help="Report every column classified as carrying personal data, by sensitivity"
+    )
+    pii_report_parser.add_argument(
+        "--contracts-dir", type=Path, default=DEFAULT_CONTRACTS_DIR,
+        help="Directory of contract YAML files (default: contracts/source/)",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "run":
@@ -430,6 +471,8 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(ingestion_history_command(args.pipeline, args.table, args.limit))
     elif args.command == "ingestion-summary":
         sys.exit(ingestion_summary_command(args.config))
+    elif args.command == "pii-report":
+        sys.exit(pii_report_command(args.contracts_dir))
 
 
 if __name__ == "__main__":

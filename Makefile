@@ -1,4 +1,4 @@
-.PHONY: venv install up down logs ps db-shell ingest ingest-full create-analytics-schema validate-contracts check-stale-runs reconcile-bronze storage-stats benchmark-parquet layout-report ingestion-history ingestion-summary test test-integration lint fmt seed
+.PHONY: venv install up down logs ps db-shell ingest ingest-full create-analytics-schema validate-contracts check-stale-runs reconcile-bronze storage-stats benchmark-parquet layout-report ingestion-history ingestion-summary pii-report test test-integration lint fmt seed
 
 venv:
 	python3.12 -m venv .venv
@@ -71,6 +71,10 @@ ingestion-history:
 
 ingestion-summary:
 	python -m url_shortener_analytics.cli ingestion-summary
+
+# See docs/analytics-engineering-guide.md Section 23.
+pii-report:
+	python -m url_shortener_analytics.cli pii-report
 
 test:
 	pytest -v
