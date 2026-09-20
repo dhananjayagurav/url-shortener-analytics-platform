@@ -1,4 +1,4 @@
-.PHONY: venv install up down logs ps db-shell ingest ingest-full create-analytics-schema validate-contracts check-stale-runs reconcile-bronze storage-stats benchmark-parquet layout-report ingestion-history ingestion-summary pii-report test test-integration coverage lint fmt seed
+.PHONY: venv install up down logs ps db-shell ingest ingest-full create-analytics-schema validate-contracts check-stale-runs reconcile-bronze storage-stats benchmark-parquet benchmark-query-performance benchmark-extraction-time layout-report ingestion-history ingestion-summary pii-report test test-integration coverage lint fmt seed
 
 venv:
 	python3.12 -m venv .venv
@@ -59,6 +59,18 @@ storage-stats:
 # `make benchmark-parquet ROWS=200000`.
 benchmark-parquet:
 	python benchmarks/parquet_vs_csv_vs_json.py $(if $(ROWS),--rows $(ROWS),)
+
+# See docs/analytics-engineering-guide.md Section 26. Temporarily populates
+# fact_clicks/dim_url/dim_user with SYNTHETIC rows, times Section 7.1's
+# metrics catalog, then cleans up. Needs only Postgres, not MinIO.
+benchmark-query-performance:
+	PYTHONPATH=ingestion/src python3 benchmarks/query_performance.py $(if $(SCALES),--scales $(SCALES),)
+
+# See docs/analytics-engineering-guide.md Section 26. Temporarily adds
+# SYNTHETIC rows to the real source `clicks` table, times extract_full and
+# extract_incremental, then cleans up. Needs only Postgres, not MinIO.
+benchmark-extraction-time:
+	PYTHONPATH=ingestion/src python3 benchmarks/extraction_time.py $(if $(SCALES),--scales $(SCALES),)
 
 # See docs/analytics-engineering-guide.md Section 21. TABLE is required,
 # e.g. `make layout-report TABLE=clicks`.

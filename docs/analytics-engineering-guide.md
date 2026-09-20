@@ -101,14 +101,14 @@ with the exact command to produce the real result yourself.
 23. [PII and Security](#23-pii-and-security-) ✅✅
 24. [Testing (deep-dive)](#24-testing-deep-dive-) ✅✅
 25. [Failure Scenarios (all 10)](#25-failure-scenarios-all-10-) ✅✅
-26. Performance ⏳
+26. [Performance](#26-performance-) ✅✅
 27. Scale Design ⏳
 
 **Reference**
 28. [Architectural Principles](#28-architectural-principles) ✅ *(introduced now, extended as more are demonstrated)*
 29. [Architecture Decision Records](#29-architecture-decision-records) ✅
-30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6; LAB 12 — Section 16.5; LAB 13 — Section 17.5; LAB 14 — Section 18.5; LAB 15 — Section 19.5; LAB 16 — Section 20.5; LAB 17 — Section 21.5; LAB 18 — Section 22.5; LAB 19 — Section 23.5; LAB 20 — Section 24.5; LAB 21 — Section 25.5)*
-31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, 24.9, and 25.9; Category I: 24.9-25.9)*
+30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6; LAB 12 — Section 16.5; LAB 13 — Section 17.5; LAB 14 — Section 18.5; LAB 15 — Section 19.5; LAB 16 — Section 20.5; LAB 17 — Section 21.5; LAB 18 — Section 22.5; LAB 19 — Section 23.5; LAB 20 — Section 24.5; LAB 21 — Section 25.5; LAB 22 — Section 26.5)*
+31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, 24.9, 25.9, and 26.9; Category I: 24.9-25.9; Category P (Performance): 26.9)*
 32. Principal-Level Scenarios ⏳
 33. [Phase 1 Summary](#33-phase-1-summary-so-far) (running, updated each increment)
 34. [Phase 1 Completion Checklist](#34-phase-1-completion-checklist)
@@ -660,7 +660,7 @@ tell what happened without guessing.
 | `schemas/source/`, `sql/source/` | Documentation and DDL for the source schema (real + clearly-labeled hypothetical tables). |
 | `schemas/analytics/`, `sql/analytics/` | Reserved for the dimensional model — not yet populated. |
 | `scripts/` | One-off operator scripts (`seed_sample_data.py`). Not imported by the pipeline. |
-| `benchmarks/` | Executable performance benchmarks. `parquet_vs_csv_vs_json.py` (Section 19) genuinely run; extraction-time-at-scale benchmarks (Section 26) not yet built. |
+| `benchmarks/` | Executable performance benchmarks. `parquet_vs_csv_vs_json.py` (Section 19), `query_performance.py` and `extraction_time.py` (both Section 26) — all three genuinely run against real Postgres in this sandbox. |
 | `sample_data/` | Convention-only landing spot for local generated files; nothing here is committed. |
 | `tests/` (root) | Reserved for cross-phase end-to-end tests, once more than one phase's components exist. |
 
@@ -820,8 +820,8 @@ joined to at most one dimension — a direct consequence of the grain
 decision in Section 8 and the star schema shape in Section 11. None of
 them require a self-join, a window function, or a pre-aggregated rollup
 table to compute correctly at this project's current scale; Section 26
-(Performance, planned) is where that stops being true and pre-aggregation
-gets evaluated.
+(Performance) genuinely benchmarked all 8 of these exact queries up to
+2,000,000 synthetic rows and confirms this still holds.
 
 ### Design Decision
 
@@ -845,8 +845,12 @@ event detail.
    Phase 1).** Would make each dashboard query trivially fast at read
    time, at the cost of a transformation pipeline to maintain every
    summary table's freshness — real complexity this project hasn't earned
-   yet at 5,000 seeded click rows. Revisit once Section 26's benchmarks
-   show `fact_clicks` queries are actually slow.
+   yet at 5,000 seeded click rows. Section 26's benchmarks genuinely
+   tested this trigger, up to 2,000,000 synthetic rows: the slowest of
+   the 8 real metric queries settled at about 220 ms, and the trend
+   suggests pre-aggregation wouldn't be worth its cost until somewhere
+   around 8-10 million rows. Revisit if a future benchmark at that scale
+   shows otherwise.
 3. **A written metrics catalog, computed live from an atomic-grain fact
    table (chosen).** Slower per-query than pre-aggregation, at a scale
    that doesn't matter yet; keeps every metric's definition traceable to
@@ -8021,6 +8025,7 @@ set of 18.
 
   1. Cross-workload resource contention
      Section 2's Failure Scenario                                [C]
+     Section 26.7                                                [A] <- new, Section 26
 
   2. Partial / crashed execution (a checkpoint never gets written)
      Section 14.7                                                 [A] <- upgraded this increment
@@ -8057,10 +8062,16 @@ set of 18.
      Section 11's Failure Scenario                                [C]
      Section 24.7                                                 [A]
 
- Totals across all 18 entries: 8 Tier A, 3 Tier B, 7 Tier C.
- This section adds ZERO new entries to the list -- it reclassifies two
- (14.7, 19.7) from a lower tier to Tier A, by actually going and
- triggering them for real in this sandbox (25.4/25.6 below).
+ Totals across all 18 entries, as of Section 25: 8 Tier A, 3 Tier B, 7
+ Tier C. This section itself adds ZERO new entries to the list -- it
+ reclassifies two (14.7, 19.7) from a lower tier to Tier A, by actually
+ going and triggering them for real in this sandbox (25.4/25.6 below).
+
+ UPDATE, Section 26: a 19th entry (26.7) now exists, filed under category
+ 1 above, Tier A. Totals as of Section 26: 9 Tier A, 3 Tier B, 7 Tier C,
+ 19 total. See 25.7's own Failure Scenario -- this is that exact gap,
+ materializing and getting manually caught and fixed one increment later,
+ not a hypothetical anymore.
 ```
 
 Category 9 and category 10 are the two biggest groups, and that's worth
@@ -8293,6 +8304,16 @@ and diffing them), and that code doesn't exist yet. Naming this honestly
 here, rather than implying this index is self-maintaining, is the point
 — see 25.8 for what closing it would actually take.
 
+**Epilogue, written from Section 26:** this stopped being hypothetical
+one increment later. Section 26 added a genuine 19th Failure Scenario
+(26.7). It was added to 25.2's table by hand, while writing this exact
+sentence, specifically *because* this paragraph was fresh in mind — not
+because any mechanical check caught it. That's the honest state of this
+gap today: closed for this one instance, by a human noticing, with the
+underlying mechanism (nothing enforces this automatically) completely
+unchanged. The next Failure Scenario added by a future section is just
+as likely to be missed as this one nearly was.
+
 ### 25.8 Production Considerations
 
 | Aspect | This repo (POC) | Production |
@@ -8419,6 +8440,451 @@ human habits, each equally easy to individually forget.
 the fix for a problem whose actual root cause is the complete absence of
 any mechanical check — training helps once; a mechanical check helps
 every time, including for people who never got the training.
+
+---
+
+## 26. Performance ✅✅
+
+### 26.1 Concept
+
+**Performance work**, in this section's narrow sense, means measuring
+something real, not arguing from intuition. Section 7.1 made a design
+decision — no pre-aggregation, every metric computed live from
+`fact_clicks`' atomic grain — and named its own trigger for revisiting
+that decision in plain words: "revisit once Section 26's benchmarks show
+`fact_clicks` queries are actually slow." This section is where that
+promise gets kept, one way or the other, with real numbers instead of a
+guess.
+
+### Why does this exist?
+
+A design decision defended only by intuition is a claim nobody has
+checked. "Live queries will be fast enough" and "we'll obviously need
+pre-aggregation" are both guesses until someone runs the actual queries
+against actual data and writes down what happened. Section 7.1 already
+named this section as the place that check would happen. Skipping it
+would leave that Design Decision permanently unverified — technically
+still "the current decision," but never actually tested against the
+condition its own text names for revisiting it.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+Two engineers on a small analytics team disagree about whether a
+dashboard query needs a summary table. One says "obviously, GROUP BY
+over millions of rows won't scale." The other says "let's load a
+realistic row count into a test database and time it before deciding
+anything." The second approach turns an argument about opinions into a
+question with a real, checkable answer — and it might go either way.
+That's the entire idea this section applies to `fact_clicks`.
+
+### URL Shortener Example
+
+`fact_clicks` is schema-only in this project as of this section — Phase
+2's real transform (Section 11) doesn't exist yet, so there's no real,
+large volume of click data to query. That's a real constraint, not an
+excuse to skip measurement: this section builds two benchmark scripts
+that temporarily populate the real tables with clearly-labeled synthetic
+rows, run the real Section 7.1 queries and the real `extract_full`/
+`extract_incremental` functions against them, and then delete every row
+they added. The numbers that come out are real Postgres execution times,
+even though the data feeding them is synthetic.
+
+### 26.2 Architecture
+
+```
+ benchmarks/query_performance.py
+   1. cleanup()              -- defensive: remove any leftover synthetic
+                                 rows from a prior crashed run first
+   2. generate synthetic     -- dim_url (500 rows), dim_user (200 rows),
+      dims                      keys start at 900,000 (SYNTHETIC_*_FLOOR)
+   3. for each scale in
+      [5000, 50000, 500000]:
+        a. delete synthetic fact_clicks rows from the previous scale
+        b. insert `scale` new synthetic fact_clicks rows
+           (click_id >= 900,000,000)
+        c. run all 8 of Section 7.1's real metric queries, each scoped
+           with WHERE click_id >= 900000000, best-of-3 timing
+   4. cleanup()              -- delete every synthetic row before exiting
+                                 (skipped only if --keep-data is passed)
+
+ benchmarks/extraction_time.py
+   1. cleanup()              -- same defensive pattern
+   2. for each scale in [5000, 50000, 500000]:
+        a. insert `scale` synthetic rows into the real `clicks` source
+           table (id >= 10,000,000, SYNTHETIC_ID_FLOOR)
+        b. time extract_full("clicks", engine)          -- reads the
+           WHOLE table, real rows + synthetic rows together
+        c. time extract_incremental("clicks", engine,
+           watermark = SYNTHETIC_ID_FLOOR - 1)           -- reads ONLY
+           the new synthetic rows
+   3. cleanup()
+
+ Neither script writes to Bronze or touches MinIO. Both need only
+ Postgres. See 26.8 for why the Bronze-write stage and partition-pruning
+ network-latency numbers stay an explicitly named open gap.
+```
+
+Both scripts follow the same shape `benchmarks/parquet_vs_csv_vs_json.py`
+already established in Section 19: a `sys.path` insert so the script can
+import this project's own package without installing it, argparse for
+`--scales`, a print function for human-readable output, and a gitignored
+JSON file under `benchmarks/results/` for anyone who wants the raw
+numbers.
+
+### 26.3 Design Decision: benchmark with clearly-marked synthetic data, at fixed floors, always cleaned up
+
+**Context:** `fact_clicks`, `dim_url`, and `dim_user` are not empty. Each
+already holds exactly one row left over from an earlier section's own
+verification work (`click_id=999999`/`url_key=1`, both `short_code`
+`'test01'`, and `dim_user`'s Unknown member at `user_key=-1`). The source
+`clicks` table has 5,003 real seeded rows with contiguous ids 1-5003.
+Any benchmark that adds temporary data has to avoid colliding with any of
+this, and has to leave the tables exactly as it found them afterward.
+
+**Decision:** every synthetic row uses a key at or above a fixed floor,
+chosen to sit far above anything this project has ever committed
+(900,000 for `dim_url`/`dim_user` keys, 900,000,000 for `click_id`,
+10,000,000 for `clicks.id`). Every one of Section 7.1's 8 queries is
+re-scoped with an explicit `WHERE click_id >= 900000000` filter, so the
+timed result reflects only this benchmark's own data, consistently
+across every query — not the pre-existing residue row, and not
+inconsistently included in some queries and excluded from others.
+Cleanup runs both before a benchmark starts (defensive, in case a prior
+run crashed mid-way, the same lesson Section 22's own Failure Scenario
+already taught) and after it finishes, unless `--keep-data` is passed.
+
+**Consequences:** the benchmark can run, and re-run, against this
+project's real, shared Postgres instance without ever risking the small
+number of real rows other sections' hands-on exercises still depend on.
+
+### Alternatives
+
+1. **Wait until Phase 2's real transform exists, and benchmark against
+   real historical volume (rejected for now).** This would give the most
+   trustworthy numbers, but makes Section 26 permanently blocked on work
+   that's explicitly out of Phase 1's scope. Section 7.1 named this
+   section as something Phase 1 needed to answer, not something deferred
+   to Phase 2.
+2. **Truncate and fully replace the tables' contents for the benchmark,
+   with no floor separation (rejected).** Simpler to write, but destroys
+   the pre-existing residue rows other sections reference (Section 11's
+   Unknown-member join proof, for one) — a real, avoidable data-loss risk
+   for a benchmark script that has no business touching those rows at
+   all.
+3. **Floor-offset synthetic data, added and always cleaned up (chosen).**
+   Slightly more bookkeeping (picking floors, scoping every query's WHERE
+   clause) in exchange for a benchmark that's safe to run against shared,
+   real infrastructure, repeatedly, without special preparation.
+
+### Trade-offs
+
+| | Floor-offset synthetic data (chosen) | Full table replacement |
+|---|---|---|
+| Safe to run against a shared real database | Yes | No — destroys any pre-existing rows |
+| Can run repeatedly without setup/teardown ceremony | Yes | Only with an explicit backup/restore step first |
+| Query results reflect ONLY the benchmark's own data | Yes, by explicit `WHERE` scoping | Yes, trivially — nothing else is left in the table |
+| Extra code needed | A floor constant and one `WHERE` clause per query | None |
+
+### 26.4 Implementation
+
+**Implementation Guide (write-it-yourself):** for the query-performance
+benchmark, write a script that picks floor constants clear of every real
+or previously-committed row, generates synthetic `dim_url`/`dim_user`
+rows once, then loops over a list of scales. At each scale: delete the
+previous scale's synthetic `fact_clicks` rows, bulk-insert the new
+count, then run every one of Section 7.1's 8 queries (copied verbatim,
+each with an added `WHERE click_id >= <floor>`), timing each with
+`time.perf_counter()` and keeping the minimum of 3 repeats. Clean up
+before exiting. For the extraction-time benchmark, do the same shape
+against the real `clicks` table, but call this project's own
+`extract_full` and `extract_incremental` functions directly (not
+`run_full_load`/`run_incremental_load`, which additionally need a real S3
+client this sandbox doesn't have) — timing only the extract step, not a
+Bronze write.
+
+**Reference Implementation** (`benchmarks/query_performance.py`, excerpt):
+
+```python
+SYNTHETIC_CLICK_ID_FLOOR = 900_000_000
+
+def run_queries(engine: Engine, n_repeats: int = 3) -> dict[str, float]:
+    timings: dict[str, float] = {}
+    with engine.connect() as conn:
+        for name, sql in QUERIES.items():
+            samples = []
+            for _ in range(n_repeats):
+                start = time.perf_counter()
+                conn.execute(text(sql)).fetchall()
+                samples.append(time.perf_counter() - start)
+            timings[name] = min(samples)
+    return timings
+```
+
+**Reference Implementation** (`benchmarks/extraction_time.py`, excerpt):
+
+```python
+SYNTHETIC_ID_FLOOR = 10_000_000
+
+def time_extract_incremental(engine: Engine, watermark: int, n_repeats: int = 3) -> float:
+    samples = []
+    for _ in range(n_repeats):
+        start = time.perf_counter()
+        extract_incremental("clicks", engine, watermark=watermark)
+        samples.append(time.perf_counter() - start)
+    return min(samples)
+```
+
+Walking through `run_queries`: for each named query, it runs the exact
+same SQL 3 times in a row and keeps the fastest of the 3. Taking the
+minimum, not the average, matters here — a single slow run caused by
+something else happening on this shared sandbox at that moment (a
+background process, a disk hiccup) would otherwise drag the reported
+number up. The fastest of 3 runs is the closest available estimate of
+"how fast this query genuinely can run right now," which is the number
+worth reporting. `time_extract_incremental` follows the identical
+pattern, calling this project's real `extract_incremental` function
+instead of a raw SQL string — meaning any bug in that function's own SQL
+generation would show up here too, not just in its unit tests.
+
+### Hands-on Challenge (implement-yourself)
+
+Before reading `query_performance.py` in full, write your own version of
+`run_queries` from just the description above. A common shortcut: timing
+only 1 repeat per query instead of 3. Run your version twice in a row
+and compare the two single-shot numbers for the same query — if they
+differ by more than a few percent, that's the exact noise the best-of-3
+approach exists to filter out.
+
+### 26.5 Hands-on Exercise
+
+**LAB 22 — Run both benchmarks yourself, then push past this section's
+own numbers.**
+
+```bash
+make benchmark-query-performance
+make benchmark-extraction-time
+```
+
+Both clean up after themselves by default. Then try a scale this section
+didn't report on paper, and predict the number before running it:
+
+```bash
+make benchmark-query-performance SCALES=1000000
+```
+
+Compare your prediction (extrapolated from the 500,000 and 2,000,000-row
+numbers in 26.6 below) against the real result. If they're close, that's
+evidence the scaling really is roughly linear across this range, not
+just a coincidence between the two data points this section happened to
+pick.
+
+### 26.6 How to test
+
+Both benchmarks were run for real against this sandbox's real Postgres
+instance (`DATABASE_URL` pointed at port 5432, per Section 24.7's
+port-mismatch workaround). Row counts before and after were checked
+directly with `psql` and confirmed identical (`fact_clicks`/`dim_url`/
+`dim_user` at 1/1/1 rows; `clicks` at 5,003 rows, unchanged, before and
+after every run in this section).
+
+**ACTUAL OBSERVED — query timings (ms, best-of-3), `make benchmark-query-performance`:**
+
+| Scale | total_clicks_per_url | clicks_over_time | clicks_by_device_type | top_10_urls | anon_vs_attributed | by_plan_type | by_domain | active_vs_inactive |
+|---|---|---|---|---|---|---|---|---|
+| 5,000 | 1.85 | 2.29 | 1.61 | 1.83 | 1.36 | 1.40 | 1.38 | 1.27 |
+| 50,000 | 11.81 | 10.04 | 10.88 | 11.45 | 9.54 | 9.76 | 9.68 | 8.38 |
+| 500,000 | 57.46 | 52.34 | 54.92 | 59.96 | 51.72 | 48.67 | 56.15 | 47.53 |
+| 2,000,000 | 200.26 | 192.42 | 218.55 | 210.57 | 178.82 | 184.50 | 216.26 | 177.65 |
+
+**ACTUAL OBSERVED — extraction timings (ms), `make benchmark-extraction-time`:**
+
+| Total `clicks` rows | `extract_full` (reads all rows) | `extract_incremental` (reads only new rows) |
+|---|---|---|
+| 10,003 (5,003 real + 5,000 synthetic) | 50.47 | 22.42 |
+| 55,003 (5,003 real + 50,000 synthetic) | 247.85 | 208.80 |
+| 505,003 (5,003 real + 500,000 synthetic) | 1,865.27 | 1,943.21 |
+
+**A genuine benchmark-noise finding, investigated rather than reported at
+face value:** the first attempt at the 2,000,000-row query scale
+produced very different numbers — `total_clicks_per_url` at 2,731 ms, far
+above the ~200 ms every other query showed at that scale. A second
+attempt (with `--keep-data`, so the data stayed in place) showed the
+anomaly had spread: both `total_clicks_per_url` (4,378 ms) and
+`clicks_over_time` (3,942 ms) were now slow, while the other 6 queries
+stayed around 175-220 ms. That pattern — the anomaly moving between
+different queries across two runs — ruled out an explanation based on
+which column each query grouped by. `EXPLAIN (ANALYZE, BUFFERS)` run
+directly against two of the queries (one grouping by a high-cardinality
+column, `short_code`; one by a low-cardinality column, `device_type`)
+showed nearly identical query plans and nearly identical real execution
+times (378 ms and 333 ms) — refuting a cardinality-based theory outright.
+The real cause, confirmed by re-running the exact same 8 queries against
+the same, still-populated 2,000,000-row dataset a few minutes later with
+no changes at all: every query then ran in 175-220 ms, consistently. The
+2,000,000-row insert is a single, large transaction (roughly 71-76
+seconds to commit); Postgres has real work left to do right after a
+transaction that size commits — flushing dirty buffer pages, checkpoint
+activity — and whichever query happens to run first, right after that
+insert, pays a disproportionate share of that settling cost. This
+project's `shared_buffers` is a small, default 128 MB against roughly
+2 million fresh rows, which makes that contention window more visible
+here than it might be on a larger, tuned instance. **The number reported
+in the table above for 2,000,000 rows is the settled, reproducible one
+(200-220 ms range), not the first, noisy observation** — reporting the
+noisy number without investigating it would have been a real, avoidable
+mistake, and 26.7 below turns this exact investigation into a named
+Failure Scenario.
+
+`ruff check ingestion/ benchmarks/` and the full unit test suite were run
+again after both scripts were added:
+
+```
+80 passed in 6.67s
+All checks passed!
+```
+
+### 26.7 Failure Scenario
+
+**What happens if a benchmark's first result is treated as the final
+answer, without checking whether it's reproducible?**
+
+26.6 above is this exact failure, caught in the act rather than shipped.
+The first 2,000,000-row run reported `total_clicks_per_url` at 2,731 ms
+— a real number, genuinely measured, and still wrong to report as "how
+long this query takes at 2 million rows," because it wasn't measuring
+the query's own cost. It was measuring the query's cost *plus* transient
+contention from a huge insert transaction settling, a cost that has
+nothing to do with `fact_clicks`' query plan and everything to do with
+this specific moment in this specific sandbox. Reported without a second
+look, that number would have suggested query performance falls off a
+cliff somewhere well below 2 million rows — a false, avoidable
+conclusion that could have driven a real decision (like retracting
+Section 7.1's no-pre-aggregation choice) based on noise, not evidence.
+**Production implication:** any benchmark's first result deserves the
+same scrutiny this section gave its own — rerun it, vary what's
+different between runs one at a time, and only report a number once its
+cause is actually understood, not just observed once.
+
+### 26.8 Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| Query benchmark data | Synthetic, generated by this benchmark, up to 2,000,000 rows | Real historical volume, once Phase 2's transform has been running long enough to accumulate it |
+| Hardware | Shared cloud sandbox, single Postgres instance, 128 MB `shared_buffers`, no tuning | A sized, tuned instance (or managed warehouse), with `shared_buffers`/`work_mem` set for its actual workload |
+| Concurrency | One query at a time, sequentially — never tested under concurrent dashboard load | Realistic load testing with many simultaneous queries, which is where contention (like 26.6/26.7's finding) matters most in practice |
+| Extraction-to-Bronze write cost | Not measured — this sandbox has no MinIO, so only the extract step (pandas read) is timed, not the S3 `PUT` that follows it | Both stages measured separately, since a slow write can hide behind a fast extract in a combined number |
+| Partition-pruning network latency | Not measured — named as a still-open gap in Section 34, unchanged by this section | Measured against a real, network-attached object store, where request latency (not local disk) usually dominates |
+
+### Principal Data Engineer Perspective
+
+The real deliverable of this section isn't the numbers in 26.6 — it's the
+answer to the question Section 7.1 asked: does `fact_clicks` need
+pre-aggregation yet? At 2,000,000 synthetic rows — roughly 400 times this
+project's real seeded scale of 5,000 clicks — the slowest of 8 real
+queries settles at about 220 ms. Extrapolating the roughly linear trend
+from 500,000 to 2,000,000 rows (4x the rows, about 3.5x the time),
+reaching even a generous 1-second-per-query threshold would take on the
+order of 8-10 million rows. That's a real answer, and it could have come
+out the other way — nothing about how this benchmark was designed
+guaranteed a "no, don't pre-aggregate yet" result. **Section 7.1's
+Design Decision stands, confirmed by measurement rather than left as an
+unverified assumption.**
+
+The extraction numbers point at a different, arguably more urgent
+finding. At roughly 500,000 rows, the OLAP-side queries in 26.6 average
+about 0.11 microseconds of Postgres execution time per row scanned. The
+OLTP-side `extract_full` call, reading a comparable row count into a
+pandas DataFrame, costs about 3.7 microseconds per row — roughly 30
+times more expensive, per row, than an aggregation query over the same
+data. That gap is pandas' own per-row Python object construction, not a
+Postgres cost at all, and it means the extraction step — not the query
+step — is where this pipeline's cost genuinely grows fastest as the
+source table grows. This is exactly why Section 15's incremental load
+matters more over time than Section 7.1's pre-aggregation question does:
+`extract_incremental`'s cost tracks the number of *new* rows per run,
+not the total table size, while `extract_full`'s cost keeps growing with
+every row ever inserted. A principal engineer reading these two findings
+together prioritizes accordingly — the query side has real headroom
+left; the extraction side has a much narrower one, and it's already the
+more expensive of the two per row today.
+
+### 26.9 Principal Engineer Interview Questions
+
+**Q: "A benchmark you ran shows a query taking 2.7 seconds once, then
+about 200 milliseconds every time after. Which number do you report to
+your team, and why?"**
+
+*What's tested:* whether the candidate treats a benchmark's first result
+as data to investigate or as an answer to ship.
+
+*What a weak answer looks like:* "Report the worst case, to be safe" —
+sounds cautious, but reports a number that doesn't actually describe the
+query's real cost, just a one-time transient condition.
+
+*What a strong answer covers:* neither number gets reported without
+first understanding why they differ. In this section's real case, the
+slow result came from contention right after a large insert transaction
+settled — not from the query itself getting slower at that row count.
+Confirming that took rerunning the same query against the same,
+unchanged data a few minutes later and watching the number stabilize.
+Only after that investigation does either number become reportable, and
+the reproducible, steady-state number (about 200 ms here) is the one
+that actually describes the query's cost.
+
+*Concepts:* benchmark noise vs. signal; the difference between "this
+number was measured" and "this number is representative."
+
+*Expected follow-up:* "What would you have missed if you'd only run the
+benchmark once?" — A false impression that query performance degrades
+sharply somewhere below 2 million rows, which could have driven a real,
+unnecessary architectural change (reviving pre-aggregation) based on a
+one-time environmental artifact rather than the query's actual behavior.
+
+*Common mistake:* averaging the two numbers together, which produces a
+number that doesn't describe either the query's real cost or the
+transient contention — it just hides both causes behind one meaningless
+figure.
+
+**Q: "Your benchmarks show query time per row is about 30 times cheaper
+than extraction time per row. Does that change anything about this
+project's priorities?"**
+
+*What's tested:* whether the candidate can turn a benchmark number into
+a concrete, prioritized engineering decision, not just restate the
+number back.
+
+*What a weak answer looks like:* "Queries are fine, extraction needs
+work" — directionally right, but stops short of connecting it to any
+specific design decision already made in this project.
+
+*What a strong answer covers:* it directly explains why Section 15's
+incremental-load design matters more, over time, than Section 7.1's
+pre-aggregation question. `extract_full`'s cost scales with the whole
+table's size, so every day that passes without incremental extraction
+makes the next full extract more expensive — while a live `fact_clicks`
+query's cost is far cheaper per row today and has real headroom (26.8's
+extrapolation) before it becomes the bottleneck. The practical
+implication: watch the source table's growth rate and the incremental
+pipeline's adoption, not the OLAP query layer, for the first real sign
+this pipeline needs architectural attention.
+
+*Concepts:* per-row cost as a way to compare two different kinds of
+operation (row materialization vs. in-database aggregation) on the same
+scale; using a measured ratio to decide where future engineering
+attention is actually worth spending.
+
+*Expected follow-up:* "Is a 30x ratio measured on this sandbox
+trustworthy at production scale?" — Only directionally. The ratio came
+from a single-node, untuned Postgres instance with no concurrent load
+(26.8), so the exact multiplier could shift on different hardware — but
+the underlying reason for the gap (per-row Python object construction in
+pandas vs. in-database columnar aggregation) is a structural difference,
+not an artifact of this specific sandbox, so the direction of the
+finding is more trustworthy than its precise magnitude.
+
+*Common mistake:* treating a benchmark's precise number as portable to a
+different environment, instead of treating its direction and rough order
+of magnitude as the trustworthy part.
 
 ---
 
@@ -8735,40 +9201,53 @@ the same posture unless a specific, named reason justifies auto-remediation.
 
 ## 33. Phase 1 Summary (so far)
 
-**What we've built in this increment:** Failure Scenarios (Section 25),
-the first section that reads all 18 existing Failure Scenario subsections
-side by side, instead of one at a time, and asks what they actually are
-as a set. The result: a taxonomy of 10 distinct failure *mechanisms* —
-not sections, mechanisms — that every one of the 18 maps onto cleanly,
-plus an honest verification tier per entry (genuinely triggered, traced
-through real code, or purely architectural reasoning). No brand-new
-failure-scenario write-ups were added. Two existing entries were
-upgraded from a lower tier to Tier A by actually triggering them for
-real in this sandbox: Section 14.7's crashed-mid-run scenario (a real
-`ingestion_metadata` row, started for real, deliberately never
-finished, backdated, and genuinely caught by `find_stale_running_runs`)
-and Section 19.7's Parquet-is-binary claim (a real Parquet file written
-to disk, its first four bytes read directly and confirmed to be `PAR1`,
-not readable text).
+**What we've built in this increment:** Performance (Section 26), the
+section that finally tests the trigger condition Section 7.1 named for
+its own Design Decision: "revisit once Section 26's benchmarks show
+`fact_clicks` queries are actually slow." Two new benchmark scripts,
+`benchmarks/query_performance.py` and `benchmarks/extraction_time.py`,
+both genuinely run against this sandbox's real Postgres instance.
+`query_performance.py` temporarily populates `fact_clicks`/`dim_url`/
+`dim_user` with floor-offset synthetic rows and times all 8 of Section
+7.1's real metric queries at 5,000 / 50,000 / 500,000 / 2,000,000 rows.
+`extraction_time.py` temporarily adds synthetic rows to the real source
+`clicks` table and times this project's own `extract_full` and
+`extract_incremental` functions at the same scales. Both clean up after
+themselves, verified by real row counts before and after.
 
-**A note on this increment specifically:** the TOC has called this
-section "Failure Scenarios (all 10)" since long before any of the 18
-individual write-ups existed — a placeholder number set during early
-planning, not a count anyone had verified. The honest, bottom-up grouping
-done for this increment happened to land on exactly 10 mechanisms, and
-that number is reported because it's genuinely what fell out of the
-grouping, not because it was forced to match the placeholder (25.1
-addresses this directly, since a padded or squeezed taxonomy would be
-exactly the kind of dishonesty this guide has avoided everywhere else).
-The more interesting number is the tier split: of 18 total entries,
-8 are Tier A (genuinely triggered, real output shown), 3 are Tier B
-(correctly traced through real code, never literally executed), and 7
-are Tier C (architectural reasoning only, since the system needed to
-trigger them — a real loaded OLTP instance, or Phase 2's not-yet-built
-transform — doesn't exist yet in this project). Six of those seven
-Tier C entries, plus two of the Tier A ones, share one root cause worth
-naming on its own: a rule enforced by nothing but a comment or a
-document, not by any running check.
+**A note on this increment specifically:** the first attempt at the
+2,000,000-row query scale produced a genuinely misleading number — one
+query at 2,731 ms, far above every other query at that scale. Rather
+than report it, this increment investigated it: a second run showed the
+anomaly had moved to a different pair of queries; `EXPLAIN ANALYZE`
+ruled out a GROUP BY-cardinality explanation; and re-running the same
+queries against the same, still-populated data a few minutes later
+showed every query settling to 175-220 ms, consistently. The real cause
+was transient contention right after a large (2,000,000-row, ~75-second)
+insert transaction committed, not a real property of the queries
+themselves. This investigation is written up in full in 26.6 and turned
+into its own Failure Scenario in 26.7 — a real example of the exact
+"don't ship an unreproduced number" discipline this guide has tried to
+model throughout. 26.7 also turned out to be the 19th failure scenario
+this project has written, and Section 25.7 had predicted exactly this:
+that a future section would add one and the failure-taxonomy index
+(25.2) would silently go stale. It didn't stay silent — 25.2's table was
+updated by hand while writing this section, closing that one instance of
+the gap, though the underlying "nothing enforces this automatically"
+problem 25.7 named is still completely open.
+
+**The real finding:** Section 7.1's no-pre-aggregation decision holds,
+confirmed by measurement rather than left as an assumption — at
+2,000,000 synthetic rows (400x this project's real seeded scale), the
+slowest query still settles under 220 ms, and the trend suggests
+pre-aggregation wouldn't earn its cost until somewhere around 8-10
+million rows. A second, arguably more important finding came from the
+extraction benchmark: `extract_full`'s pandas-based row materialization
+costs roughly 30 times more per row than an in-database aggregation
+query over a comparable row count — meaning the OLTP extraction side,
+not the OLAP query side, is where this pipeline's cost grows fastest as
+the source table grows, which is exactly why Section 15's incremental
+load matters more over time than pre-aggregation does.
 
 **Concepts taught so far, at full depth:** the real application's
 architecture and schema, OLTP vs. OLAP, full load and incremental-load
@@ -8776,34 +9255,25 @@ ingestion (watermarks, idempotency, checkpointing, Bronze reconciliation),
 the entire data modeling layer (Sections 7-12), the Storage block in
 full (Sections 18-21), `ingestion_metadata` as this pipeline's control
 plane (Section 22), PII classification (Section 23), testing strategy
-(Section 24), and now failure taxonomy itself: grouping failures by
-mechanism rather than by which section happened to introduce them, and
-distinguishing a genuinely triggered failure from one that's only been
-reasoned through on paper (Section 25).
+(Section 24), failure taxonomy (Section 25), and now performance
+benchmarking itself: designing a benchmark safe to run against shared,
+real infrastructure, and treating a benchmark's first result as
+something to investigate, not something to ship (Section 26).
 
-**Known limitations, stated honestly:** this index can go stale the
-moment a future section adds a 19th Failure Scenario and nobody updates
-Section 25.2's table — named explicitly, and honestly not closed, as
-this section's own Failure Scenario (25.7), since closing it would need
-an actual CI check that doesn't exist yet; the 7 Tier C entries remain
-Tier C, genuinely, because this project doesn't yet have the
-infrastructure (a real, loaded OLTP instance for Section 2's scenario)
-or the code (Phase 2's transform, for the four data-modeling
-convention-drift scenarios) that would let anyone actually trigger them;
-this section's own tiering judgment calls are stated as judgment calls,
-not as an exact science — a reasonable reviewer could draw the Tier A/B
-line in a slightly different place for an entry like Section 17.7, which
-has a genuinely unit-tested detection mechanism underneath a still-only-
-reasoned-about "should this auto-remediate" question. What *was*
-genuinely verified in this sandbox this increment: both upgraded
-scenarios, run for real, with their exact real output shown in 25.6 —
-the stale-run detection against real Postgres, and the Parquet
-magic-byte check against a real file written to disk.
+**Known limitations, stated honestly:** this benchmark never tested
+concurrent query load — every number in 26.6 comes from one query
+running at a time, and contention under real simultaneous dashboard
+traffic is untested (26.8); the extraction benchmark measures only the
+pandas read step, not the Bronze write that follows it in production,
+since this sandbox has no MinIO; partition-pruning real-network-latency
+benchmarks remain a named, still-open gap (Section 34), unchanged by
+this increment; the 8-10 million row extrapolation in 26.8 is exactly
+that — an extrapolation from a linear trend observed up to 2,000,000
+rows, not itself a benchmarked number.
 
-**Immediate next increment:** Performance (Section 26), now that Section
-19's Parquet benchmark and Section 20's partition-pruning numbers exist
-as a real starting point, or Scale Design (Section 27); whichever the
-reader wants to tackle next.
+**Immediate next increment:** Scale Design (Section 27), now that
+Section 26 has real numbers characterizing where this pipeline's current
+headroom actually is.
 
 ---
 
@@ -8832,11 +9302,11 @@ reader wants to tackle next.
 | PII identified | ✅ Done | Every column in `contracts/source/*.yaml` now declares `pii` (`none`/`pseudonymized`/`direct`); `pii.py`, `pii-report` CLI command, Section 23 | Not content-inspecting — `original_url` query strings aren't scanned (Section 23.8); no encryption/access-control/erasure mechanism built yet (Section 23.8) |
 | Tests implemented | ✅ Done (unit + partial integration) | 80 passing unit tests (unchanged this increment — Section 24 measures and explains the existing suite rather than growing it); coverage now measured for the first time, 58% (`make coverage`, Section 24); the contracts integration test genuinely re-confirmed passing against real, non-Docker local Postgres in this sandbox | Coverage is measured, not gated (Section 24.3); `cli.py`'s command functions (0% coverage) remain untested directly, a named scope decision (Section 24's Principal Perspective); full-load/incremental-load integration tests still need real MinIO, not available here — user should run `make up && make test-integration` locally for the complete suite |
 | Failure scenarios tested | ✅ Done (consolidated) | All 18 failure scenarios across Sections 2, 7-12, 14-24 now indexed into 10 mechanism categories with an honest verification tier each (8 Tier A, 3 Tier B, 7 Tier C), Section 25 | 7 Tier C entries remain architectural reasoning only, honestly named as blocked on infrastructure or code this project doesn't have yet (Section 25.2); this index itself can go stale (Section 25.7, not yet closed) |
-| Performance benchmark completed | ✅ Partial | Parquet vs. CSV/JSON, Section 19, genuinely run at two scales | Extraction-time-at-scale and partition-pruning real-network-latency benchmarks not yet run, Section 26 |
+| Performance benchmark completed | ✅ Done (queries + extraction) | Parquet vs. CSV/JSON (Section 19); query performance across all 8 Section 7.1 metrics up to 2,000,000 synthetic rows, and extraction time (`extract_full`/`extract_incremental`) up to 505,003 rows, both genuinely run against real Postgres, Section 26 | Concurrent-query load untested (26.8); partition-pruning real-network-latency benchmarks still not run — no MinIO in this sandbox (unchanged gap, Section 26.8) |
 | Architecture diagrams completed | ✅ Partial | 10+ diagrams so far, including the full star schema ER diagram (Section 10.1) and Sections 18/20/21/22/23/24/25's object-storage, partition-pruning, file-layout, control-plane, PII-classification, test-pyramid, and failure-taxonomy diagrams | More land with later sections (data lifecycle, failure/recovery, final architecture) |
 | ADRs documented | ✅ 13 of 13+ planned | Section 29 | No new ADR this increment — Section 25 added no new architectural decision, only a consolidated index of existing ones |
-| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, 24.9-25.9 (Category I: Testing/Failure Strategy) | Remaining categories not yet covered, Section 31 |
-| Hands-on labs completed | ✅ Partial | LAB 1-21 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation, LAB 14 storage growth/idempotency, LAB 15 Parquet benchmark, LAB 16 partition pruning, LAB 17 file-layout report, LAB 18 watermark_start fix + metadata readers, LAB 19 PII report break/fix, LAB 20 coverage report + integration-test port break/fix, LAB 21 crash-sim + Parquet magic-bytes repro) | LAB 22+ |
+| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, 24.9-25.9 (Category I: Testing/Failure Strategy), 26.9 (Category P: Performance) | Remaining categories not yet covered, Section 31 |
+| Hands-on labs completed | ✅ Partial | LAB 1-22 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation, LAB 14 storage growth/idempotency, LAB 15 Parquet benchmark, LAB 16 partition pruning, LAB 17 file-layout report, LAB 18 watermark_start fix + metadata readers, LAB 19 PII report break/fix, LAB 20 coverage report + integration-test port break/fix, LAB 21 crash-sim + Parquet magic-bytes repro, LAB 22 query-performance/extraction-time benchmarks at a new scale) | LAB 23+ |
 | README updated | ✅ Done | `README.md` | — |
 | Git repository clean | ✅ Done | Section 35 | — |
 | No secrets committed | ✅ Done | `.gitignore`, `.env.example` reviewed | — |
