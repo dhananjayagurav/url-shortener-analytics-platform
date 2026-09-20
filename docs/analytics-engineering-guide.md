@@ -102,13 +102,13 @@ with the exact command to produce the real result yourself.
 24. [Testing (deep-dive)](#24-testing-deep-dive-) ✅✅
 25. [Failure Scenarios (all 10)](#25-failure-scenarios-all-10-) ✅✅
 26. [Performance](#26-performance-) ✅✅
-27. Scale Design ⏳
+27. [Scale Design](#27-scale-design-) ✅✅
 
 **Reference**
 28. [Architectural Principles](#28-architectural-principles) ✅ *(introduced now, extended as more are demonstrated)*
 29. [Architecture Decision Records](#29-architecture-decision-records) ✅
-30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6; LAB 12 — Section 16.5; LAB 13 — Section 17.5; LAB 14 — Section 18.5; LAB 15 — Section 19.5; LAB 16 — Section 20.5; LAB 17 — Section 21.5; LAB 18 — Section 22.5; LAB 19 — Section 23.5; LAB 20 — Section 24.5; LAB 21 — Section 25.5; LAB 22 — Section 26.5)*
-31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, 24.9, 25.9, and 26.9; Category I: 24.9-25.9; Category P (Performance): 26.9)*
+30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6; LAB 12 — Section 16.5; LAB 13 — Section 17.5; LAB 14 — Section 18.5; LAB 15 — Section 19.5; LAB 16 — Section 20.5; LAB 17 — Section 21.5; LAB 18 — Section 22.5; LAB 19 — Section 23.5; LAB 20 — Section 24.5; LAB 21 — Section 25.5; LAB 22 — Section 26.5; LAB 23 — Section 27.5)*
+31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, 24.9, 25.9, 26.9, and 27.9; Category I: 24.9-25.9; Category P (Performance/Scale): 26.9, 27.9)*
 32. Principal-Level Scenarios ⏳
 33. [Phase 1 Summary](#33-phase-1-summary-so-far) (running, updated each increment)
 34. [Phase 1 Completion Checklist](#34-phase-1-completion-checklist)
@@ -635,7 +635,8 @@ CLI command is simpler to operate and debug than a scheduler at this
 scale), Kubernetes (Docker Compose is sufficient for a single-host batch
 job). Each is introduced later only once a specific, named limitation of
 the simpler tool is actually hit — see [Section 29 ADR-004](#adr-004-batch-ingestion-before-cdcstreaming)
-and the future Scale Design section.
+and [Section 27](#27-scale-design-), which names the real, ranked list of
+which limitation is likely to be hit first.
 
 ### 3.2 In simple language
 
@@ -8888,6 +8889,384 @@ of magnitude as the trustworthy part.
 
 ---
 
+## 27. Scale Design ✅✅
+
+### 27.1 Concept
+
+**Scale design** means naming, in advance, the specific component that
+will break first as a system grows — not "it might not scale," but which
+part, at roughly what size, and what the concrete next step is. A useful
+scale-design document does this separately for every part of a pipeline,
+because different parts break for different reasons, at different sizes,
+along different measurements entirely.
+
+### Why does this exist?
+
+Section 26 measured two things well: how `fact_clicks` queries behave as
+row count grows, and how extraction behaves as row count grows. Both
+answers were reassuring. But a system has more moving parts than the two
+this project happened to benchmark, and "we benchmarked query latency
+and it's fine" can quietly stand in for "the whole system scales," which
+isn't the same claim. This section checks the parts Section 26 didn't
+directly measure, and — this is the real point — finds that the part
+everyone worried about (Section 7.1's query-latency question) turns out
+to have the most headroom of anything in this pipeline, while two parts
+nobody had benchmarked at all turn out to be closer to a real limit.
+
+### Simple Example (generic, pre-URL-Shortener)
+
+A team building an order-processing system spends a sprint optimizing
+their reporting dashboard's SQL, because "reports feel slow" is the
+complaint they can see. The dashboard gets fast. Six months later, the
+nightly job that re-exports the entire `orders` table for a partner
+integration starts missing its window — nobody had benchmarked *that*,
+because nobody complained about it yet. The lesson: the part of a system
+that's loudest about being slow, and the part that will actually run out
+of room first, are frequently not the same part.
+
+### URL Shortener Example
+
+This project's own `ingestion/configs/pipelines.yaml` — real, checked-in
+config, not a hypothetical — currently reads:
+
+```yaml
+tables:
+  - name: urls
+    load_type: full
+  - name: users
+    load_type: full
+  - name: clicks
+    load_type: incremental   # id-based watermark; see guide Section 15
+```
+
+`clicks` got the incremental-load protection Section 15 built, because
+it's the table everyone would expect to grow fastest. `urls` and `users`
+did not — they're still `full`, meaning every run re-reads the entire
+table with `pd.read_sql_table`, the exact pattern Section 14.9's own
+interview question already named as a growth risk. Today that's harmless
+(`urls` has 500 rows, `users` has 200). This section asks what happens
+if that stops being true, using real measurements, not a guess.
+
+### 27.2 Architecture
+
+```
+ FIVE SEPARATE SCALING AXES -- each one breaks a different component,
+ for a different reason, at a different size:
+
+  Axis                          | Drives                | Evidence
+  -------------------------------------------------------------------
+  1. Cumulative fact_clicks     | Live OLAP query        | MEASURED
+     table size                 | latency (Sec 7.1)      | Section 26
+  -------------------------------------------------------------------
+  2. Per-table full-load size   | extract_full cost for  | MEASURED
+     (urls, users -- unwatermarked)| any full-load table | this section
+  -------------------------------------------------------------------
+  3. Single-partition (single-  | Bronze one-file-per-   | EXTRAPOLATED
+     day / single-run) volume   | partition size (Sec 20)| from Section
+                                 |                        | 19's real
+                                 |                        | byte density
+  -------------------------------------------------------------------
+  4. Number of tables/pipelines | Orchestration          | REASONING
+     onboarded                  | complexity             | ONLY (3
+                                 |                        | tables exist)
+  -------------------------------------------------------------------
+  5. Operational availability   | Single-host Docker     | REASONING
+     requirement (an SLA)       | Compose deployment     | ONLY (no SLA
+                                 |                        | exists yet)
+
+ These are genuinely independent. A pipeline can have enormous headroom
+ on axis 1 while already being exposed on axis 2 or 3 -- which is
+ exactly this project's real, current situation (27.4 below).
+```
+
+### 27.3 Design Decision: rank scale risk by how close each axis actually is to its limit today, not by a uniform 10x/100x/1000x ladder applied to every axis alike
+
+**Context:** the five axes above measure completely different
+quantities (cumulative rows, per-table rows, single-partition rows,
+table count, uptime requirements). Multiplying all of them by the same
+"10x, 100x, 1000x" ladder would produce five unrelated numbers with no
+shared meaning.
+
+**Decision:** for each axis, ask the same question in its own terms —
+"given what this project actually measured or can reasonably estimate,
+how close is this to mattering *today*?" — and rank the five axes by
+that answer, not by an artificial shared multiplier.
+
+**Consequences:** the ranking that falls out (27.4 below) is genuinely
+surprising, and that's the value of doing it this way. If this section
+had instead just applied "10x/100x/1000x" to `fact_clicks`' current row
+count alone, it would have re-derived Section 26's own finding and
+missed the two axes that turned out to matter more.
+
+### Alternatives
+
+A single "10x/100x/1000x of current total data volume" table, applied
+uniformly across the whole pipeline. Simpler to build, and it's the
+naive first instinct — but it silently assumes every component's limit
+is a function of the same number (`fact_clicks` row count), which
+27.2's axis breakdown shows is false: axis 3's real trigger is a single
+day's volume, not cumulative history, and axis 2's real trigger is a
+different table's row count entirely.
+
+### Trade-offs
+
+| | Per-axis ranking (chosen) | Uniform 10x/100x/1000x ladder |
+|---|---|---|
+| Reflects that different components fail for different reasons | Yes | No — flattens everything into one number |
+| Catches a risk on an unmeasured axis | Yes — that's how 27.4's urls/users finding surfaced | No — only ever restates whatever axis was already being tracked |
+| Simplicity | Requires identifying each axis by hand first | Simpler to compute once axes aren't distinguished |
+| Right choice for a real, multi-component pipeline | Yes | Only for a system genuinely bottlenecked on one number |
+
+### 27.4 Implementation
+
+**Implementation Guide (write-it-yourself):** for any pipeline, list
+every component that reads, writes, or holds data, and for each one ask
+what specific measurement its behavior actually depends on — not
+"data volume" in the abstract, but the exact quantity (cumulative table
+size? single-batch size? number of tables?). Where a real benchmark
+already exists (Section 26, for two of this project's five axes), use
+its real numbers and extrapolate honestly, showing the arithmetic.
+Where no benchmark is possible yet, say so plainly and reason from
+what's already known architecturally, rather than inventing a number.
+
+**Reference Implementation — this project's real Scale Roadmap, ranked
+by nearness to its limit, most urgent first:**
+
+| Rank | Axis | Real evidence | Estimated trigger | How close is this project today? |
+|---|---|---|---|---|
+| 1 | Single-partition volume (Bronze, axis 3) | Section 19.6's real Parquet byte density: 4,329,469 bytes / 200,000 rows = 21.65 bytes/row | ~6.2 million rows in ONE partition crosses the 128 MB "mature lake" target (Section 21.8); ~49.6 million crosses 1 GB | Not close under steady growth, but **completely unmonitored against a single-day spike** — a URL going viral could put millions of clicks into one day's Bronze object with nothing in this pipeline noticing until Section 21's `layout-report` is run by hand |
+| 2 | Per-table full-load size (`urls`/`users`, axis 2) | **Newly benchmarked for this section:** `extract_full("urls", ...)` genuinely run in this sandbox at 5,500 / 50,500 / 500,500 total rows — 44.91 ms / 220.37 ms / 1,833.57 ms, matching `clicks`' own pre-Section-15 growth curve almost exactly | No fixed row-count trigger — the real problem is structural: **zero watermark protection exists for these two tables today** | `urls` (500 rows) and `users` (200 rows) are nowhere near a performance problem, but the *safety net* Section 15 built for `clicks` was never extended to them — a real, present-tense gap, not a future one |
+| 3 | Cumulative `fact_clicks` size (axis 1) | Section 26's real benchmark, 5,000 to 2,000,000 rows | ~10.4 million rows before the slowest of 8 real queries crosses ~1 second (refined from Section 26.8's "8-10 million" using the exact measured average) | Furthest from its limit of all five axes — the one axis this project had already benchmarked twice over |
+| 4 | Table/pipeline count (axis 4) | None — architectural reasoning only | No number; the real friction is dependency ordering and backfill coordination once tables must run in sequence, not row count | Only 3 tables exist (`pipelines.yaml`); not a real problem yet at any measurable distance |
+| 5 | Operational availability (axis 5) | None — architectural reasoning only | Triggered by a business requirement ("must not silently stop for N hours"), not by any data measurement | No such requirement exists for a Phase 1 portfolio project |
+
+**The real finding, stated plainly:** rank 3 is the axis Section 7.1 and
+Section 26 spent the most effort measuring, and it has the most
+headroom of all five. Ranks 1 and 2 were never benchmarked before this
+section, and both are closer to mattering — rank 2 in particular is a
+structural gap that exists *today*, at any row count, not a future
+threshold.
+
+### Hands-on Challenge (implement-yourself)
+
+Before reading the table above, predict which of the five axes you'd
+guess is closest to its limit, using only what Sections 1-26 already
+told you. Most people guess axis 1 (`fact_clicks` query latency),
+because it's the one this guide spent two full sections (7 and 26)
+building up. Check your guess against the ranking above, and ask
+yourself why the actual answer wasn't the one most of this guide's
+attention had gone toward.
+
+### 27.5 Hands-on Exercise
+
+**LAB 23 — Reproduce the `urls` full-load benchmark yourself, then check
+`users` too.**
+
+```bash
+DATABASE_URL="postgresql+psycopg://analytics:analytics@localhost:5432/analytics" \
+  python3 -c "
+import sys, time
+sys.path.insert(0, 'ingestion/src')
+from sqlalchemy import text
+from url_shortener_analytics.config import get_settings
+from url_shortener_analytics.db import engine_from_settings
+from url_shortener_analytics.extract_full import extract_full
+
+FLOOR = 60_000_000  # pick a floor clear of users' real id range
+engine = engine_from_settings(get_settings())
+with engine.begin() as conn:
+    conn.execute(text('DELETE FROM users WHERE id >= :f'), {'f': FLOOR})
+    conn.execute(text('''
+        INSERT INTO users (id, email, plan_type)
+        SELECT :floor + g, 'bench' || g || '@example.com', 'FREE'
+        FROM generate_series(0, 49999) AS g
+    '''), {'floor': FLOOR})
+samples = [time.perf_counter() for _ in [0]]
+start = time.perf_counter()
+extract_full('users', engine)
+print(f'{time.perf_counter()-start:.3f}s for extract_full(users) at +50,000 rows')
+with engine.begin() as conn:
+    conn.execute(text('DELETE FROM users WHERE id >= :f'), {'f': FLOOR})
+"
+```
+
+Confirm your number lands in the same range as this section's real
+`urls` result at a comparable scale (~220 ms at +50,000 rows). Then
+answer, in your own words: if `users` grew large enough that this
+number became a real problem, is the fix "make `extract_full` faster,"
+or is it "give `users` the same incremental-load treatment `clicks`
+already has"? (It's the second one — the same conclusion Section 15
+already reached once, for a different table.)
+
+### 27.6 How to test
+
+Every number in 27.4's Scale Roadmap table was checked against its
+source before being written down. The Bronze byte-density figure
+(21.65 bytes/row) was recomputed directly from Section 19.6's real,
+already-committed benchmark output (4,329,469 / 200,000), not
+re-measured — ACTUAL OBSERVED, cited, not re-run. The `urls` full-load
+numbers were genuinely run for the first time in this sandbox for this
+section:
+
+```
+urls rows before: 500
+     5,500 total urls rows (500 real + 5,000 synthetic): extract_full best-of-3 = 44.91 ms
+    50,500 total urls rows (500 real + 50,000 synthetic): extract_full best-of-3 = 220.37 ms
+   500,500 total urls rows (500 real + 500,000 synthetic): extract_full best-of-3 = 1833.57 ms
+urls rows after cleanup: 500 (expected 500)
+```
+
+Row counts were confirmed identical before and after (`500` both
+times). This closely matches `clicks`' own extraction curve from
+Section 26.6 (505,003 rows → 1,865.27 ms; `urls` at 500,500 rows →
+1,833.57 ms) — strong, real evidence that extraction cost is driven by
+row count and row width, not by which specific table is being read, so
+this project's `clicks`-based extraction numbers genuinely do generalize
+to `urls`/`users`. The ~10.4 million-row query-latency trigger was
+recomputed from Section 26.6's exact 8-query averages at 500,000 and
+2,000,000 rows (53.59 ms and 197.38 ms), fitting a straight line between
+them and solving for 1,000 ms — shown as arithmetic, not asserted.
+
+### 27.7 Failure Scenario
+
+**What happens if this section's linear extrapolations turn out wrong
+in a way Section 26 already demonstrated is possible?**
+
+Section 26.6/26.7 found a real case where a straightforward reading of
+the numbers would have been wrong: the first 2,000,000-row query
+timing looked like a sharp, non-linear cliff, and turned out to be
+transient contention, not a real property of the query. Every trigger
+point in 27.4's table (the ~6.2 million-row Bronze threshold, the ~10.4
+million-row query threshold) is a **linear** extrapolation from at most
+two or three real measurements. If either relationship is actually
+non-linear beyond the range this project measured — for example, if
+Postgres's query planner switches strategies at some larger table size,
+the way EXPLAIN plans already showed parallel workers engaging at 2
+million rows in Section 26.6 — the real trigger could arrive earlier or
+later than this table states. **Production implication:** every number
+in 27.4 is a planning estimate, worth acting on for prioritization, not
+a guarantee — the only way to know a trigger point precisely is to
+actually benchmark near it when the system's real data approaches that
+range, the same discipline Section 26.7 already named.
+
+### 27.8 Production Considerations
+
+| Aspect | This repo (POC) | Production |
+|---|---|---|
+| Scale roadmap | A table in this guide (27.4), built from real benchmarks plus honest extrapolation | Usually a living document or dashboard, re-derived automatically from current metrics rather than hand-updated prose |
+| Axis 2 (urls/users full-load) | Named as a gap; not yet fixed | `urls`/`users` migrated to the same incremental-load pattern Section 15 built for `clicks`, before either table's real growth makes it necessary |
+| Axis 3 (single-partition spike) | Detected only after the fact, by manually running `make layout-report` (Section 21, ADR-013) | Automated alerting the moment a single partition's projected size crosses a threshold, ideally before the write even completes |
+| Axis 4/5 (pipeline count, availability) | Not yet a real constraint | Revisited the moment either constraint becomes real — a specific new table, or a specific uptime commitment — not before, per this project's own "earn complexity" discipline (Section 3.1) |
+| Re-benchmarking cadence | One-time, this increment | Scale benchmarks re-run on a schedule (e.g., quarterly, or triggered by real volume crossing a defined watchpoint), since 27.7's own Failure Scenario means a stale extrapolation is a real risk, not just a theoretical one |
+
+### Principal Data Engineer Perspective
+
+The judgment call worth defending here is choosing to look for scale
+risk in places this guide hadn't already been looking, instead of just
+extending Section 26's own query-latency work further. It would have
+been easy, and would have looked thorough, to simply re-run
+`query_performance.py` at 20 million rows and call that "Scale Design."
+Doing that alone would have missed both real findings this section
+actually produced — the Bronze single-partition spike risk, and the
+`urls`/`users` structural gap — because neither one is visible from
+inside `fact_clicks`' own query benchmark at all. A principal engineer
+treats "we benchmarked the thing everyone was already worried about" and
+"we checked whether something else is actually closer to breaking" as
+two different exercises, and doesn't let doing the first one stand in
+for the second.
+
+The second thing worth naming: axis 2's finding (`urls`/`users` have no
+watermark protection) is not a new capability this project lacks — it's
+an *existing* capability (Section 15's incremental-load machinery)
+applied to only one of three tables that could use it. The fix, when it
+becomes worth doing, is a one-line change to `pipelines.yaml` plus
+whatever schema check confirms `urls.id`/`users.id` behave the same way
+`clicks.id` does — genuinely cheap, specifically because Section 15
+already built the hard part once, generically. Naming a gap that's
+already this cheap to close, rather than waiting for it to become
+expensive, is exactly the kind of finding a scale-design review exists
+to produce.
+
+### 27.9 Principal Engineer Interview Questions
+
+**Q: "You've built a system where the component everyone was worried
+about has the most headroom, and a component nobody was watching is the
+closest to a problem. How did that happen, and what does it tell you
+about how to run future scale reviews?"**
+
+*What's tested:* whether the candidate can generalize a specific finding
+into a repeatable practice, not just explain this one case.
+
+*What a weak answer looks like:* "We got lucky that we checked" — treats
+the finding as a one-time discovery rather than evidence of a systematic
+blind spot.
+
+*What a strong answer covers:* attention naturally concentrates on
+whatever's already been discussed or complained about — `fact_clicks`'
+query performance had two sections devoted to it (7 and 26) before this
+one, simply because it came up early and got debated. `urls`/`users`'
+full-load risk never got that attention because nothing about them
+looked urgent — 500 and 200 rows respectively. The lesson for future
+scale reviews: deliberately audit every component that reads or holds
+data, not just the ones already under discussion, specifically because
+the ones already under discussion are the ones least likely to be
+hiding a surprise.
+
+*Concepts:* attention bias in engineering prioritization; the value of a
+systematic, component-by-component audit over an ad hoc "what's slow
+right now" investigation.
+
+*Expected follow-up:* "How would you build this audit into a recurring
+process instead of a one-time exercise?" — Tie a scale-risk review to a
+concrete trigger (a new table onboarded, a quarterly cadence, or real
+volume crossing a named watchpoint from 27.4), rather than relying on
+someone remembering to redo it.
+
+*Common mistake:* concluding "we should benchmark everything constantly"
+— expensive, low-signal, and not what actually found this section's real
+issues. What found them was asking, once, "what quantity does each
+component's cost actually depend on," not running more benchmarks on the
+same component.
+
+**Q: "Two tables in this pipeline have identical extraction cost curves
+but got different scaling treatment — one has a watermark, two don't.
+Is that a bug?"**
+
+*What's tested:* whether the candidate can distinguish a genuine defect
+from a reasonable, currently-inconsequential prioritization choice.
+
+*What a weak answer looks like:* "Yes, every table should be consistent"
+— treats consistency as inherently correct, without checking whether the
+inconsistency currently causes any actual harm.
+
+*What a strong answer covers:* not a bug — a reasonable choice made for
+a reason that's still valid today. `clicks` got incremental load first
+because it was, correctly, expected to grow fastest and matter most for
+analytics freshness (Section 15's own stated reasoning). `urls` and
+`users` are genuinely small right now (500 and 200 rows), so the
+identical extraction-cost curve this section measured doesn't yet
+translate into an identical real cost. It becomes a bug the moment
+either table's real growth trajectory suggests it, and this section's
+job was to make sure that moment gets noticed early rather than found
+during an incident.
+
+*Concepts:* the difference between an inconsistency that's a defect and
+one that's a deliberately deferred, currently-safe choice; using
+measurement to decide *when* deferred work stops being safe to defer.
+
+*Expected follow-up:* "What would you actually watch, to know when to
+revisit this?" — `urls`/`users`' real row counts and their growth rate,
+compared against 27.4's Scale Roadmap trigger estimates — the same
+"named watchpoint" idea 27.8's Production Considerations already
+recommends.
+
+*Common mistake:* treating "not yet a problem" as equivalent to "not a
+gap" — the gap (no watermark on two tables) is real today, even though
+its consequences aren't, and naming it now is what makes it cheap to fix
+later instead of urgent.
+
+---
+
 ## 28. Architectural Principles
 
 Introduced here, demonstrated incrementally as more of Phase 1 is built.
@@ -8954,8 +9333,10 @@ Section 14.7's failure scenario for what it does and doesn't tell you.
 
 **12. Scalability.** *Meaning:* the design's bottlenecks are known and
 have a described next step, not just "hope it holds." *Phase 1, now:*
-named explicitly in Section 14.9's second interview question; a full
-scale-design writeup is the planned Section 27.
+Section 27's full scale-design writeup ranks five separate scaling axes
+by real evidence and honest extrapolation, and finds that `urls`/`users`
+lacking `clicks`' incremental-load protection (Section 15) is a closer
+real risk than `fact_clicks` query latency ever was (Section 26).
 
 **13. Cost awareness.** *Meaning:* every architectural choice is made with
 an eye on what it costs to run, not just whether it works. *Phase 1, now:*
@@ -9201,53 +9582,49 @@ the same posture unless a specific, named reason justifies auto-remediation.
 
 ## 33. Phase 1 Summary (so far)
 
-**What we've built in this increment:** Performance (Section 26), the
-section that finally tests the trigger condition Section 7.1 named for
-its own Design Decision: "revisit once Section 26's benchmarks show
-`fact_clicks` queries are actually slow." Two new benchmark scripts,
-`benchmarks/query_performance.py` and `benchmarks/extraction_time.py`,
-both genuinely run against this sandbox's real Postgres instance.
-`query_performance.py` temporarily populates `fact_clicks`/`dim_url`/
-`dim_user` with floor-offset synthetic rows and times all 8 of Section
-7.1's real metric queries at 5,000 / 50,000 / 500,000 / 2,000,000 rows.
-`extraction_time.py` temporarily adds synthetic rows to the real source
-`clicks` table and times this project's own `extract_full` and
-`extract_incremental` functions at the same scales. Both clean up after
-themselves, verified by real row counts before and after.
+**What we've built in this increment:** Scale Design (Section 27), which
+takes Section 26's real benchmark numbers and asks a broader question
+than either Section 7.1 or Section 26 asked on their own: across the
+*whole* pipeline, not just `fact_clicks`' query layer, which component
+is actually closest to a real limit? The answer required identifying
+five genuinely separate scaling axes — cumulative `fact_clicks` size,
+per-table full-load size, single-partition Bronze volume, table/pipeline
+count, and operational availability — because each one breaks a
+different component, for a different reason, measured in different
+units. Ranking all five by real evidence, rather than applying one
+uniform growth multiplier to all of them, produced this increment's real
+finding.
 
-**A note on this increment specifically:** the first attempt at the
-2,000,000-row query scale produced a genuinely misleading number — one
-query at 2,731 ms, far above every other query at that scale. Rather
-than report it, this increment investigated it: a second run showed the
-anomaly had moved to a different pair of queries; `EXPLAIN ANALYZE`
-ruled out a GROUP BY-cardinality explanation; and re-running the same
-queries against the same, still-populated data a few minutes later
-showed every query settling to 175-220 ms, consistently. The real cause
-was transient contention right after a large (2,000,000-row, ~75-second)
-insert transaction committed, not a real property of the queries
-themselves. This investigation is written up in full in 26.6 and turned
-into its own Failure Scenario in 26.7 — a real example of the exact
-"don't ship an unreproduced number" discipline this guide has tried to
-model throughout. 26.7 also turned out to be the 19th failure scenario
-this project has written, and Section 25.7 had predicted exactly this:
-that a future section would add one and the failure-taxonomy index
-(25.2) would silently go stale. It didn't stay silent — 25.2's table was
-updated by hand while writing this section, closing that one instance of
-the gap, though the underlying "nothing enforces this automatically"
-problem 25.7 named is still completely open.
+**The real finding:** the axis this guide had already spent two full
+sections (7 and 26) measuring — `fact_clicks` query latency — turned out
+to have the *most* headroom of all five, with a real, measured trigger
+around 10.4 million cumulative rows. Two axes nobody had benchmarked
+before this section turned out to be closer to mattering. First: Bronze's
+one-file-per-partition design (Sections 20-21) has no protection against
+a single day's volume spike — extrapolating Section 19.6's own real
+Parquet byte density (21.65 bytes/row), a single partition crosses a
+128 MB "mature lake" target at around 6.2 million rows in one day, a
+number a URL shortener could plausibly hit from one link going viral,
+with nothing in this pipeline currently watching for it. Second, and
+more concrete: `ingestion/configs/pipelines.yaml` still has `urls` and
+`users` on `full` load, meaning neither has the watermark protection
+`clicks` got in Section 15 — a real, present-tense structural gap, not a
+future one, confirmed with a newly-run benchmark this increment
+(`extract_full` against a synthetically-inflated `urls` table: 44.91 ms
+/ 220.37 ms / 1,833.57 ms at 5,500 / 50,500 / 500,500 total rows,
+matching `clicks`' own pre-Section-15 growth curve almost exactly).
 
-**The real finding:** Section 7.1's no-pre-aggregation decision holds,
-confirmed by measurement rather than left as an assumption — at
-2,000,000 synthetic rows (400x this project's real seeded scale), the
-slowest query still settles under 220 ms, and the trend suggests
-pre-aggregation wouldn't earn its cost until somewhere around 8-10
-million rows. A second, arguably more important finding came from the
-extraction benchmark: `extract_full`'s pandas-based row materialization
-costs roughly 30 times more per row than an in-database aggregation
-query over a comparable row count — meaning the OLTP extraction side,
-not the OLAP query side, is where this pipeline's cost grows fastest as
-the source table grows, which is exactly why Section 15's incremental
-load matters more over time than pre-aggregation does.
+**A note on this increment specifically:** 27.7's own Failure Scenario
+names the honest limit of this section's method — every trigger point
+in 27.4's Scale Roadmap is a linear extrapolation from at most two or
+three real measurements, and Section 26.6/26.7 already proved, in this
+same project, that a real system can behave non-linearly in ways a
+straight-line extrapolation wouldn't predict (the 2,000,000-row
+buffer-cache contention finding). The roadmap is presented as a
+planning estimate worth prioritizing against, not a guarantee — closing
+that gap for real would mean actually benchmarking near each trigger
+point once real data approaches it, which this project's synthetic data
+can approximate but not replace.
 
 **Concepts taught so far, at full depth:** the real application's
 architecture and schema, OLTP vs. OLAP, full load and incremental-load
@@ -9255,25 +9632,27 @@ ingestion (watermarks, idempotency, checkpointing, Bronze reconciliation),
 the entire data modeling layer (Sections 7-12), the Storage block in
 full (Sections 18-21), `ingestion_metadata` as this pipeline's control
 plane (Section 22), PII classification (Section 23), testing strategy
-(Section 24), failure taxonomy (Section 25), and now performance
-benchmarking itself: designing a benchmark safe to run against shared,
-real infrastructure, and treating a benchmark's first result as
-something to investigate, not something to ship (Section 26).
+(Section 24), failure taxonomy (Section 25), performance benchmarking
+(Section 26), and now scale design itself: separating a system's
+scaling behavior into independent axes, each measured in its own units,
+and ranking real risk by nearness to a limit rather than by which axis
+already had the most attention (Section 27).
 
-**Known limitations, stated honestly:** this benchmark never tested
-concurrent query load — every number in 26.6 comes from one query
-running at a time, and contention under real simultaneous dashboard
-traffic is untested (26.8); the extraction benchmark measures only the
-pandas read step, not the Bronze write that follows it in production,
-since this sandbox has no MinIO; partition-pruning real-network-latency
-benchmarks remain a named, still-open gap (Section 34), unchanged by
-this increment; the 8-10 million row extrapolation in 26.8 is exactly
-that — an extrapolation from a linear trend observed up to 2,000,000
-rows, not itself a benchmarked number.
+**Known limitations, stated honestly:** axis 4 (table/pipeline count)
+and axis 5 (operational availability) in 27.2/27.4 are architectural
+reasoning only — this project has just 3 tables and no uptime
+requirement, so neither axis has anything real to benchmark against yet;
+partition-pruning real-network-latency benchmarks remain a named,
+still-open gap (Section 34), unchanged by this increment; the
+`urls`/`users` full-load gap this section surfaced is named, not fixed
+— Section 27.8 states the fix (migrate both to incremental load) without
+implementing it, since neither table's real growth currently justifies
+the work, per this project's own "earn complexity" discipline.
 
-**Immediate next increment:** Scale Design (Section 27), now that
-Section 26 has real numbers characterizing where this pipeline's current
-headroom actually is.
+**Immediate next increment:** whichever the reader wants — Section 28's
+Architectural Principles and Section 29's ADRs are both living indexes
+that could use a pass reflecting Sections 23-27, or a genuinely new
+topic if one exists past Section 27's current TOC placeholder.
 
 ---
 
@@ -9301,12 +9680,13 @@ headroom actually is.
 | Ingestion metadata deep-dive completed | ✅ Done | `watermark_start` gap found and fixed, `get_run_history`, `get_ingestion_summary`, `ingestion-history`/`ingestion-summary` CLI commands, Section 22 | `get_run_history` has no pagination guard on `limit` (Section 22.8) |
 | PII identified | ✅ Done | Every column in `contracts/source/*.yaml` now declares `pii` (`none`/`pseudonymized`/`direct`); `pii.py`, `pii-report` CLI command, Section 23 | Not content-inspecting — `original_url` query strings aren't scanned (Section 23.8); no encryption/access-control/erasure mechanism built yet (Section 23.8) |
 | Tests implemented | ✅ Done (unit + partial integration) | 80 passing unit tests (unchanged this increment — Section 24 measures and explains the existing suite rather than growing it); coverage now measured for the first time, 58% (`make coverage`, Section 24); the contracts integration test genuinely re-confirmed passing against real, non-Docker local Postgres in this sandbox | Coverage is measured, not gated (Section 24.3); `cli.py`'s command functions (0% coverage) remain untested directly, a named scope decision (Section 24's Principal Perspective); full-load/incremental-load integration tests still need real MinIO, not available here — user should run `make up && make test-integration` locally for the complete suite |
-| Failure scenarios tested | ✅ Done (consolidated) | All 18 failure scenarios across Sections 2, 7-12, 14-24 now indexed into 10 mechanism categories with an honest verification tier each (8 Tier A, 3 Tier B, 7 Tier C), Section 25 | 7 Tier C entries remain architectural reasoning only, honestly named as blocked on infrastructure or code this project doesn't have yet (Section 25.2); this index itself can go stale (Section 25.7, not yet closed) |
+| Failure scenarios tested | ✅ Done (consolidated) | All 19 failure scenarios across Sections 2, 7-12, 14-26 now indexed into 10 mechanism categories with an honest verification tier each (9 Tier A, 3 Tier B, 7 Tier C), Sections 25/26.7 | 7 Tier C entries remain architectural reasoning only, honestly named as blocked on infrastructure or code this project doesn't have yet (Section 25.2); this index's own auto-staleness gap (25.7) is closed for this one instance, not structurally — still no mechanical check |
 | Performance benchmark completed | ✅ Done (queries + extraction) | Parquet vs. CSV/JSON (Section 19); query performance across all 8 Section 7.1 metrics up to 2,000,000 synthetic rows, and extraction time (`extract_full`/`extract_incremental`) up to 505,003 rows, both genuinely run against real Postgres, Section 26 | Concurrent-query load untested (26.8); partition-pruning real-network-latency benchmarks still not run — no MinIO in this sandbox (unchanged gap, Section 26.8) |
-| Architecture diagrams completed | ✅ Partial | 10+ diagrams so far, including the full star schema ER diagram (Section 10.1) and Sections 18/20/21/22/23/24/25's object-storage, partition-pruning, file-layout, control-plane, PII-classification, test-pyramid, and failure-taxonomy diagrams | More land with later sections (data lifecycle, failure/recovery, final architecture) |
-| ADRs documented | ✅ 13 of 13+ planned | Section 29 | No new ADR this increment — Section 25 added no new architectural decision, only a consolidated index of existing ones |
-| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, 24.9-25.9 (Category I: Testing/Failure Strategy), 26.9 (Category P: Performance) | Remaining categories not yet covered, Section 31 |
-| Hands-on labs completed | ✅ Partial | LAB 1-22 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation, LAB 14 storage growth/idempotency, LAB 15 Parquet benchmark, LAB 16 partition pruning, LAB 17 file-layout report, LAB 18 watermark_start fix + metadata readers, LAB 19 PII report break/fix, LAB 20 coverage report + integration-test port break/fix, LAB 21 crash-sim + Parquet magic-bytes repro, LAB 22 query-performance/extraction-time benchmarks at a new scale) | LAB 23+ |
+| Scale design completed | ✅ Done | Five scaling axes identified and ranked by real evidence, Section 27; `urls`/`users` full-load extraction genuinely benchmarked for this section (5,500/50,500/500,500 rows: 44.91/220.37/1,833.57 ms), confirming a structural watermark gap Section 15 never extended to those two tables | `urls`/`users` not yet migrated to incremental load — named, not fixed (Section 27.8); every trigger point in 27.4's roadmap is a linear extrapolation, honestly flagged as a planning estimate, not a guarantee (Section 27.7) |
+| Architecture diagrams completed | ✅ Partial | 10+ diagrams so far, including the full star schema ER diagram (Section 10.1), Sections 18/20/21/22/23/24/25's object-storage, partition-pruning, file-layout, control-plane, PII-classification, test-pyramid, and failure-taxonomy diagrams, and Section 27's five-axis scale-risk diagram | More land with later sections (data lifecycle, failure/recovery, final architecture) |
+| ADRs documented | ✅ 13 of 13+ planned | Section 29 | No new ADR this increment — Section 27 named a real gap (`urls`/`users` full-load) and its fix, but didn't implement the fix, so there's no new architectural decision to record yet |
+| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, 24.9-25.9 (Category I: Testing/Failure Strategy), 26.9, 27.9 (Category P: Performance/Scale) | Remaining categories not yet covered, Section 31 |
+| Hands-on labs completed | ✅ Partial | LAB 1-23 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation, LAB 14 storage growth/idempotency, LAB 15 Parquet benchmark, LAB 16 partition pruning, LAB 17 file-layout report, LAB 18 watermark_start fix + metadata readers, LAB 19 PII report break/fix, LAB 20 coverage report + integration-test port break/fix, LAB 21 crash-sim + Parquet magic-bytes repro, LAB 22 query-performance/extraction-time benchmarks at a new scale, LAB 23 users full-load benchmark reproduction) | LAB 24+ |
 | README updated | ✅ Done | `README.md` | — |
 | Git repository clean | ✅ Done | Section 35 | — |
 | No secrets committed | ✅ Done | `.gitignore`, `.env.example` reviewed | — |
