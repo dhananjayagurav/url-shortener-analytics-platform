@@ -13,10 +13,16 @@ lives in the repository. When you see a reference like
 real, current, executable implementation — this guide explains *why* it's
 built the way it is and *how to run it*, not a copy of its source.
 
-**Status of this document:** Phase 1 is in progress and this guide grows
-with it. Sections are marked ✅ (implemented and documented) or ⏳ (planned,
-not yet built) in the table of contents below — an honest, current map of
-the project, not a promise of what will eventually exist. Sections marked
+**Status of this document:** Phase 1 is complete as of Section 36 — every
+section in the table of contents below now has real content, and Section
+33 gives the full close-out summary. Phase 2 begins only when explicitly
+requested (Section 36). Sections are marked ✅ (implemented and
+documented) or ✅✅ (written to the full teaching template below); none
+remain marked ⏳. This is an honest, current map of the project, not a
+retroactive claim that every section was written to the same depth from
+the start — some earlier ✅ sections are still due an upgrade to the ✅✅
+template in a future pass, named explicitly rather than silently
+implied. Sections marked
 ✅✅ have been written (or rewritten) to the **full teaching template**
 described immediately below; a plain ✅ means the section exists but is
 still due an upgrade to that depth in a later increment.
@@ -107,13 +113,13 @@ with the exact command to produce the real result yourself.
 **Reference**
 28. [Architectural Principles](#28-architectural-principles) ✅ *(introduced now, extended as more are demonstrated)*
 29. [Architecture Decision Records](#29-architecture-decision-records) ✅
-30. Hands-on Labs (index) ⏳ *(LAB 1, LAB 4/5 — Section 14.5; LAB 2, LAB 3 — Section 15.5; LAB 6-9 — Sections 7.3/8.3/9.3/11.3; LAB 10 — Section 10.7; LAB 11 — Section 12.6; LAB 12 — Section 16.5; LAB 13 — Section 17.5; LAB 14 — Section 18.5; LAB 15 — Section 19.5; LAB 16 — Section 20.5; LAB 17 — Section 21.5; LAB 18 — Section 22.5; LAB 19 — Section 23.5; LAB 20 — Section 24.5; LAB 21 — Section 25.5; LAB 22 — Section 26.5; LAB 23 — Section 27.5)*
-31. Interview Questions (consolidated, all categories) ⏳ *(Category C questions exist now — see Sections 7, 8, 9, 10, 11, 12, 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, 24.9, 25.9, 26.9, and 27.9; Category I: 24.9-25.9; Category P (Performance/Scale): 26.9, 27.9)*
-32. Principal-Level Scenarios ⏳
-33. [Phase 1 Summary](#33-phase-1-summary-so-far) (running, updated each increment)
-34. [Phase 1 Completion Checklist](#34-phase-1-completion-checklist)
-35. [Git Repository Review](#35-git-repository-review)
-36. What Phase 2 Will Add ⏳
+30. [Hands-on Labs (index)](#30-hands-on-labs-index) ✅ *(all 23 labs indexed)*
+31. [Interview Questions (consolidated, all categories)](#31-interview-questions-consolidated-all-categories) ✅ *(37 questions, 15 categories)*
+32. [Principal-Level Scenarios](#32-principal-level-scenarios) ✅ *(3 cross-cutting scenarios)*
+33. [Phase 1 Summary](#33-phase-1-summary-so-far) ✅ *(complete — see Phase 1 close-out below)*
+34. [Phase 1 Completion Checklist](#34-phase-1-completion-checklist) ✅
+35. [Git Repository Review](#35-git-repository-review) ✅
+36. [What Phase 2 Will Add](#36-what-phase-2-will-add) ✅
 
 ---
 
@@ -9675,93 +9681,368 @@ health, applied here to test coverage instead of storage.
 
 ---
 
+## 30. Hands-on Labs (index)
+
+This is a single index over all 23 hands-on labs this guide has built,
+in the order they appear. Each lab lives inside its own section's
+"Hands-on Exercise" subsection — this index doesn't duplicate a single
+one of them, it exists so a reader who wants a self-contained practice
+session can see every lab at a glance, pick where to start, and jump
+straight there.
+
+**Foundations & Data Modeling**
+
+| LAB | What it proves | Section |
+|---|---|---|
+| 6 | Trace one metrics-catalog requirement to the actual SQL query it implies, before seeing the real DDL | [7.3](#73-hands-on-exercise) |
+| 7 | A grain violation (mixing two different grains in one fact table) breaks simple addition — reproduced concretely, not just asserted | [8.3](#83-hands-on-exercise) |
+| 8 | Find a real, documented quirk in the source schema before it silently corrupts a query | [9.3](#93-hands-on-exercise) |
+| 10 | The `dim_user` Unknown member (`user_key = -1`) resolves a real SQL join for an anonymous click, not just in theory | [10.7](#107-hands-on-exercise) |
+| 9 | Confirm the Unknown-member pattern resolves correctly from the star-schema design side, independent of Lab 10's join proof | [11.3](#113-hands-on-exercise) |
+| 11 | Watch a real data-contract violation get caught end to end, not just read about the mechanism | [12.6](#126-hands-on-exercise) |
+
+**Ingestion**
+
+| LAB | What it proves | Section |
+|---|---|---|
+| 1 | Run a real full load against real Postgres and MinIO, and inspect the Bronze object it produces | [14.5](#145-hands-on-exercise) |
+| 4/5 | Rerunning a full load overwrites the same Bronze key rather than duplicating it — idempotency, proven by rerunning, not just by reading `build_bronze_key`'s code | [14.5](#145-hands-on-exercise) |
+| 2 | An incremental load run twice only reads the rows that are actually new the second time | [15.5](#155-hands-on-exercise) |
+| 3 | A no-op incremental run (no new rows since the last watermark) writes nothing to Bronze, by design | [15.5](#155-hands-on-exercise) |
+| 12 | Manufacture a genuinely stale, never-finished run and confirm `find_stale_running_runs` catches it | [16.5](#165-hands-on-exercise) |
+| 13 | Manufacture real Bronze/`ingestion_metadata` drift and confirm `reconcile-bronze` detects it | [17.5](#175-hands-on-exercise) |
+
+**Storage**
+
+| LAB | What it proves | Section |
+|---|---|---|
+| 14 | Watch Bronze storage actually grow across runs, then confirm a rerun doesn't double it | [18.5](#185-hands-on-exercise) |
+| 15 | Run the real Parquet-vs-CSV-vs-JSON benchmark yourself, at both of Section 19's scales | [19.5](#195-hands-on-exercise) |
+| 16 | Prove partition pruning genuinely issues fewer, more targeted listing calls than an unpruned full scan | [20.5](#205-hands-on-exercise) |
+| 17 | Run the real file-layout tests and confirm the health report's shape matches what a healthy vs. degraded layout should look like | [21.5](#215-hands-on-exercise) |
+| 18 | Prove the `watermark_start` bug fix and both new `ingestion_metadata` query functions genuinely work against real data | [22.5](#225-hands-on-exercise) |
+
+**Quality & Operations**
+
+| LAB | What it proves | Section |
+|---|---|---|
+| 19 | Run the real PII report, then deliberately break a contract's `pii` field and watch it get caught | [23.5](#235-hands-on-exercise) |
+| 20 | Run the real coverage report, then reproduce the exact real port-mismatch failure Section 24.7 documents | [24.5](#245-hands-on-exercise) |
+| 21 | Reproduce both of Section 25's real Tier-A upgrades yourself — the crash-sim and the Parquet magic-bytes check | [25.5](#255-hands-on-exercise) |
+| 22 | Run both Section 26 benchmarks yourself, then predict and check a scale this guide didn't already report | [26.5](#265-hands-on-exercise) |
+| 23 | Reproduce the `urls` full-load benchmark yourself, then run the same check against `users` | [27.5](#275-hands-on-exercise) |
+
+**Suggested paths, depending on what you want out of this project:**
+
+- **New to data engineering, want the full arc:** run them in order, 1 through 23. Each lab assumes only what earlier labs and sections already covered.
+- **Preparing for interviews, short on time:** Labs 1, 2, 9/10, 12, 13, 16, 19, 21, 23 — one lab per major mechanism this project demonstrates (idempotency, incremental correctness, the Unknown-member pattern, stale-run detection, drift detection, partition pruning, PII classification, honest failure-tier verification, and the real scale-risk finding).
+- **Already comfortable with the concepts, want to verify this project specifically works:** Labs 1-3 (ingestion), 12-13 (control plane), 21 (failure verification) are the fastest path to confirming the whole pipeline behaves as documented, end to end.
+
+---
+
+## 31. Interview Questions (consolidated, all categories)
+
+This guide has asked 37 Principal Engineer interview questions so far,
+two per topic section on average, each with what a weak answer looks
+like, what a strong answer covers, an expected follow-up, and a common
+mistake — all left in place in their original sections, not duplicated
+here. This section's job is different: group all 37 by what they
+actually test, the same bottom-up, honest approach Section 25 used for
+failure scenarios, rather than by which section happened to ask them.
+
+**A note on the category labels used before this section existed:** the
+table of contents and Section 34's checklist have referred to "Category
+C," "Category I," and "Category P" since early in this project, as
+informal placeholders — "Category C" in particular was applied loosely
+to "Sections 7-12," never actually defined as a real, bounded category.
+Only two of those three labels turn out to describe something real once
+every question is actually grouped: **Category I** (Testing Strategy,
+already used verbatim in Section 24.9's own heading) and **Category P**
+(Performance/Scale, already used in the TOC and Section 34). Both are
+kept, unchanged, below. "Category C" is retired as a label — the
+questions it loosely gestured at land in Category 2 below, now with a
+real, complete boundary instead of a vague one.
+
+### 31.1 Categories
+
+| # | Category | Sections | Count | What this category tests, as a group |
+|---|---|---|---|---|
+| 1 | Architecture & Systems-Design Judgment | 1, 2 | 2 | Whether the candidate's first instinct, faced with an unfamiliar system, is to verify or to assume — and whether they understand *why* OLTP and OLAP workloads get separated, not just that they should be |
+| 2 | Data Modeling & Contracts | 7, 8, 9, 10, 11, 12 | 7 | Grain, dimensional design, the Unknown-member pattern, star-vs-snowflake trade-offs, and schema contracts as a machine-checkable agreement rather than a description |
+| 3 | Ingestion Idempotency & Extraction Limits | 14 | 2 | Idempotent-by-overwrite as a concrete mechanism (not a property asserted by fiat), and naming the actual first failure mode of unbounded full-table extraction |
+| 4 | Incremental Load & Watermarking | 15 | 2 | Why an id-based watermark beats a timestamp-based one, and what an incremental pipeline structurally cannot see (updates to already-ingested rows) |
+| 5 | Checkpointing & Stale-Run Detection | 16 | 2 | The trade-off inherent in any fixed-threshold staleness check, and why a checkpoint is written before work starts, not after |
+| 6 | Idempotency Guarantees & Remediation Posture | 17 | 2 | The gap between "writes are idempotent" and "the system can never disagree with itself," and the risk calculus behind detect-only vs. auto-remediate |
+| 7 | Object Storage Fundamentals | 18 | 2 | Whether the candidate has internalized object storage's actual constraints (no partial-object edits, no real folders) rather than treating it like a networked filesystem |
+| 8 | Parquet & File Formats | 19 | 2 | Separating "which number a benchmark reports" from "what that number means at a different scale," and the real mechanical difference between `usecols` and true columnar I/O |
+| 9 | Partitioning | 20 | 2 | Reasoning about the actual cost of many small API calls instead of assuming "fewer calls is always better," and remembering *why* two different partitioning schemes coexist |
+| 10 | File Layout & Small-File Problem | 21 | 2 | Naming the concrete mechanical cost of many small files (not just "it's slow"), and knowing when a single summary statistic can hide a real problem |
+| 11 | Ingestion Metadata & Control Plane | 22 | 2 | Prioritizing a latent, currently-harmless gap correctly, and understanding that "portable across dialects" and "correct" are two different claims |
+| 12 | PII & Security | 23 | 2 | The real difference between pseudonymization and anonymization, and finding the actual weak point in a design choice you'd otherwise defend |
+| 13 | Testing Strategy *(Category I)* | 24 | 2 | The specific, narrower claim a passing test suite actually makes, and whether the candidate reaches for blame or for a process fix when a gap is found |
+| 14 | Failure Taxonomy & Systemic Thinking | 25 | 2 | Whether "documented" is treated as a finished claim or an invitation to ask a sharper follow-up, and turning a pattern across many findings into one prioritized recommendation |
+| 15 | Performance & Scale Reasoning *(Category P)* | 26, 27 | 4 | Investigating a benchmark result before reporting it, turning a measured ratio into a prioritization decision, and generalizing a specific surprising finding into a repeatable review practice |
+
+**Totals:** 15 categories, 37 questions, across 20 sections (every
+section from 1 through 27 that has an Interview Questions subsection).
+
+### 31.2 What this grouping actually shows
+
+Read as a whole rather than section by section, these 37 questions test
+a consistent, small set of underlying skills, over and over, in
+different technical clothing: distinguishing a measured claim from an
+assumed one (Categories 1, 8, 15); knowing the specific boundary of what
+a mechanism actually guarantees, not just that it "works" (Categories 3,
+6, 7, 13); and converting a finding — a benchmark number, a discovered
+gap, a pattern across many small issues — into a prioritized, defensible
+next step (Categories 11, 14, 15). No category tests pure syntax or
+tool-specific trivia. That's a deliberate property of how every one of
+these questions was written, going all the way back to Section 1 — not
+something this consolidation discovered by accident, but worth
+confirming explicitly now that all 37 can be seen side by side at once.
+
+---
+
+## 32. Principal-Level Scenarios
+
+This guide's interview questions (Section 31) each test one concept in
+isolation. A real principal-engineer conversation rarely stays that
+narrow — a stakeholder's question usually forces you to reason across
+several sections' worth of decisions at once, under time pressure, with
+an answer someone will actually act on. This section presents three
+such scenarios, each deliberately cutting across multiple parts of this
+project, in the order a real conversation might raise them.
+
+### Scenario 1: "A link just went viral. Is anything going to break?"
+
+**The setup:** a `url-shortener` link gets shared somewhere with a huge
+audience. Instead of this project's steady 5,003 real seeded clicks,
+one single day sees several million. You're asked, with no time to
+benchmark first: is this pipeline going to survive that day, and if not,
+where does it actually break?
+
+**What a weak answer looks like:** "It should be fine, everything's
+tested" — treats "tests pass" (Section 24) as if it answers a scale
+question, when nothing in this project's test suite exercises anything
+close to a multi-million-row single day.
+
+**What a strong answer covers:** this is Section 27's axis 3 exactly,
+and the honest answer is "probably not fully fine, and here's the
+specific mechanism." Bronze writes one Parquet file per day for
+full-load tables and one per watermark-range for incremental
+(Sections 14-15, 18.2) — extrapolating Section 19.6's real Parquet byte
+density (21.65 bytes/row), several million clicks in one day would put
+that single day's object well past the 128 MB "mature lake" target
+named in Section 21.8, and likely past the 1 GB mark too, in a single,
+un-split file. Nothing in this pipeline currently watches for that in
+real time — Section 21's `layout-report` only detects it after the
+fact, by hand (ADR-013's deliberate detect-don't-remediate posture).
+The extraction and query layers, by contrast, have real measured
+headroom (Section 26) well past this scale. So the honest answer is
+specific: the write path's file-size assumption is the actual risk, not
+query performance, and it's a genuinely open gap today, not a
+theoretical one.
+
+*Concepts:* distinguishing "this system has been tested" from "this
+system has been tested at the scale you're asking about"; naming the
+specific mechanism at risk instead of a vague reassurance.
+
+*Expected follow-up:* "What would you do about it before it happens
+again?" — Either split large partitions into multiple files at write
+time (the "target file size" gap Section 21.8 already names), or add
+real-time alerting on a single write's projected size before the object
+finishes writing — both currently unbuilt, both named honestly rather
+than pretended-away.
+
+### Scenario 2: "We need to add a fourth source table next sprint. What do you need from me?"
+
+**The setup:** the URL shortener team wants to add a new source table
+— say, a `link_reports` table users submit for abuse review — and wants
+it flowing through this analytics pipeline like `urls`, `users`, and
+`clicks` already do. What do you actually need before you can say yes?
+
+**What a weak answer looks like:** "Just add it to the config" — true
+mechanically (`pipelines.yaml`, Section 28's Principle 8), but skips
+every real question a fourth table actually raises.
+
+**What a strong answer covers:** three separate things, each traceable
+to a section of this project. First, a data contract (Section 12):
+every column's type, nullability, and — since Section 23 — its PII
+classification, before a single row is extracted; the classification
+piece specifically closes ADR-014's whole reason for existing. Second,
+a load-type decision (Section 15/ADR-005): full or incremental depends
+on whether the table is expected to grow without bound the way `clicks`
+does, and Section 27's own finding (`urls`/`users` still lack the
+watermark protection `clicks` has) is a live cautionary example of
+what happens when this decision gets made once and never revisited.
+Third, Section 27's axis 4 (table/pipeline count) — a fourth table is
+still small news for a single, sequential CLI pipeline, but it's one
+step closer to needing real dependency ordering, which this project has
+deliberately not built yet (Section 3.1's "earn complexity" framing).
+
+*Concepts:* treating "add a table" as three separable decisions
+(contract, load strategy, orchestration impact) instead of one config
+edit; recognizing which of this project's already-named gaps a new
+requirement would immediately expose.
+
+*Expected follow-up:* "Which of those three would you push back on
+timeline for?" — The contract and PII classification, non-negotiably
+(Section 23's whole argument is that skipping this is how blast radius
+expands invisibly); the load-type decision can reasonably start as
+`full` and be revisited once real volume is known, the same
+deliberately-deferred choice this project already made for `urls`/
+`users`.
+
+### Scenario 3: "Leadership wants a real-time dashboard. How far are we from that, really?"
+
+**The setup:** someone asks how much work it would take to make this
+pipeline's dashboards update within minutes of a click happening,
+instead of however often `make ingest-full`/`make ingest` is run today.
+
+**What a weak answer looks like:** "We'd just need to run the pipeline
+more often" — treats latency as a scheduling knob, ignoring that this
+project's entire architecture (ADR-004) is built on an explicit
+batch-before-streaming decision, not an accident of scheduling.
+
+**What a strong answer covers:** near-real-time isn't a frequency
+change, it's a different architecture, and this project has already
+named the real gap honestly: ADR-004 chose batch over Kafka/CDC because
+no event stream exists yet upstream and this project's volume doesn't
+justify one — that's still true today. Getting to real-time would mean,
+at minimum: a CDC or event-streaming source (Debezium/Kafka reading the
+OLTP database's write-ahead log, not this pipeline's own batch queries),
+a streaming or micro-batch consumer replacing `extract_full`/
+`extract_incremental` entirely, and revisiting Section 7.1's
+no-pre-aggregation decision under a completely different load pattern
+(continuous small writes instead of periodic batch reads) — Section 26's
+real benchmark numbers don't transfer to that world, because they were
+measured against a very different access pattern. The honest scope
+answer: this isn't a tuning exercise, it's most of a new project phase,
+and ADR-004 already said so before anyone asked.
+
+*Concepts:* recognizing when a request is actually asking for a
+different architecture, not a parameter change; using an existing,
+already-reasoned ADR to answer a scope question quickly and honestly
+instead of re-deriving the answer from scratch under time pressure.
+
+*Expected follow-up:* "Is there a cheaper middle ground?" — Running the
+existing batch pipeline more frequently (every few minutes instead of
+manually) narrows the latency gap without a rearchitecture, at the cost
+of the extraction-cost-per-run problem Section 27's axis 2 already
+named getting exercised much more often — a real, honest trade-off, not
+a free win.
+
+---
+
 ## 33. Phase 1 Summary (so far)
 
-**What we've built in this increment:** a maintenance pass over Section
-28 (Architectural Principles) and Section 29 (Architecture Decision
-Records) — both explicitly "living" indexes since their introduction,
-meant to be revisited as later sections demonstrate new principles or
-make new decisions, not written once and left alone. This is the first
-time either index has actually been revisited since Section 22, and
-Sections 23-27 had genuinely accumulated content neither index yet
-reflected.
+**Phase 1 is complete as of this increment.** This section closes it out
+in two parts: what this specific increment added, and — because this is
+the last increment before Phase 2 begins — a real summary of the whole
+of Phase 1, not just the most recent piece of it.
 
-**What changed in Section 28:** three existing principles were updated
-to cite work that had already superseded their original wording —
-Principle 5 (Schema contracts) still said contracts "land in the
-planned Section 12," stale since Section 12 shipped; Principle 7 (Least
-privilege) gained a second, related gap from Section 23.8 (Bronze has no
-access control, not just one shared MinIO credential); Principle 11
-(Observability) was extended to cover Section 22's queryable run
-history and Section 25's failure taxonomy, not just the original
-`ingestion_metadata` example. Two new principles were added, each
-demonstrated at least twice already rather than asserted from a single
-example: **Data minimization** (Section 23's PII classification exists,
-but isn't yet enforced — `users.email` still reaches Bronze unmasked)
-and **Layered, honestly-tiered verification** (the same
-measure-and-label-your-confidence discipline shown independently by
-Section 24's test pyramid, Section 25's Tier A/B/C system, and Section
-26.6/26.7's refusal to ship an unreproduced benchmark number).
+### What this increment added
 
-**What changed in Section 29:** two decisions this project had already
-made, with full context/decision/trade-offs reasoning already written
-in their originating sections, had simply never been promoted into the
-consolidated ADR index — a real gap in an index whose entire job is
-consolidation. **ADR-014** (classify PII inside the existing data
-contract, not a separate registry, from Section 23.3) and **ADR-015**
-(measure test coverage now, don't gate on it yet, from Section 24.3) are
-both added, cross-referenced from their originating sections in both
-directions. ADR-015 is explicitly tied to ADR-013's earlier
-detect-don't-remediate decision for Bronze file layout — the same
-posture, chosen independently, in a different context, which is exactly
-the kind of pattern a consolidated index is supposed to make visible.
-Sections 25-27 were checked too, and genuinely made no new decisions
-about the deployed system itself — only decisions about how to write
-this guide's own documentation and benchmarks — so nothing from them
-was added, a deliberate non-finding rather than an oversight.
+Four sections that had existed only as table-of-contents placeholders
+since this guide's earliest planning now have real content: Section 30
+(an index over all 23 hands-on labs, grouped by project block, with
+three suggested paths through them depending on what the reader wants —
+the full arc, an interview-prep subset, or a fast pipeline-verification
+subset); Section 31 (all 37 Principal Engineer interview questions
+this guide has asked, grouped into 15 categories by what they actually
+test, replacing the vague, never-fully-defined "Category C" placeholder
+this guide had carried since early on with a real, bounded taxonomy);
+and Section 32 (three new, genuinely cross-cutting scenarios — a viral
+traffic spike, onboarding a fourth source table, and a real-time
+dashboard request — each one deliberately built to require reasoning
+across several sections at once, the way an actual principal-engineer
+conversation does, rather than testing one concept in isolation the way
+every other interview question in this guide does). Sections 35 and 36,
+which already had real content from earlier in the project, were
+refreshed rather than rewritten: Section 35's git-repository review
+was re-verified against the current, larger codebase (finding one new,
+small, honestly-named instance of duplicate code between the two
+Section 26 benchmark scripts); Section 36's Phase 2 preview gained two
+concrete carry-forward items Section 27 surfaced (the `urls`/`users`
+incremental-load gap, and Bronze's missing target file size in *either*
+direction) and one explicit scope boundary (PII encryption/access
+control belongs to a security-hardening phase, not Phase 2's
+data-quality focus).
 
-**A note on this increment specifically:** this is maintenance work, not
-new capability — no code changed, no new benchmark was run beyond the
-verification already covered by prior sections. Its value is narrower
-and more specific: an index that silently drifts from what it's
-supposed to index is exactly the "detection gap" mechanism category
-Section 25.2 already named (category 9, "silent, long-lived detection
-gaps"), and this increment is that same failure mode caught and fixed
-in these two indexes specifically, the same way Section 27's own review
-caught it for `urls`/`users`' full-load gap and Section 25.7's epilogue
-caught it for the failure-taxonomy table itself.
+### Phase 1, as a whole: what was actually built
 
-**Concepts taught so far, at full depth:** the real application's
-architecture and schema, OLTP vs. OLAP, full load and incremental-load
-ingestion (watermarks, idempotency, checkpointing, Bronze reconciliation),
-the entire data modeling layer (Sections 7-12), the Storage block in
-full (Sections 18-21), `ingestion_metadata` as this pipeline's control
-plane (Section 22), PII classification (Section 23), testing strategy
-(Section 24), failure taxonomy (Section 25), performance benchmarking
-(Section 26), scale design (Section 27), and now the discipline of
-actually maintaining a "living" index instead of just labeling it that
-way — checking a consolidated document against what it claims to
-consolidate, on a real cadence, not only when a new topic happens to
-touch it directly.
+Thirty-six numbered sections, all with real content — every ⏳
+placeholder this guide ever carried is gone. Twenty-two of them (Sections
+1, 2, and 7 through 27 except Section 13) are at this guide's full
+teaching-template depth; the remaining fourteen (the Foundations-block
+setup sections 3-6 and 13, and the Reference-block index sections 28-36)
+are real but plainer, a difference this guide's own status legend names
+explicitly rather than blurring the two together. A working ingestion
+pipeline — full load and watermark-based
+incremental load, both checkpointed, both idempotent, both reconciled
+against Bronze after the fact — that has been run for real against
+real Postgres in this sandbox at every stage, not merely described.
+A complete star-schema analytical model, designed from a real, written
+metrics catalog and a real grain decision, with its DDL committed and
+genuinely applied against Postgres, deliberately left unpopulated as an
+honestly-named Phase 2 boundary rather than faked with placeholder
+transform logic. PII classification covering every source column, with
+enforcement (not just documentation) via a required contract field. An
+80-test unit suite plus a working integration test, both genuinely run
+in this sandbox, with real, measured coverage (58%) reported without
+being gamed by a threshold picked before anyone saw the real number.
+Nineteen failure scenarios, indexed by underlying mechanism rather than
+by which section introduced them, each honestly tiered by how it was
+actually verified. Two real performance benchmarks and a five-axis
+scale-design review that found the axis this guide worried about least
+(query latency) had the most headroom, and two axes nobody had
+benchmarked (Bronze single-partition risk, `urls`/`users`' missing
+watermark) were closer to mattering — a genuinely non-obvious result
+that measurement, not intuition, produced. Fifteen ADRs, thirteen
+principal-engineering principles demonstrated against real code, and
+now, as of this increment, a complete index over every lab and every
+interview question this project has produced.
 
-**Known limitations, stated honestly:** this pass checked Section 28 and
-29 against Sections 23-27 specifically, because those were the sections
-accumulated since the indexes' last real update — it did not re-audit
-Sections 1-22 for anything those indexes might have also missed from
-further back, which is itself worth naming: an index-maintenance pass
-that only looks at recent sections can still be catching up on older,
-unnoticed drift. Neither index has a mechanical check tying it to the
-sections it summarizes — this pass was a human (well, an AI mentor)
-noticing and fixing the gap by hand, the exact same unresolved
-limitation Section 25.7's epilogue already named for the failure-taxonomy
-index specifically, now shown to generalize to every "living" index this
-guide keeps.
+### The throughline worth naming explicitly
 
-**Immediate next increment:** whichever the reader wants — a genuinely
-new topic (Sections 27 was the last one with real content still owed;
-30-32 and 36 remain TOC placeholders) or a similar audit pass extended
-back over Sections 1-22, to check whether the same drift exists further
-back than this increment checked.
+Read end to end, Phase 1's real achievement isn't any single pipeline
+component — it's the discipline repeated at every layer: state a
+design decision and its alternatives before building (every section's
+Design Decision subsection); verify a claim for real before writing it
+down, and label exactly how confident that verification makes you
+(Section 25's Tier A/B/C system, demonstrated again in Section 26.6/26.7
+and reinforced in Section 28's newly-named Principle 15); and when an
+index or a document claims to consolidate something, actually check it
+against what it claims to consolidate, rather than letting the claim go
+stale (Section 25.7's epilogue, Section 27's `urls`/`users` finding, and
+this very increment's refresh of Sections 28/29/35/36 are three
+independent instances of that same discipline, not one lucky catch).
+None of these were named as goals at the start of Phase 1 — they
+emerged from actually doing the work honestly, increment after
+increment, and are worth carrying into Phase 2 as explicitly as any
+specific technical decision this guide recorded.
+
+### Known limitations, stated honestly, carried forward as Phase 2 begins
+
+Not every named gap in this guide gets fixed before Phase 2 starts, and
+that's a deliberate choice, not an oversight: `urls`/`users` still lack
+incremental-load protection (Section 27); Bronze has no file-size target
+in either direction (Sections 21, 26); coverage is measured but not
+gated (Section 24, ADR-015); PII is classified but not enforced beyond
+that (Section 23.8); the analytical layer has no contract validation of
+its own yet (Section 12.7); and the fourteen sections named above as
+plain ✅ (the Foundations-block setup sections 3-6, Section 13's
+ingestion overview, and every Reference-block section 28-36) remain at
+that depth, not yet rewritten to the full ✅✅ teaching template — a
+deliberate scope choice, since a setup or index section teaches a
+genuinely different kind of content than a technical concept does, and
+forcing the same template onto both would pad rather than clarify. Each
+one is named, in its own section, with what closing it would take —
+consistent with this guide's own standard from Section 1 onward: a
+named gap is honest progress, a silent one is a liability waiting to be
+discovered by someone else.
+
+**Phase 2 begins whenever explicitly requested (Section 36).**
 
 ---
 
@@ -9794,25 +10075,30 @@ back than this increment checked.
 | Scale design completed | ✅ Done | Five scaling axes identified and ranked by real evidence, Section 27; `urls`/`users` full-load extraction genuinely benchmarked for this section (5,500/50,500/500,500 rows: 44.91/220.37/1,833.57 ms), confirming a structural watermark gap Section 15 never extended to those two tables | `urls`/`users` not yet migrated to incremental load — named, not fixed (Section 27.8); every trigger point in 27.4's roadmap is a linear extrapolation, honestly flagged as a planning estimate, not a guarantee (Section 27.7) |
 | Architecture diagrams completed | ✅ Partial | 10+ diagrams so far, including the full star schema ER diagram (Section 10.1), Sections 18/20/21/22/23/24/25's object-storage, partition-pruning, file-layout, control-plane, PII-classification, test-pyramid, and failure-taxonomy diagrams, and Section 27's five-axis scale-risk diagram | More land with later sections (data lifecycle, failure/recovery, final architecture) |
 | ADRs documented | ✅ 15 of 15+ planned | Section 29 | Two decisions this project had already made — PII classification location (Section 23.3) and coverage measure-don't-gate (Section 24.3) — were promoted into the consolidated index this increment as ADR-014/ADR-015; Sections 25-27 made no new architectural decisions about the deployed system itself (only documentation/benchmarking-methodology choices), so nothing from them was added |
-| Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, 24.9-25.9 (Category I: Testing/Failure Strategy), 26.9, 27.9 (Category P: Performance/Scale) | Remaining categories not yet covered, Section 31 |
-| Hands-on labs completed | ✅ Partial | LAB 1-23 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation, LAB 14 storage growth/idempotency, LAB 15 Parquet benchmark, LAB 16 partition pruning, LAB 17 file-layout report, LAB 18 watermark_start fix + metadata readers, LAB 19 PII report break/fix, LAB 20 coverage report + integration-test port break/fix, LAB 21 crash-sim + Parquet magic-bytes repro, LAB 22 query-performance/extraction-time benchmarks at a new scale, LAB 23 users full-load benchmark reproduction) | LAB 24+ |
-| README updated | ✅ Done | `README.md` | — |
-| Git repository clean | ✅ Done | Section 35 | — |
+| Interview questions reviewed | ✅ Done (consolidated) | All 37 Principal Engineer interview questions across every section from 1 through 27 now indexed into 15 real categories by what they test, replacing the never-formally-defined "Category C" placeholder, Section 31 | Section 31 indexes what exists; it doesn't add new questions for topics not yet covered (e.g. Phase 2 concepts, once they exist) |
+| Hands-on labs completed | ✅ Done (indexed) | All 23 labs indexed by project block with three suggested paths (full arc, interview-prep subset, fast-verification subset), Section 30 | LAB 24+ lands with Phase 2's own new components |
+| Principal-level scenarios completed | ✅ Done | Three new, deliberately cross-cutting scenarios (a viral traffic spike, onboarding a fourth source table, a real-time dashboard request), each requiring reasoning across multiple sections at once rather than one isolated concept, Section 32 | More scenarios could be added as Phase 2 introduces new cross-cutting failure modes to reason about |
+| README updated | ✅ Done | `README.md` — benchmarking section and "Current phase" status corrected to match this increment's real state (was stale: still said benchmarks were "not yet populated" and Phase 1 was "in progress") | — |
+| Git repository clean | ✅ Done | Section 35, re-verified this increment against the current, larger codebase | One small, honestly-named instance of duplicate code between the two Section 26 benchmark scripts, left un-extracted deliberately (Section 35) |
 | No secrets committed | ✅ Done | `.gitignore`, `.env.example` reviewed | — |
 
 ---
 
 ## 35. Git Repository Review
 
-**Structure:** clean, matches the map in Section 4; no stray files at the
-repository root.
+**Structure:** still clean, re-verified against Section 4's map as of
+this increment — no stray files at the repository root; the two new
+benchmark scripts (`benchmarks/query_performance.py`,
+`benchmarks/extraction_time.py`, Section 26) live exactly where Section
+4's table said benchmarks belong.
 
 **Naming:** consistent `snake_case` for Python, `kebab-case` nowhere yet
 needed, table/column names match the real source schema's own convention.
 
 **Tests:** unit and integration cleanly separated by both directory and
 pytest marker; unit tests genuinely run and pass in an environment with no
-Docker at all (verified while writing this guide).
+Docker at all (verified while writing this guide); 80 tests, unchanged
+since Section 24, still passing as of this increment.
 
 **Configuration:** `.env.example` present and complete; no credential in
 any committed file resolves to anything beyond localhost containers.
@@ -9820,19 +10106,38 @@ any committed file resolves to anything beyond localhost containers.
 **Secrets:** none committed. `git status`/`.gitignore` reviewed by hand
 before this increment's commit.
 
-**Duplicate code:** none yet — the codebase is small enough that this
-hasn't become a risk.
+**Duplicate code:** a small, real instance now exists, not yet
+extracted: `benchmarks/query_performance.py` and
+`benchmarks/extraction_time.py` (Section 26) each implement their own
+near-identical `cleanup()` function — floor-offset delete, called both
+defensively before a run and normally after. Left un-extracted
+deliberately: two call sites sharing a few lines of straightforward SQL
+is a real but small cost, and extracting a shared helper for exactly two
+users risks guessing the wrong shared interface before a third benchmark
+script ever needs it — the same "don't build it until it's earned"
+judgment this project has applied elsewhere (Section 3.1).
 
 **Generated artifacts:** none committed — `pg_data/`, `minio_data/`,
-`.pytest_cache/`, `.ruff_cache/` all excluded.
+`.pytest_cache/`, `.ruff_cache/`, `benchmarks/results/` all excluded.
 
 **Reproducibility:** `docker-compose.yml` pins every image tag explicitly;
 `scripts/seed_sample_data.py` uses a fixed seed; a clean clone plus the
 Quick Start commands in `README.md` should reproduce this exact state.
 
+**Decision history:** 15 ADRs now recorded in Section 29 (up from 13),
+with two — PII classification location and coverage measure-don't-gate —
+promoted this project's own maintenance pass (Section 28/29's refresh)
+from decisions that already existed in their originating sections but
+had never reached the consolidated index.
+
 **What should improve before this is "done" for Phase 1:** the items
 marked ⏳ in Section 34's checklist — this is an honest, current snapshot,
-not a claim of completeness.
+not a claim of completeness. As of this increment, Section 34's
+checklist has no remaining ⏳ items at the section level — every planned
+Phase 1 section now has real content — though several individual rows
+still carry named, open sub-gaps (the `urls`/`users` incremental-load
+migration, coverage gating, encryption/access control, and others),
+all listed explicitly rather than implied away.
 
 ---
 
@@ -9852,6 +10157,35 @@ to the analytical layer (a named Phase 1 gap — Section 12.7); schema
 evolution handling; late-arriving-data reprocessing (the gap named in
 ADR-005); backfill tooling; small-file compaction; and tests for
 transformation logic specifically (distinct from this phase's ingestion
-tests). Phase 2 begins only when explicitly requested — consistent with
+tests).
+
+**Two additional, concrete items Phase 1's later sections surfaced,
+worth carrying into Phase 2's planning rather than left as scattered
+footnotes:** first, Section 27's real finding that `urls` and `users`
+still run full load with no watermark protection — migrating both to
+the incremental pattern `clicks` already has (Section 15) is cheap,
+well-understood work, and doing it before Phase 2's transform starts
+reading from Bronze means Phase 2 never has to reason about a
+still-unbounded full-table extraction underneath it. Second, Section
+26/27's Bronze single-partition volume risk (no protection against one
+day's write landing an oversized, un-split Parquet object) — Phase 2's
+small-file-compaction work is the natural place to also address the
+opposite failure mode (too-large, not just too-small), since both are
+really the same underlying gap: this project's Bronze layer has no
+target file size at all, in either direction (Section 21.8).
+
+**Explicitly out of Phase 2's scope, named here so it isn't confused
+for an oversight:** PII encryption at rest, Bronze access control, and
+a real right-to-erasure mechanism (all three named honestly as
+unbuilt in Section 23.8) are governance and security concerns, not data
+lake or transformation concerns — they belong to whichever later phase
+takes up production-readiness and security hardening specifically, not
+Phase 2's data-quality focus. Folding them into Phase 2 anyway, just
+because Section 23 raised them, would blur two genuinely different
+kinds of work together the same way this guide has avoided doing
+elsewhere (Section 24.9's own interview question makes exactly this
+point about test coverage being one fact, not two).
+
+Phase 2 begins only when explicitly requested — consistent with
 how this repository has been built so far, one reviewed increment at a
 time.

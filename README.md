@@ -51,7 +51,7 @@ the guide for why Kafka/Spark/Airflow are deliberately not here yet.
 | `schemas/analytics/`, `sql/analytics/` | The analytical (star schema) model — `dim_date`/`dim_url`/`dim_user`/`dim_device`/`fact_clicks`. Schema only; Phase 2 populates it. |
 | `contracts/` | Formal, machine-checked data contracts for the source tables — `make validate-contracts`. |
 | `scripts/` | One-off operator scripts (e.g. `seed_sample_data.py`), not part of the ingestion package itself. |
-| `benchmarks/` | Executable performance benchmarks (Parquet vs CSV, partitioned vs not). |
+| `benchmarks/` | Executable performance benchmarks (Parquet vs CSV/JSON; query performance and extraction time at scale). See `benchmarks/README.md`. |
 | `sample_data/` | Convention-only landing spot for locally generated files; nothing here is committed. |
 | `tests/` | Reserved for cross-phase end-to-end tests (empty in Phase 1 — see `ingestion/tests/` for what exists now). |
 
@@ -90,8 +90,15 @@ make coverage           # unit-test coverage report -- measured, not gated yet
 
 ## Benchmarking
 
-Not yet populated in this increment — see `benchmarks/README.md` and the
-guide's "Parquet" / "Partitioning" sections for what lands here next.
+```bash
+make benchmark-parquet               # Parquet vs CSV vs JSON, real or synthetic data
+make benchmark-query-performance     # Section 7.1's metrics catalog, timed at scale
+make benchmark-extraction-time       # extract_full / extract_incremental, timed at scale
+```
+
+All three are genuinely run against real Postgres, results captured in
+the guide's "Parquet" and "Performance" sections — see `benchmarks/README.md`
+for what each one measures and how to run it at a different scale.
 
 ## Documentation
 
@@ -103,9 +110,14 @@ scenarios, and interview questions — lives in one place:
 
 ## Current phase
 
-**Phase 1: Analytics Foundation & Batch Ingestion** — in progress. See the
-guide's Phase 1 Completion Checklist for exactly what's done and what
-remains.
+**Phase 1: Analytics Foundation & Batch Ingestion** — complete. Every
+section of the guide has real content, 15 architecture decisions are
+recorded, and a five-axis scale-design review has been run against real
+benchmark data. See the guide's Phase 1 Summary and Completion Checklist
+for the full close-out, including the specific, named gaps (not every
+item is "finished" — each remaining one is stated explicitly, not
+implied away) that carry into Phase 2. Phase 2 begins only when
+explicitly requested.
 
 ## Future phases
 
