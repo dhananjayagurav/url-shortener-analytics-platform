@@ -7178,7 +7178,10 @@ existing contract files. No new file, no second source of truth.
 
 **Consequences:** a column can never have a schema but no PII
 classification, or a PII classification for a column that doesn't exist.
-Both are structurally impossible when they live in the same list.
+Both are structurally impossible when they live in the same list. Now
+recorded as [ADR-014](#adr-014-classify-pii-inside-the-existing-data-contract-not-a-separate-registry)
+in Section 29's consolidated index, alongside every other decision this
+project has made and stood behind.
 
 ### Alternatives
 
@@ -7630,7 +7633,11 @@ drops.
 
 **Consequences:** coverage becomes a number a developer can check, but
 nothing currently stops it from getting worse over time. Section 24.8
-names this as a real, temporary gap, not a permanent design choice.
+names this as a real, temporary gap, not a permanent design choice. Now
+recorded as [ADR-015](#adr-015-measure-test-coverage-now-dont-gate-on-it-yet)
+in Section 29, explicitly tied there to ADR-013's earlier
+detect-don't-remediate decision for Bronze file-layout health — the same
+posture, applied a second time, to a different concern.
 
 ### Alternatives
 
@@ -9297,18 +9304,27 @@ same outputs, and the whole system can be rebuilt from a clean clone.
 
 **5. Schema contracts.** *Meaning:* producers and consumers of a dataset
 agree on its shape explicitly, not by convention. *Phase 1, now:*
-documented informally in `schemas/source/urls.md`; formal, versioned
-contracts land in the planned Section 12.
+implemented, not just planned — `contracts/source/*.yaml`, validated by
+`contracts.py` against both SQLite (unit tests) and real Postgres
+(integration tests), Section 12; every column additionally declares a
+PII classification since Section 23, so "the shape of a dataset" now
+includes its sensitivity, not just its type.
 
 **6. Explicit ownership.** *Meaning:* every dataset and pipeline has a
 named owner accountable for it. *Phase 1, now:* not yet formalized — a
 single-engineer portfolio project doesn't need this machinery yet, but the
 principle is recorded for when Phase 3+ introduces multiple pipelines.
+Section 27's axis 4 (table/pipeline count) confirms this is still true:
+only 3 tables exist today, nowhere near the scale where ownership
+ambiguity becomes a real problem.
 
 **7. Least privilege.** *Meaning:* every credential grants the minimum
 access it needs. *Phase 1, now:* explicitly **not** met — `.env.example`
 uses a single MinIO root credential for everything, called out as a POC
-simplification in [Section 14.8](#148-production-considerations).
+simplification in [Section 14.8](#148-production-considerations). Section
+23.8 named the same gap from a different angle: any credential with
+bucket access can also read Bronze's unmasked `users.email`, since Bronze
+has no column- or object-level access control either.
 
 **8. Metadata-driven processing.** *Meaning:* what a pipeline does (which
 tables, which strategy) is configuration, not hardcoded logic.
@@ -9330,6 +9346,12 @@ this principle is deferred to Section 15.
 queryable, not just inferred from external symptoms. *Phase 1, now:*
 `ingestion_metadata` is exactly this for the ingestion pipeline — see
 Section 14.7's failure scenario for what it does and doesn't tell you.
+Section 22 extended this with `get_run_history`/`get_ingestion_summary`
+(queryable run history, not just a pass/fail signal), and Section 25
+extended it again by indexing every known failure mode this project has
+across 19 entries, each labeled by how confidently it's actually been
+verified — observability isn't only "can I see what happened," it's also
+"do I know how much to trust what I'm seeing."
 
 **12. Scalability.** *Meaning:* the design's bottlenecks are known and
 have a described next step, not just "hope it holds." *Phase 1, now:*
@@ -9342,6 +9364,32 @@ real risk than `fact_clicks` query latency ever was (Section 26).
 an eye on what it costs to run, not just whether it works. *Phase 1, now:*
 implicit in choosing batch over streaming (Section 13) — this is the
 principle that decision is really an instance of.
+
+**14. Data minimization.** *Meaning:* every dataset a pipeline creates is
+an expansion of personal data's blast radius, and each column carrying
+personal data is either genuinely needed downstream or shouldn't be
+copied at all. *Phase 1, now:* Section 23's PII classification names
+which columns carry personal data (`users.email` direct;
+`urls.user_id`/`clicks.user_id`/`clicks.hashed_ip` pseudonymized) — but
+this principle isn't yet **enforced**, only observed: `extract_full`
+copies `users.email` into Bronze unmasked regardless, and only
+`dim_user`'s already-decided schema (Section 10.4) keeps it from
+reaching the analytical layer. Named honestly as partial in Section
+23.8, not claimed as solved.
+
+**15. Layered, honestly-tiered verification.** *Meaning:* a claim this
+project makes about its own behavior — a failure mode, a performance
+number, a test result — is only as trustworthy as how it was checked,
+and that check's rigor should be stated, not implied. *Phase 1, now:*
+demonstrated repeatedly, not just declared: Section 24's two-layer test
+pyramid (fast SQLite/mock unit tests vs. slower real-Postgres/MinIO
+integration tests) catches different bug classes on purpose; Section
+25's Tier A/B/C system labels all 19 failure scenarios by whether they
+were genuinely triggered, traced through real code, or reasoned about
+architecturally; Section 26.6/26.7 caught its own benchmark reporting a
+misleading number by refusing to ship a result that hadn't been
+reproduced. The same discipline, applied three times in three different
+contexts, is what makes it a principle rather than a one-off habit.
 
 ---
 
@@ -9577,54 +9625,111 @@ project's operational tooling (Section 17.7's reconciliation, now Section
 21's layout reporting), not a one-off choice specific to either section —
 any future operational-health check this codebase adds should default to
 the same posture unless a specific, named reason justifies auto-remediation.
+ADR-015 below is exactly that pattern recurring a third time, in a
+testing context rather than a storage one.
+
+### ADR-014: Classify PII inside the existing data contract, not a separate registry
+
+**Context:** every source column already has one canonical description,
+in one place — `contracts/source/*.yaml` (Section 12, ADR-010). A PII
+classification needs to live somewhere too, and answers the same
+question a schema contract already answers: what does this column
+actually contain? **Decision:** add `pii` (`none`/`pseudonymized`/
+`direct`) as a required field on every column inside the existing
+contract files, enforced by `pii.py`'s `_require_pii_declared` — no new
+file, no second source of truth. **Alternatives considered:** a separate
+`pii_registry.yaml`, mapping `table.column` to a category, checked on
+its own schedule — a common real-world pattern where a governance team
+and a platform team are genuinely different owners. **Trade-offs:**
+co-locating the two concerns makes them structurally impossible to drift
+apart (a column can't have a schema but no PII classification, or vice
+versa), at the cost of not cleanly separating governance ownership from
+schema ownership — the right trade for a single-team, single-repo
+project today, not necessarily once a separate governance team exists
+(Section 23.3's full reasoning). **Consequences:** `make pii-report` and
+`make validate-contracts` are two separate commands checking two
+different things about the same file, and nothing currently runs them
+together — a real, named ordering gap (Section 23.7), not yet closed.
+
+### ADR-015: Measure test coverage now, don't gate on it yet
+
+**Context:** `pytest-cov` sat listed but unused in `pyproject.toml`
+since this project's first commit; running it for the first time
+(Section 24) produced a real number — 58% of this project's source
+lines exercised by the unit-test suite. **Decision:** wire up `make
+coverage` so that number is visible and reproducible on demand; do not
+add a `--cov-fail-under` threshold, and do not fail `make test` if
+coverage drops. **Alternatives considered:** set a hard threshold
+immediately (e.g. `--cov-fail-under=80`); or leave `pytest-cov`
+uninstalled and unused, the actual status quo before this decision.
+**Trade-offs:** a threshold picked before ever seeing a real number
+risks being arbitrary, and this project's real number (58%) sits well
+below a plausible-sounding one like 80% — gating on an arbitrary number
+before any CI exists to enforce it consistently would imply a guarantee
+this project can't actually back up (Section 24.3's full reasoning).
+**Consequences:** coverage can silently get worse over time until a real
+CI system exists to gate it — a genuine, temporary gap, named as such in
+Section 24.8, not a permanent design choice. This is the same
+detect-don't-remediate posture ADR-013 formalized for Bronze file-layout
+health, applied here to test coverage instead of storage.
 
 ---
 
 ## 33. Phase 1 Summary (so far)
 
-**What we've built in this increment:** Scale Design (Section 27), which
-takes Section 26's real benchmark numbers and asks a broader question
-than either Section 7.1 or Section 26 asked on their own: across the
-*whole* pipeline, not just `fact_clicks`' query layer, which component
-is actually closest to a real limit? The answer required identifying
-five genuinely separate scaling axes — cumulative `fact_clicks` size,
-per-table full-load size, single-partition Bronze volume, table/pipeline
-count, and operational availability — because each one breaks a
-different component, for a different reason, measured in different
-units. Ranking all five by real evidence, rather than applying one
-uniform growth multiplier to all of them, produced this increment's real
-finding.
+**What we've built in this increment:** a maintenance pass over Section
+28 (Architectural Principles) and Section 29 (Architecture Decision
+Records) — both explicitly "living" indexes since their introduction,
+meant to be revisited as later sections demonstrate new principles or
+make new decisions, not written once and left alone. This is the first
+time either index has actually been revisited since Section 22, and
+Sections 23-27 had genuinely accumulated content neither index yet
+reflected.
 
-**The real finding:** the axis this guide had already spent two full
-sections (7 and 26) measuring — `fact_clicks` query latency — turned out
-to have the *most* headroom of all five, with a real, measured trigger
-around 10.4 million cumulative rows. Two axes nobody had benchmarked
-before this section turned out to be closer to mattering. First: Bronze's
-one-file-per-partition design (Sections 20-21) has no protection against
-a single day's volume spike — extrapolating Section 19.6's own real
-Parquet byte density (21.65 bytes/row), a single partition crosses a
-128 MB "mature lake" target at around 6.2 million rows in one day, a
-number a URL shortener could plausibly hit from one link going viral,
-with nothing in this pipeline currently watching for it. Second, and
-more concrete: `ingestion/configs/pipelines.yaml` still has `urls` and
-`users` on `full` load, meaning neither has the watermark protection
-`clicks` got in Section 15 — a real, present-tense structural gap, not a
-future one, confirmed with a newly-run benchmark this increment
-(`extract_full` against a synthetically-inflated `urls` table: 44.91 ms
-/ 220.37 ms / 1,833.57 ms at 5,500 / 50,500 / 500,500 total rows,
-matching `clicks`' own pre-Section-15 growth curve almost exactly).
+**What changed in Section 28:** three existing principles were updated
+to cite work that had already superseded their original wording —
+Principle 5 (Schema contracts) still said contracts "land in the
+planned Section 12," stale since Section 12 shipped; Principle 7 (Least
+privilege) gained a second, related gap from Section 23.8 (Bronze has no
+access control, not just one shared MinIO credential); Principle 11
+(Observability) was extended to cover Section 22's queryable run
+history and Section 25's failure taxonomy, not just the original
+`ingestion_metadata` example. Two new principles were added, each
+demonstrated at least twice already rather than asserted from a single
+example: **Data minimization** (Section 23's PII classification exists,
+but isn't yet enforced — `users.email` still reaches Bronze unmasked)
+and **Layered, honestly-tiered verification** (the same
+measure-and-label-your-confidence discipline shown independently by
+Section 24's test pyramid, Section 25's Tier A/B/C system, and Section
+26.6/26.7's refusal to ship an unreproduced benchmark number).
 
-**A note on this increment specifically:** 27.7's own Failure Scenario
-names the honest limit of this section's method — every trigger point
-in 27.4's Scale Roadmap is a linear extrapolation from at most two or
-three real measurements, and Section 26.6/26.7 already proved, in this
-same project, that a real system can behave non-linearly in ways a
-straight-line extrapolation wouldn't predict (the 2,000,000-row
-buffer-cache contention finding). The roadmap is presented as a
-planning estimate worth prioritizing against, not a guarantee — closing
-that gap for real would mean actually benchmarking near each trigger
-point once real data approaches it, which this project's synthetic data
-can approximate but not replace.
+**What changed in Section 29:** two decisions this project had already
+made, with full context/decision/trade-offs reasoning already written
+in their originating sections, had simply never been promoted into the
+consolidated ADR index — a real gap in an index whose entire job is
+consolidation. **ADR-014** (classify PII inside the existing data
+contract, not a separate registry, from Section 23.3) and **ADR-015**
+(measure test coverage now, don't gate on it yet, from Section 24.3) are
+both added, cross-referenced from their originating sections in both
+directions. ADR-015 is explicitly tied to ADR-013's earlier
+detect-don't-remediate decision for Bronze file layout — the same
+posture, chosen independently, in a different context, which is exactly
+the kind of pattern a consolidated index is supposed to make visible.
+Sections 25-27 were checked too, and genuinely made no new decisions
+about the deployed system itself — only decisions about how to write
+this guide's own documentation and benchmarks — so nothing from them
+was added, a deliberate non-finding rather than an oversight.
+
+**A note on this increment specifically:** this is maintenance work, not
+new capability — no code changed, no new benchmark was run beyond the
+verification already covered by prior sections. Its value is narrower
+and more specific: an index that silently drifts from what it's
+supposed to index is exactly the "detection gap" mechanism category
+Section 25.2 already named (category 9, "silent, long-lived detection
+gaps"), and this increment is that same failure mode caught and fixed
+in these two indexes specifically, the same way Section 27's own review
+caught it for `urls`/`users`' full-load gap and Section 25.7's epilogue
+caught it for the failure-taxonomy table itself.
 
 **Concepts taught so far, at full depth:** the real application's
 architecture and schema, OLTP vs. OLAP, full load and incremental-load
@@ -9633,26 +9738,30 @@ the entire data modeling layer (Sections 7-12), the Storage block in
 full (Sections 18-21), `ingestion_metadata` as this pipeline's control
 plane (Section 22), PII classification (Section 23), testing strategy
 (Section 24), failure taxonomy (Section 25), performance benchmarking
-(Section 26), and now scale design itself: separating a system's
-scaling behavior into independent axes, each measured in its own units,
-and ranking real risk by nearness to a limit rather than by which axis
-already had the most attention (Section 27).
+(Section 26), scale design (Section 27), and now the discipline of
+actually maintaining a "living" index instead of just labeling it that
+way — checking a consolidated document against what it claims to
+consolidate, on a real cadence, not only when a new topic happens to
+touch it directly.
 
-**Known limitations, stated honestly:** axis 4 (table/pipeline count)
-and axis 5 (operational availability) in 27.2/27.4 are architectural
-reasoning only — this project has just 3 tables and no uptime
-requirement, so neither axis has anything real to benchmark against yet;
-partition-pruning real-network-latency benchmarks remain a named,
-still-open gap (Section 34), unchanged by this increment; the
-`urls`/`users` full-load gap this section surfaced is named, not fixed
-— Section 27.8 states the fix (migrate both to incremental load) without
-implementing it, since neither table's real growth currently justifies
-the work, per this project's own "earn complexity" discipline.
+**Known limitations, stated honestly:** this pass checked Section 28 and
+29 against Sections 23-27 specifically, because those were the sections
+accumulated since the indexes' last real update — it did not re-audit
+Sections 1-22 for anything those indexes might have also missed from
+further back, which is itself worth naming: an index-maintenance pass
+that only looks at recent sections can still be catching up on older,
+unnoticed drift. Neither index has a mechanical check tying it to the
+sections it summarizes — this pass was a human (well, an AI mentor)
+noticing and fixing the gap by hand, the exact same unresolved
+limitation Section 25.7's epilogue already named for the failure-taxonomy
+index specifically, now shown to generalize to every "living" index this
+guide keeps.
 
-**Immediate next increment:** whichever the reader wants — Section 28's
-Architectural Principles and Section 29's ADRs are both living indexes
-that could use a pass reflecting Sections 23-27, or a genuinely new
-topic if one exists past Section 27's current TOC placeholder.
+**Immediate next increment:** whichever the reader wants — a genuinely
+new topic (Sections 27 was the last one with real content still owed;
+30-32 and 36 remain TOC placeholders) or a similar audit pass extended
+back over Sections 1-22, to check whether the same drift exists further
+back than this increment checked.
 
 ---
 
@@ -9678,13 +9787,13 @@ topic if one exists past Section 27's current TOC placeholder.
 | Partitioning implemented | ✅ Done (single file per partition; pruning added) | Hive-style date/watermark-scoped keys since Sections 14-15, formalized in Section 18.2; genuine partition-pruned listing for full-load tables, `list_bronze_keys_for_date_range`, Section 20, ADR-012 | Not true multi-file-per-partition splitting; pruning not extended to incremental's watermark-range keys (named scope boundary, Section 20.3) |
 | File layout health reporting implemented | ✅ Done (detect-only) | `object_store.get_file_layout_report`, `layout-report` CLI command, Section 21, ADR-013 | No auto-compaction, by deliberate design (ADR-013); 8 MB small-file threshold is a POC default, not empirically derived (Section 21.8) |
 | Ingestion metadata deep-dive completed | ✅ Done | `watermark_start` gap found and fixed, `get_run_history`, `get_ingestion_summary`, `ingestion-history`/`ingestion-summary` CLI commands, Section 22 | `get_run_history` has no pagination guard on `limit` (Section 22.8) |
-| PII identified | ✅ Done | Every column in `contracts/source/*.yaml` now declares `pii` (`none`/`pseudonymized`/`direct`); `pii.py`, `pii-report` CLI command, Section 23 | Not content-inspecting — `original_url` query strings aren't scanned (Section 23.8); no encryption/access-control/erasure mechanism built yet (Section 23.8) |
-| Tests implemented | ✅ Done (unit + partial integration) | 80 passing unit tests (unchanged this increment — Section 24 measures and explains the existing suite rather than growing it); coverage now measured for the first time, 58% (`make coverage`, Section 24); the contracts integration test genuinely re-confirmed passing against real, non-Docker local Postgres in this sandbox | Coverage is measured, not gated (Section 24.3); `cli.py`'s command functions (0% coverage) remain untested directly, a named scope decision (Section 24's Principal Perspective); full-load/incremental-load integration tests still need real MinIO, not available here — user should run `make up && make test-integration` locally for the complete suite |
+| PII identified | ✅ Done | Every column in `contracts/source/*.yaml` now declares `pii` (`none`/`pseudonymized`/`direct`); `pii.py`, `pii-report` CLI command, Section 23, ADR-014 | Not content-inspecting — `original_url` query strings aren't scanned (Section 23.8); no encryption/access-control/erasure mechanism built yet (Section 23.8) |
+| Tests implemented | ✅ Done (unit + partial integration) | 80 passing unit tests (unchanged this increment — Section 24 measures and explains the existing suite rather than growing it); coverage now measured for the first time, 58% (`make coverage`, Section 24, ADR-015); the contracts integration test genuinely re-confirmed passing against real, non-Docker local Postgres in this sandbox | Coverage is measured, not gated (Section 24.3, ADR-015); `cli.py`'s command functions (0% coverage) remain untested directly, a named scope decision (Section 24's Principal Perspective); full-load/incremental-load integration tests still need real MinIO, not available here — user should run `make up && make test-integration` locally for the complete suite |
 | Failure scenarios tested | ✅ Done (consolidated) | All 19 failure scenarios across Sections 2, 7-12, 14-26 now indexed into 10 mechanism categories with an honest verification tier each (9 Tier A, 3 Tier B, 7 Tier C), Sections 25/26.7 | 7 Tier C entries remain architectural reasoning only, honestly named as blocked on infrastructure or code this project doesn't have yet (Section 25.2); this index's own auto-staleness gap (25.7) is closed for this one instance, not structurally — still no mechanical check |
 | Performance benchmark completed | ✅ Done (queries + extraction) | Parquet vs. CSV/JSON (Section 19); query performance across all 8 Section 7.1 metrics up to 2,000,000 synthetic rows, and extraction time (`extract_full`/`extract_incremental`) up to 505,003 rows, both genuinely run against real Postgres, Section 26 | Concurrent-query load untested (26.8); partition-pruning real-network-latency benchmarks still not run — no MinIO in this sandbox (unchanged gap, Section 26.8) |
 | Scale design completed | ✅ Done | Five scaling axes identified and ranked by real evidence, Section 27; `urls`/`users` full-load extraction genuinely benchmarked for this section (5,500/50,500/500,500 rows: 44.91/220.37/1,833.57 ms), confirming a structural watermark gap Section 15 never extended to those two tables | `urls`/`users` not yet migrated to incremental load — named, not fixed (Section 27.8); every trigger point in 27.4's roadmap is a linear extrapolation, honestly flagged as a planning estimate, not a guarantee (Section 27.7) |
 | Architecture diagrams completed | ✅ Partial | 10+ diagrams so far, including the full star schema ER diagram (Section 10.1), Sections 18/20/21/22/23/24/25's object-storage, partition-pruning, file-layout, control-plane, PII-classification, test-pyramid, and failure-taxonomy diagrams, and Section 27's five-axis scale-risk diagram | More land with later sections (data lifecycle, failure/recovery, final architecture) |
-| ADRs documented | ✅ 13 of 13+ planned | Section 29 | No new ADR this increment — Section 27 named a real gap (`urls`/`users` full-load) and its fix, but didn't implement the fix, so there's no new architectural decision to record yet |
+| ADRs documented | ✅ 15 of 15+ planned | Section 29 | Two decisions this project had already made — PII classification location (Section 23.3) and coverage measure-don't-gate (Section 24.3) — were promoted into the consolidated index this increment as ADR-014/ADR-015; Sections 25-27 made no new architectural decisions about the deployed system itself (only documentation/benchmarking-methodology choices), so nothing from them was added |
 | Interview questions reviewed | ✅ Partial | Sections 7, 8, 9, 10, 11, 12 (Category C-N, data modeling), 14.9, 15.9, 16.9, 17.9, 18.9, 19.9, 20.9, 21.9, 22.9, 23.9, 24.9-25.9 (Category I: Testing/Failure Strategy), 26.9, 27.9 (Category P: Performance/Scale) | Remaining categories not yet covered, Section 31 |
 | Hands-on labs completed | ✅ Partial | LAB 1-23 (LAB 1-5 ingestion, LAB 6-9 requirements/grain/source-model/star-schema, LAB 10 Unknown-member join, LAB 11 contract violation, LAB 12 stale-run detection, LAB 13 Bronze reconciliation, LAB 14 storage growth/idempotency, LAB 15 Parquet benchmark, LAB 16 partition pruning, LAB 17 file-layout report, LAB 18 watermark_start fix + metadata readers, LAB 19 PII report break/fix, LAB 20 coverage report + integration-test port break/fix, LAB 21 crash-sim + Parquet magic-bytes repro, LAB 22 query-performance/extraction-time benchmarks at a new scale, LAB 23 users full-load benchmark reproduction) | LAB 24+ |
 | README updated | ✅ Done | `README.md` | — |
