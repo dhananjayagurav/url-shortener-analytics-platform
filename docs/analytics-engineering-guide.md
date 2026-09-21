@@ -1627,9 +1627,10 @@ against).
 **LAB 10 — Prove the Unknown member resolves a real join, not just an
 insert.**
 
-*(Requires `make up` and `make create-analytics-schema` — DESIGN
-EXPECTATION, not yet executed in this sandbox; see Section 11's How to
-test for what genuinely was run.)*
+*(Requires `make up` and `make create-analytics-schema` — not runnable in
+this cloud sandbox, since it has no real Docker/MinIO (ADR-016). **ACTUAL
+OBSERVED — genuinely run**, on the user's own machine, where real Docker
+does work: see the real output below.)*
 
 ```sql
 -- dim_user has exactly one row (the Unknown member) before Phase 2 runs.
@@ -1647,6 +1648,42 @@ GROUP BY du.plan_type;
 -- that would have silently dropped this row entirely had user_key been
 -- NULL instead of -1.
 ```
+
+**ACTUAL OBSERVED result**, run for real via `make db-shell` (a real
+`psql` session against the real Postgres container):
+
+```
+analytics=# select user_key, user_id, plan_type, is_known from dim_user;
+ user_key | user_id | plan_type | is_known
+----------+---------+-----------+----------
+       -1 |      -1 | UNKNOWN   | f
+(1 row)
+
+analytics=# SELECT du.plan_type, COUNT(*) FROM (SELECT -1 AS user_key) AS simulated_anonymous_click INNER JOIN dim_user du ON du.user_key = simulated_anonymous_click.user_key GROUP BY du.plan_type;
+ plan_type | count
+-----------+-------
+ UNKNOWN   |     1
+(1 row)
+```
+
+Both real results match the predicted expectation exactly.
+
+**A real bug surfaced getting here, worth keeping as its own lesson**:
+`make create-analytics-schema` initially failed with
+`FATAL: role "urlshortener" does not exist`, even with a correct `.env`
+file already in place. Root cause: `make` never sources `.env` the way
+`docker compose` does — nothing in this repo's Makefile had ever loaded
+it — so `db-shell`/`create-analytics-schema`'s shell fallback
+(`$${POSTGRES_USER:-urlshortener}`, a stale default left over from an
+earlier project name) silently kicked in instead of the real, correct
+`analytics` user. Fixed by having the Makefile `include`/`export` `.env`
+when present, and by correcting the fallback default itself to
+`analytics` to match `.env.example` and `docker-compose.yml`. A small,
+concrete instance of a pattern worth remembering generally: a fallback
+default that silently activates is a real failure mode of its own,
+independent of whatever it was a fallback *for* — it can mask a
+misconfiguration (no `.env`) that would otherwise have failed loudly and
+obviously.
 
 What to observe: the second query is a stand-in for exactly what a BI
 tool's default `INNER JOIN` would do against a real `fact_clicks` row for
