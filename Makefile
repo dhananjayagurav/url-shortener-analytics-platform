@@ -1,5 +1,20 @@
 .PHONY: venv install install-transform up down logs ps db-shell ingest ingest-full create-analytics-schema validate-contracts check-stale-runs reconcile-bronze storage-stats benchmark-parquet benchmark-query-performance benchmark-extraction-time layout-report ingestion-history ingestion-summary pii-report test test-integration test-transform coverage lint fmt seed write-local-bronze-clicks write-local-bronze-clicks-incremental seed-more-clicks transform-silver-clicks
 
+# Load this repo's own .env (git-ignored; copy from .env.example) so every
+# recipe below sees real Postgres/MinIO credentials automatically. `make`
+# does NOT source .env on its own the way `docker compose` does -- this
+# was a real bug (found while running Section 11's Lab 10): without this
+# block, `make create-analytics-schema`/`make db-shell` silently fell
+# back to a wrong hardcoded default username ("urlshortener", left over
+# from an earlier project name) any time no shell in front of `make` had
+# already exported these variables by hand, producing a genuine
+# `FATAL: role "urlshortener" does not exist` error even with a correct
+# .env file sitting right there, unread.
+ifneq (,$(wildcard .env))
+include .env
+export
+endif
+
 venv:
 	python3.12 -m venv .venv
 	@echo "Activate with: source .venv/bin/activate"
@@ -26,7 +41,7 @@ ps:
 	docker compose ps
 
 db-shell:
-	docker compose exec postgres psql -U $${POSTGRES_USER:-urlshortener} -d $${POSTGRES_DB:-urlshortener}
+	docker compose exec postgres psql -U $${POSTGRES_USER:-analytics} -d $${POSTGRES_DB:-analytics}
 
 seed:
 	python scripts/seed_sample_data.py
@@ -42,7 +57,7 @@ ingest-full:
 create-analytics-schema:
 	@for f in sql/analytics/*.sql; do \
 		echo "applying $$f"; \
-		docker compose exec -T postgres psql -U $${POSTGRES_USER:-urlshortener} -d $${POSTGRES_DB:-urlshortener} -f - < $$f; \
+		docker compose exec -T postgres psql -U $${POSTGRES_USER:-analytics} -d $${POSTGRES_DB:-analytics} -f - < $$f; \
 	done
 
 validate-contracts:
