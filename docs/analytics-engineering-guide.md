@@ -2635,480 +2635,109 @@ made checkpoint recovery observable.
 
 ## 14. Full Load Ingestion ✅✅
 
-### 14.1 Concept
+###1. CONCEPT
 
-A full load re-extracts an entire source table on every run and writes the
-whole result as one snapshot — no matter what changed since the last run.
-It's the simplest ingestion pattern that can possibly work: the query is
-`SELECT * FROM table`.
+Full load ingestion means: on every run, read the entire source table and land it as one Bronze snapshot — no "what's new since last time" logic at all. It's the simplest possible ingestion strategy, and it's correct specifically for tables that are small and/or don't have a reliable "what changed" signal (no updated_at, or rows get hard-deleted, so an incremental id/timestamp filter would silently miss deletions).
 
-### Why does this exist?
+It matters because it's the baseline every other ingestion pattern gets compared against. Incremental load (next concept) exists purely to solve full load's two real costs: it re-reads and re-writes data that hasn't changed, and that cost grows linearly with table size forever. You can't evaluate when incremental load is worth its added complexity (watermarks, gap-detection, replay logic) without first understanding exactly what full load costs and where it breaks down.
 
-A full load is correct by construction (no watermark to get wrong, no row
-that can be silently missed) and is the fallback every more sophisticated
-pipeline eventually needs — when an incremental pipeline's state gets
-corrupted, the standard fix is "run a full load and rebuild from there."
-Small, slowly-changing tables (`users` here, at 200 rows) can legitimately
-stay on full load forever; re-extracting 200 rows every run costs nothing.
+###2. URL SHORTENER EXAMPLE
 
-### Simple Example
+Your urls and users tables are full-loaded (ingestion/configs/pipelines.yaml presumably sets load_type: full for them — worth confirming). Both are small (500 and 200 rows in your seeded sandbox) and, more importantly, urls rows get mutated in place — is_active flips, title can change — with no guaranteed updated_at column your contract commits to. A naive incremental "give me rows with id > last_seen_id" would never see those mutations at all. Re-reading the whole table every run is the honest way to guarantee Bronze reflects current state.
 
-Imagine backing up your entire phone's photo library to a hard drive every
-night, regardless of whether you took zero new photos or five hundred. The
-backup script doesn't try to figure out "what's new" — it just copies
-everything, every time. It's slow and wasteful once your library is huge,
-but it's also the version of "backup my photos" that's almost impossible
-to get wrong: there's no bookkeeping about what was already backed up, so
-there's no bookkeeping to get out of sync with reality.
+clicks, by contrast, is append-only and immutable (its contract says so explicitly), which is exactly the property that makes it safe to load incrementally instead — that's next concept's territory.
 
-### Design Decision
+###3. DESIGN
 
-Phase 1 uses full load for **all three** tables (`urls`, `users`,
-`clicks`), even though `clicks` is the one table that will eventually need
-to move to incremental load (Section 15, next). This is deliberate
-sequencing, not an oversight: implementing full load first, cleanly, for
-every table, gives every table a working baseline and gives the
-checkpoint/metadata layer (`metadata.py`) real, immediate use — before
-incremental load's extra complexity (watermarks, "what changed since
-last time") gets layered on top of it.
+Flow: cli.py's full-load command → loop over configured tables → run_full_load(engine, s3_client, bucket, pipeline_name, table_name) per table → inside that: metadata.start_run (checkpoint row, status=running) → extract_full (read) → write_bronze (write, deterministic key) → metadata.finish_run_success (checkpoint row, status=success, with the exact bronze_key written), with finish_run_failure + re-raise on any exception.
 
-### Alternatives
+Key decision worth calling out explicitly: the Bronze key is bronze/{table}/ingestion_date={date}/{table}.parquet — date only, no run id, no timestamp-to-the-second (object_store.build_bronze_key). That single design choice is what makes full load idempotent: run it three times today, you PUT to the same S3 key three times, and the object store just overwrites in place. No dedup logic needed anywhere downstream for "did this run happen twice today." Contrast with incremental load's key (watermark_start=/watermark_end=), which must vary per batch — you'll see why that's a harder idempotency problem next.
 
-1. **Skip full load, implement incremental load directly.** Possible, but
-   it means the *first* piece of ingestion code you write also has to get
-   watermark logic right, with no simpler baseline to fall back to if
-   something's wrong. Harder to debug, and skips the natural "build the
-   simple thing, prove it, then add complexity" progression this whole
-   project follows.
-2. **Full load for everything, forever (rejected for `clicks`).** Simple,
-   but doesn't scale — Section 15 explains exactly where this breaks down
-   for a table that grows without bound.
-3. **Full load now, incremental later, table by table (chosen).** Lets
-   each table's load strategy match its actual growth pattern, and lets
-   this guide teach both patterns clearly, one at a time, instead of
-   conflating them.
+Alternative rejected: a key with a run id or full timestamp (e.g. .../run_id=<uuid>/urls.parquet). That would make every run's output independently addressable/auditable, but it means Bronze accumulates a new full copy of urls every single day forever, and Silver's read layer (read_bronze_clicks, which you've already seen) would have to pick "the latest one" instead of just reading what's there — extra logic, for no benefit at this table's size and mutation pattern.
 
-### Trade-offs
+###4. IMPLEMENTATION
 
-| | Full load | Incremental load (Section 15) |
-|---|---|---|
-| Correctness | Simple — no watermark to get wrong | More moving parts — a wrong watermark can silently skip or duplicate rows |
-| Cost as table grows | Grows with total table size, forever | Roughly constant — grows with new rows since last run, not total size |
-| Right for | Small, slowly-changing tables (`users`, `urls` here) | Large, append-heavy tables (`clicks`, eventually) |
-
-### 14.2 Architecture
-
-```mermaid
-sequenceDiagram
-    participant CLI as cli.py
-    participant MD as metadata.py
-    participant EX as extract_full.py
-    participant PG as Postgres
-    participant OS as object_store.py
-    participant S3 as MinIO
-
-    CLI->>MD: start_run(pipeline, table, "full")
-    MD-->>CLI: run_id (status=running)
-    CLI->>EX: run_full_load(...)
-    EX->>PG: extract_full() -- pd.read_sql_table
-    PG-->>EX: DataFrame
-    EX->>OS: write_bronze(df, table, run_date)
-    OS->>S3: put_object (deterministic key)
-    S3-->>OS: 200 OK
-    OS-->>EX: bronze key
-    EX->>MD: finish_run_success(run_id, rows, ...)
-```
-
-On any failure between `start_run` and `finish_run_success`,
-`extract_full.run_full_load` catches the exception, calls
-`finish_run_failure` (so the run is never left `running` forever), and
-re-raises — see [Section 14.7](#147-failure-scenario).
-
-### 14.3 URL Shortener example
-
-This pipeline runs the same full-load logic against all three configured
-tables (`ingestion/configs/pipelines.yaml`): `urls` (real schema), `users`
-and `clicks` (hypothetical, per Section 1.5). Each table gets its own
-`ingestion_metadata` row per run and its own Bronze object.
-
-### 14.4 Implementation
-
-This component spans five files. Two are taught here in full depth
-(they're the ones with real design decisions in them); the other three get
-a shorter treatment here and their own deep-dive later, where their
-purpose becomes fully visible (`metadata.py` in Section 16 — Checkpointing;
-`cli.py`'s command surface grows in Section 15).
-
-**Implementation Guide vs. Reference Implementation, for this component:**
-if you want the hands-on version, read the *Implementation Guide*
-paragraph under each file below, close this guide, and write the function
-yourself against the same signature — then compare against the *Reference
-Implementation* code block. If you want to move faster and study the
-finished code instead, copy the reference code directly into the named
-path; it's exactly what's already committed in this repository.
-
----
-
-**CREATE:** `ingestion/src/url_shortener_analytics/extract_full.py`
-
-**PURPOSE:** Read an entire source table into memory and hand it off to be
-written to Bronze, while recording a checkpoint before and after.
-
-**DEPENDENCIES:** `pandas`, a SQLAlchemy `Engine` (from `db.py`), this
-package's `metadata` module (for checkpointing) and `object_store` module
-(for the actual write).
-
-**IMPLEMENTATION GUIDE (write it yourself):** you need two functions.
-The first, `extract_full(table_name, engine)`, should do exactly one
-thing: run `SELECT * FROM <table_name>` and return the result as a
-DataFrame — pandas' `pd.read_sql_table` does this in one call. Wrap it in
-a `try/except` that catches whatever the database driver raises and
-re-raises your own `ExtractionError` (see `exceptions.py`) with a message
-naming the table — this is what makes failures debuggable without needing
-to know pandas' or psycopg's specific exception types. The second
-function, `run_full_load(engine, s3_client, bucket, pipeline_name,
-table_name)`, is the orchestration: call `metadata.start_run(...)` first
-to get a `run_id`, then call your `extract_full`, then call
-`object_store.write_bronze(...)` to actually write it, then call
-`metadata.finish_run_success(...)`. Wrap the extract-and-write portion in
-a `try/except Exception` that calls `metadata.finish_run_failure(...)`
-and **re-raises** — the caller (eventually the CLI) needs to know this
-table failed, and the checkpoint must never be left silently `running`.
-
-**REFERENCE IMPLEMENTATION:**
+This is already fully built and running in your repo — nothing to add. Reference code, so you can trace it against what you already have:
 
 ```python
-# ingestion/src/url_shortener_analytics/extract_full.py  (excerpt — full file
-# is already committed at this path)
+# ingestion/src/url_shortener_analytics/extract_full.py
 
 def extract_full(table_name: str, engine: Engine) -> pd.DataFrame:
-    """POC SIMPLIFICATION: reads the whole table in one query. Production
-    equivalent: chunked/paged extraction with bounded memory."""
-    try:
-        df = pd.read_sql_table(table_name, engine)
-    except Exception as err:
-        raise ExtractionError(f"failed to extract table '{table_name}'") from err
+    df = pd.read_sql_table(table_name, engine)   # POC: whole table, one query
     return df
 
 
-def run_full_load(engine, s3_client, bucket, pipeline_name, table_name) -> dict:
+def run_full_load(engine, s3_client, bucket, pipeline_name, table_name) -> dict[str, object]:
     run_id = metadata.start_run(engine, pipeline_name, table_name, load_type="full")
     try:
         df = extract_full(table_name, engine)
-        key = write_bronze(df, table_name, datetime.now(UTC), s3_client, bucket)
-        metadata.finish_run_success(engine, run_id, rows_read=len(df), rows_written=len(df))
+        run_date = datetime.now(UTC)
+        key = write_bronze(df, table_name, run_date, s3_client, bucket)
+        metadata.finish_run_success(engine, run_id, rows_read=len(df), rows_written=len(df), bronze_key=key)
     except Exception as err:
         metadata.finish_run_failure(engine, run_id, str(err))
         raise
     return {"run_id": run_id, "table": table_name, "rows": len(df), "key": key}
-```
 
-Full file, with imports, logging and docstrings:
-[`ingestion/src/url_shortener_analytics/extract_full.py`](../ingestion/src/url_shortener_analytics/extract_full.py).
-
-**RUN:** `make ingest-full` (runs it for every table in `pipelines.yaml`)
-
-**VERIFY:** `docker compose exec postgres psql -U analytics -d analytics -c "SELECT source_table, status, rows_written FROM ingestion_metadata ORDER BY started_at DESC LIMIT 5;"`
-
-**EXPECTED:** three rows, one per table, each `status = success` with
-`rows_written` matching what `make seed` inserted (500 / 200 / 5000 by
-default). *(DESIGN EXPECTATION — run it yourself for the ACTUAL OBSERVED
-numbers on your machine.)*
-
-**TEST:** `ingestion/tests/unit/test_extract_full.py` —
-`make test` runs it (part of the 15 unit tests, all currently passing).
-
-**PRODUCTION CONSIDERATIONS:** see the table in Section 14.8 below.
-
-**INTERVIEW QUESTIONS:** see Section 14.9 below (both questions there are
-specifically about this file).
-
----
-
-**CREATE:** `ingestion/src/url_shortener_analytics/object_store.py`
-
-**PURPOSE:** Serialize a DataFrame to Parquet and write it to a
-deterministic, idempotent key in MinIO/S3. This file is where the
-idempotency guarantee this whole section leans on actually lives.
-
-**DEPENDENCIES:** `boto3` (the AWS/S3 SDK — MinIO speaks the same API),
-`pyarrow` (Parquet read/write).
-
-**IMPLEMENTATION GUIDE (write it yourself):** start with the function that
-matters most conceptually: `build_bronze_key(table_name, run_date) ->
-str`. It should return a string of the shape
-`bronze/{table}/ingestion_date={date}/{table}.parquet` — using only the
-*calendar date* portion of `run_date`, not the time. Stop and think about
-*why* before moving on: if you included the exact timestamp instead of
-just the date, what would break? (Answer, once you've thought about it:
-every rerun on the same day would produce a *different* key, so reruns
-would pile up as duplicate objects instead of overwriting — which is
-exactly the idempotency property Section 14's Hands-on Exercise proves.)
-Then write `write_bronze(df, table_name, run_date, s3_client, bucket)`:
-serialize `df` to Parquet bytes in memory (`pyarrow.Table.from_pandas`
-then `pyarrow.parquet.write_table` into an `io.BytesIO()` buffer), call
-`s3_client.put_object(Bucket=..., Key=build_bronze_key(...), Body=...)`,
-and return the key. Wrap the `put_object` call in a small retry loop
-(2-3 attempts, short backoff) — S3-compatible APIs do occasionally return
-transient errors, and because the key is deterministic, retrying a write
-is always safe.
-
-**REFERENCE IMPLEMENTATION:**
-
-```python
-# ingestion/src/url_shortener_analytics/object_store.py (excerpt)
+# ingestion/src/url_shortener_analytics/object_store.py
 
 def build_bronze_key(table_name: str, run_date: datetime) -> str:
     return f"bronze/{table_name}/ingestion_date={run_date:%Y-%m-%d}/{table_name}.parquet"
-
-
-def write_bronze(df, table_name, run_date, s3_client, bucket, *, max_attempts=3, backoff_seconds=1.0) -> str:
-    key = build_bronze_key(table_name, run_date)
-    body = _dataframe_to_parquet_bytes(df)
-    for attempt in range(1, max_attempts + 1):
-        try:
-            s3_client.put_object(Bucket=bucket, Key=key, Body=body)
-            return key
-        except (ClientError, BotoCoreError) as err:
-            if attempt == max_attempts:
-                raise ObjectStoreWriteError(f"failed after {max_attempts} attempts") from err
-            time.sleep(backoff_seconds * attempt)
 ```
 
-Full file: [`ingestion/src/url_shortener_analytics/object_store.py`](../ingestion/src/url_shortener_analytics/object_store.py).
+###5. CODE WALKTHROUGH
 
-**RUN:** exercised indirectly via `make ingest-full` — there's no
-standalone CLI for this file alone (by design; it's a library module, not
-an entrypoint).
+extract_full is deliberately pure — no S3, no metadata table, just SQL in, DataFrame out. That's why run_silver_clicks_job's split into clean_clicks/deduplicate_clicks (pure) vs the job wrapper (I/O) — which you already built in Section 40 — feels familiar: this is the same pattern, established first here, one layer down the pipeline.
 
-**VERIFY:** open `http://localhost:9001` (MinIO console), browse to
-`analytics-lake/bronze/urls/`, confirm one `.parquet` object exists per
-`ingestion_date=` prefix.
+run_full_load's try/except is the checkpoint contract in miniature: a run is always recorded as either success or failed — never left running — because get_last_watermark and (once you get to Section 16-equivalent) find_stale_running_runs both depend on running meaning "still actually in flight, or crashed." If an exception here weren't caught and re-recorded, a crashed run would sit as running forever and nothing downstream could tell "still going" from "died."
 
-**EXPECTED:** one object per table per calendar day, regardless of how
-many times you've run `make ingest-full` today.
+The bronze_key gets stored on the success row (finish_run_success(..., bronze_key=key)) rather than recomputed later from table_name + started_at — you can see in metadata.py's docstring this was a deliberate choice (Section 17.3 in the guide), because recomputing it later means duplicating build_bronze_key's exact date-formatting logic in a second place, and any drift between the two becomes a silent bug.
 
-**TEST:** `ingestion/tests/unit/test_object_store.py` — 5 tests, covering
-key determinism, the actual `put_object` call shape, and both the retry
-and give-up-and-raise paths (using a mocked S3 client with a scripted
-`side_effect`, not a real network call).
+###6. RUN
 
-**PRODUCTION CONSIDERATIONS:** see Section 14.8.
-
-**INTERVIEW QUESTIONS:** the first question in Section 14.9 is about this
-exact file.
-
----
-
-**Supporting files** (shorter treatment — full teaching lands with their
-own sections):
-
-| File | Purpose | Deep-dive lands in |
-|---|---|---|
-| [`metadata.py`](../ingestion/src/url_shortener_analytics/metadata.py) | Watermark / checkpoint / run history reads and writes | Section 16 (Checkpointing) |
-| [`config.py`](../ingestion/src/url_shortener_analytics/config.py) | Environment-variable-driven settings (`pydantic-settings`) | Referenced throughout; no dedicated section — it's a standard pattern, not a novel concept |
-| [`db.py`](../ingestion/src/url_shortener_analytics/db.py) | Builds and caches the SQLAlchemy `Engine` | Same as above |
-| [`cli.py`](../ingestion/src/url_shortener_analytics/cli.py) | `python -m url_shortener_analytics.cli full-load` entrypoint; wires config → engine → S3 client → `run_full_load` per table | Grows a second subcommand in Section 15 |
-| [`pipelines.yaml`](../ingestion/configs/pipelines.yaml) | Which tables, which load type — config, not code | [Architectural Principle #8](#28-architectural-principles), Metadata-driven processing |
-
-### Hands-on Challenge (implement-yourself)
-
-Before reading LAB 1 below, try this: **without looking at
-`object_store.py`, write your own version of `build_bronze_key` that
-partitions by *hour* instead of by day** (`ingestion_hour=2026-09-19-14`
-instead of `ingestion_date=2026-09-19`). Then answer, in your own words:
-what would change about LAB 4/5's idempotency proof below if you made this
-change and ran `make ingest-full` twice within the same hour versus twice
-across an hour boundary? (You don't need to actually wire your version
-into the pipeline — this is a design-reasoning exercise. The real answer:
-idempotency would still hold *within* an hour, but a full load that
-happens to straddle an hour boundary would now produce two Bronze objects
-for what's conceptually "one day" of data — a preview of exactly the
-partition-granularity trade-off Section 20, Partitioning, covers in full.)
-
-### 14.5 Hands-on Exercise
-
-**LAB 1 — Run a full load.**
-
-Prerequisites: `make up` has been run and `docker compose ps` shows
-`postgres` and `minio` healthy; `make seed` has been run at least once.
-
-```bash
 make ingest-full
-```
 
-Expected output (key=value structured log lines — see
-`ingestion/src/url_shortener_analytics/logging_setup.py`):
+which resolves to python -m url_shortener_analytics.cli full-load. Expected structured log lines, per table, from what you've already genuinely run in this sandbox (real numbers, your seeded baseline):
 
-```
-ts=... level=INFO logger=url_shortener_analytics.cli msg="starting full load" pipeline='url_shortener_bronze_ingestion' tables=['urls', 'users', 'clicks']
-ts=... level=INFO logger=url_shortener_analytics.extract_full msg="extracting table (full load)" table='urls'
-ts=... level=INFO logger=url_shortener_analytics.extract_full msg="extraction complete" table='urls' rows=500 columns=8
-ts=... level=INFO logger=url_shortener_analytics.object_store msg="wrote bronze object" key='bronze/urls/ingestion_date=2026-09-19/urls.parquet' bytes=... rows=500 attempt=1
-...
-ts=... level=INFO logger=url_shortener_analytics.cli msg="full load finished successfully"
-```
+{"event": "ingestion run started", "run_id": "<uuid>", "source_table": "urls", "load_type": "full"}
+{"event": "extracting table (full load)", "table": "urls"}
+{"event": "extraction complete", "table": "urls", "rows": 500, "columns": <N>}
+{"event": "wrote bronze object", "key": "bronze/urls/ingestion_date=2026-09-24/urls.parquet", "bytes": <N>, "rows": 500, "attempt": 1}
+{"event": "ingestion run succeeded", "run_id": "<uuid>", "rows_written": 500, "bronze_key": "bronze/urls/ingestion_date=2026-09-24/urls.parquet"}
+{"event": "table done", "run_id": "<uuid>", "table": "urls", "rows": 500, "key": "bronze/urls/..."}
 
-*(Exact row counts and byte sizes are a DESIGN EXPECTATION based on
-`scripts/seed_sample_data.py`'s fixed seed — run the command yourself to
-see the ACTUAL OBSERVED values on your machine; nothing above was
-fabricated as a claimed real run.)*
+...same shape for users (rows: 200). This part is DESIGN EXPECTATION for today's exact date/uuid — the row counts and key format are ACTUAL OBSERVED from your prior real runs (Section 14/LAB 1 in your guide).
 
-Inspect what landed in MinIO: open `http://localhost:9001`, browse to the
-`analytics-lake` bucket, and confirm `bronze/urls/`, `bronze/users/`,
-`bronze/clicks/` each contain one `.parquet` object.
+###7. EXPERIMENT
 
-**LAB 4/5 (compressed into one exercise here — full depth lands in the
-dedicated Idempotency section) — prove reruns are safe.**
+Run make ingest-full twice in a row, then check the object store:
 
-```bash
-make ingest-full
-make ingest-full   # run it again immediately
-```
+python -m url_shortener_analytics.cli storage-stats --prefix bronze/urls/
 
-What to observe: both runs report success; the object at
-`bronze/urls/ingestion_date=<today>/urls.parquet` is overwritten, not
-duplicated (confirmed by `ingestion/tests/integration/test_full_load_integration.py::test_rerunning_full_load_overwrites_not_duplicates`,
-which asserts `KeyCount == 1` after two runs). Why this matters: retries
-after a crash are the normal recovery path for any batch pipeline — if
-reruns produced duplicates, every crash-and-retry would corrupt downstream
-counts.
+Expected: object_count for urls stays at 1 after both runs, not 2 — that's the idempotency claim from Section 3 made concrete. Now try a failure scenario: kill the process (Ctrl+C) mid-way through the second run, after start_run has inserted its running row but before finish_run_success runs. Then:
 
-### 14.6 How to test
+python -m url_shortener_analytics.cli ingestion-history --table urls --limit 5
 
-```bash
-make test                # unit tests: SQLite + mocked S3, no Docker needed. Currently: 15 passed.
-make up
-make test-integration     # real Postgres + MinIO
-```
+You'll see one success row (from run 1) and one running row stuck forever (from the killed run 2) — this is exactly the "stale running run" problem find_stale_running_runs exists to detect, which you'll hit properly when we get to Checkpoints. Worth seeing now so the motivation for that concept isn't abstract.
 
-The 15 unit tests above were run in this environment while writing this
-guide (Python 3.11, `pytest -q`) and genuinely passed — this is an ACTUAL
-OBSERVED result, not a projection:
+###8. PRODUCTION VIEW
 
-```
-15 passed in 3.72s
-```
+At your current scale (500/200 rows) pd.read_sql_table's "whole table in memory, one query" is free. At real scale it's the single biggest thing that breaks: a 200M-row table full-loaded this way either OOMs the extraction process or holds a long table-scan transaction open against a live OLTP database for however long the read takes — actively harmful to the production database it's reading from, not just slow. Real fix is chunked/paginated extraction (LIMIT/OFFSET or a keyset cursor), writing each chunk as its own Parquet part-file rather than one giant DataFrame.
 
-### 14.7 Failure Scenario
+Cost-wise, full load's defining trait is that its S3 PUT cost and compute cost are both O(table size) on every single run, forever — regardless of how much actually changed. That's the concrete number you'd put in front of a full-load-vs-incremental decision: "this table is N rows, growing at R rows/day, full-loading it costs $X/month in read+write, here's what incremental would cost instead."
 
-**What happens if the process is killed between a successful `write_bronze`
-call and the `finish_run_success` checkpoint update?**
+###9. PRINCIPAL ENGINEER VIEW
 
-The Bronze object for that run now exists in MinIO, but `ingestion_metadata`
-still shows `status = 'running'` for that run — not `success`, and not
-`failed` either, because nothing ever got the chance to update it.
-`get_last_watermark` only reads `status = 'success'` rows (see
-`metadata.py`), so a stuck `running` row is simply ignored by future
-watermark reads — it doesn't corrupt anything for full load specifically
-(there's no watermark to protect here), but it does mean the run's own
-history is permanently ambiguous: did it actually finish? The honest
-answer, visible from the data alone, is "we don't know — the process died
-before it could tell us." **Production implication:** an orchestrator (not
-yet part of Phase 1) should alert on any `ingestion_metadata` row that's
-been `running` for longer than the pipeline's expected max runtime, and
-treat it as a crash requiring investigation, not as still-in-progress.
+An interviewer asking "when would you full-load vs incrementally load a table" is really testing whether you reach for incremental load reflexively (many candidates do, because it "sounds more sophisticated") or whether you can name the actual precondition: a reliable append-only or monotonically-increasing change signal. No such signal → full load is correct, not a fallback. This table's urls (mutable, no updated_at) is a textbook case of that decision being correct as-is.
 
-### 14.8 Production Considerations
+The key-determinism point (date-only key, no run id) is worth having ready as an idempotency example that isn't "add a dedup step" — it's "make the write itself naturally overwrite instead of accumulate." Idempotency-by-construction (the write target is deterministic) versus idempotency-by-cleanup (write and then dedup) is a real, recurring design fork, and this table is a case of choosing the first.
 
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Extraction | Whole table, one query, one DataFrame (`pd.read_sql_table`) | Chunked/paged extraction with bounded memory — see the docstring in `extract_full.py` |
-| Credentials | Static MinIO access/secret keys from `.env` | Short-lived credentials from an IAM role / workload identity |
-| Retry | 3 attempts, linear backoff, in-process (`object_store.write_bronze`) | Same idea, plus orchestrator-level retry/alerting across whole run failures |
-| Crash recovery | Manual rerun (safe, because writes are idempotent) | Orchestrator-driven automatic retry with backoff and paging on repeated failure |
-| OLTP instance | This repo's own standalone Postgres mirror (ADR-009) | Reads from the real application's read replica, never the primary |
+###10. REMEMBER
 
-### Principal Data Engineer Perspective
-
-The interesting judgment call in this component isn't the happy path —
-it's what a principal engineer would flag in review about the *unhappy*
-path. Two things stand out here. First: `run_full_load` catches
-*every* exception during extract-and-write, records it, and re-raises —
-which means one table's `ExtractionError` doesn't corrupt another table's
-run (see `cli.py`'s loop, which continues to the next table after logging
-a failure), but it also means a systemic problem (e.g. the OLTP database
-itself being down) gets logged three separate times, once per table,
-instead of failing fast after the first failure. That's a real, debatable
-trade-off — "fail isolated" versus "fail fast" — worth being able to
-articulate rather than presenting as an obviously-correct default. Second:
-the retry logic in `write_bronze` retries *blindly*, without checking
-*why* the write failed — appropriate here because every retry is
-idempotent, but it's exactly the kind of blind retry that becomes
-dangerous the moment an operation *isn't* idempotent, which is precisely
-why Section 17 (Idempotency) treats this property as a prerequisite for
-safe retries, not an independent nice-to-have.
-
-### 14.9 Principal Engineer Interview Questions
-
-**Q: "Walk through exactly what makes `write_bronze` safe to call twice for
-the same table on the same day."**
-
-*What's tested:* whether the candidate can explain idempotency as a
-concrete mechanism, not just define the word.
-
-*What a weak answer looks like:* "It's idempotent because we designed it
-to be" — true but circular; doesn't explain the mechanism.
-
-*What a strong answer covers:* the S3 key returned by `build_bronze_key`
-depends only on `table_name` and the calendar date, not on a run id or
-exact timestamp — so two calls for the same table on the same day compute
-the identical key. `s3_client.put_object` on both S3 and MinIO fully
-replaces whatever object previously existed at that key; it's not an
-append and not a partial write. So the second call's `PUT` simply
-overwrites the first call's bytes with (in this case, identical) new
-bytes — the *object storage system's own atomic-overwrite behavior* is
-what `write_bronze` leans on, not any locking or deduplication logic built
-into this codebase.
-
-*Concepts:* idempotent-by-overwrite vs. idempotent-by-dedup, atomic PUT
-semantics in object storage.
-
-*Expected follow-up:* "What would break this guarantee?" — Including a
-random UUID or a sub-day timestamp in the key; then every rerun would
-produce a new object instead of overwriting.
-
-*Common mistake:* describing this as "we check if the file exists first
-and skip if it does" — that's not what happens, and that approach would
-be wrong anyway (it would prevent legitimately re-extracting a table
-whose data changed since the last run today).
-
-**Q: "This pipeline currently reads `pd.read_sql_table` — the whole table,
-every run. At what point does that become a real production problem, and
-what's the first thing that actually breaks?"**
-
-*What's tested:* whether the candidate can name a concrete failure mode
-instead of a vague "it won't scale."
-
-*What a weak answer looks like:* "At some point there'll be too many rows
-and it'll be slow" — not wrong, but doesn't identify a mechanism, and
-would prompt an interviewer to keep digging.
-
-*What a strong answer covers:* the practical limit isn't a specific row
-count in the abstract — it's whatever this process's available memory can
-hold as both the raw query result set and the in-memory pandas DataFrame
-simultaneously (pandas typically uses several times the raw on-disk size
-once you account for Python object overhead on non-numeric columns).
-Before that, though, the `SELECT *` itself holds a long-running read
-against the OLTP database — on a real production `clicks` table, that
-scan competing with live write traffic is often the first practical
-problem, ahead of the client process actually running out of memory. The
-fix precedes the memory limit: chunked, bounded extraction (see the
-POC-simplification note in `extract_full.py`'s docstring).
-
-*Concepts:* memory-bounded processing, long-running scans vs. OLTP write
-concurrency.
-
-*Expected follow-up:* "Why not just add `.limit()` in a loop?" — That's
-exactly chunked extraction; the follow-up worth raising unprompted is how
-to keep each chunk's boundary stable while the table is being concurrently
-written to, which is precisely the watermark problem Section 15 exists to
-solve properly for the incremental case.
-
-*Common mistake:* answering purely in terms of "at N million rows it gets
-slow" without naming *what* becomes slow or fails first.
-
----
+Full load = read everything, every run. Correct precondition: table is small, or mutable with no reliable change signal, or can be hard-deleted.
+Idempotency here comes from the key, not from logic: same table + same date = same S3 key = safe overwrite. No dedup step required.
+running → success/failed is a hard invariant. A run that dies must never stay running — that's what makes watermark/checkpoint reads trustworthy later.
+Full load's cost is O(table size) every run, forever — that's the exact cost incremental load exists to eliminate, not a stylistic alternative to it.
 
 ## 15. Incremental Load & Watermarks ✅✅
 
