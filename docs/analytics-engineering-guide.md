@@ -2979,300 +2979,36 @@ Closing an operational gap by querying data you're already durably recording (be
 
 ## 17. Idempotency ✅✅
 
-### 17.1 Concept
+### 1. CONCEPT
 
-An operation is **idempotent** if running it more than once, with the same
-inputs, produces the same result as running it exactly once — no
-duplicates, no double-counting, nothing left in a different state than a
-single successful run would have left it in. Sections 14 and 15 already
-built this: `build_bronze_key`/`build_bronze_incremental_key` compute a
-*deterministic* Bronze object key from a run's own inputs, so a rerun
-overwrites the same object rather than writing a new one. This section is
-the dedicated treatment of what idempotency is actually protecting against
-and, critically, two things it does *not* automatically guarantee on its
-own: (1) that the control plane's own record of what was written
-(`ingestion_metadata`) stays in sync with what's actually in Bronze, and
-(2) full coverage of every retry scenario — Section 15.7 already documents
-one residual edge case where idempotency's guarantee narrows. This
-section adds the `bronze_key` column and `reconciliation.py`, which
-together close the "does the record match reality" half of the gap.
+An operation is idempotent if running it more than once, with the same inputs, leaves things in exactly the same state as running it once. You already have this: build_bronze_key/build_bronze_incremental_key are deterministic, so a retry's put_object overwrites cleanly instead of duplicating. That's the "writes are safe to retry" half.
 
-### Why does this exist?
+What's new: idempotent writes alone don't guarantee the system as a whole never drifts. A manually uploaded object, an object deleted by something outside the pipeline, or a retried run whose key genuinely doesn't collide with the original (a real residual edge case from Section 15.7) — none of these are caught by "the write itself is safe to repeat." You need a separate check that compares what the control plane (ingestion_metadata) believes it wrote against what's actually sitting in the bucket. That check is reconciliation, and it's the actual new content in this concept.
 
-Retries are unavoidable in any real pipeline — a network blip, a
-transient MinIO error, an orchestrator retrying a failed task
-automatically. Without idempotency, every retry risks corrupting the
-result it's supposed to be fixing: a non-idempotent write on retry either
-duplicates data (two Bronze objects for what should be one run's output)
-or, worse, silently does the wrong thing depending on what state the
-first, failed attempt left behind. Idempotency turns "is it safe to just
-retry this?" from a case-by-case judgment call into a property that's true
-by construction, for every retry, without an operator needing to reason
-about exactly where the previous attempt failed.
+### 2. URL SHORTENER EXAMPLE
 
-But idempotent *writes* alone don't guarantee the *system as a whole*
-never drifts — a manually uploaded object, a retried run that (per Section
-15.7) lands a non-overlapping duplicate, or an object deleted by something
-outside this pipeline entirely, can each cause `ingestion_metadata` and
-the real contents of the Bronze bucket to disagree with each other, even
-though every individual write was idempotent. Reconciliation — this
-section's second new piece — is the check that catches *that* kind of
-drift, which idempotent writes alone were never designed to catch.
+build_bronze_key("clicks", run_date) returns the same string every time today — you've already verified this by hand. What you haven't seen: since this increment, finish_run_success also records that exact key on the ingestion_metadata row itself (bronze_key column). So the control plane doesn't just idempotently write the object — it durably remembers what it wrote. That memory is the input reconciliation needs.
 
-### Simple Example (generic, pre-URL-Shortener)
+### 3. DESIGN
 
-A generic "safe retry" example: an API endpoint that creates an order.
-`POST /orders` with no idempotency key: retrying a request that actually
-succeeded, but whose response was lost to a network error, creates a
-*second* order — a real, costly bug (the customer gets charged twice).
-The fix: the client sends a client-generated `idempotency_key` with every
-request; the server checks "have I already processed this exact key?"
-before creating anything, and if so, returns the *original* result instead
-of creating a duplicate. The deterministic Bronze key in this repo plays
-exactly the `idempotency_key`'s role — except here, the key is derived
-from the request's own content (`table_name`, date or watermark range)
-rather than being a separately generated token, because this pipeline's
-retries are always exact reruns of the same logical unit of work, not
-independent client requests that happen to repeat.
+Two independent mechanisms, checked at different times, for different failure classes:
 
-### URL Shortener Example
+Idempotent writes (already built) — make a single run's own retry safe.
+Reconciliation (new) — detects drift from anything else: a manual upload, an out-of-band deletion, a non-overlapping duplicate from a retry.
 
-`build_bronze_key("clicks", run_date)` returns
-`bronze/clicks/ingestion_date=2026-09-19/clicks.parquet` — the exact same
-string no matter how many times `make ingest-full` runs today. A retry
-after a transient MinIO error, or a deliberate manual rerun, calls
-`put_object` with that same key again; S3-compatible object storage
-treats a `PUT` to an existing key as a plain overwrite, so the *object
-itself* is exactly as if only the last successful write had ever
-happened. What's new in *this* section: since this increment,
-`finish_run_success` also records that exact key on the `ingestion_metadata`
-row (`bronze_key` column, `sql/source/003_ingestion_metadata.sql`) — so
-the control plane doesn't just idempotently *write* the object, it also
-durably *remembers* what it wrote, which is the piece reconciliation
-depends on.
+reconcile_bronze(engine, s3_client, bucket, pipeline_name) does two set comparisons:
 
-### 17.2 Architecture
+list_bronze_keys (what's really in the bucket) minus list_successful_bronze_keys (what ingestion_metadata says was written) = orphaned — data nobody accounted for.
+list_successful_bronze_keys minus what actually head_objects successfully = missing — a promise that wasn't kept.
 
-```
- run_full_load() / run_incremental_load()
-        │
-        ├─▶ key = build_bronze_key(...) / build_bronze_incremental_key(...)
-        │        (deterministic -- same inputs, same key, every time)
-        │
-        ├─▶ s3_client.put_object(Key=key, ...)     ──▶  Bronze (MinIO/S3)
-        │        (overwrite-safe: a retry with the same key clobbers
-        │         cleanly instead of duplicating)
-        │
-        └─▶ metadata.finish_run_success(..., bronze_key=key)
-                 (NEW this increment -- durably records the key on the
-                  ingestion_metadata row itself, not just written to
-                  Bronze and then "trusted" to have happened)
+Key decision: store bronze_key explicitly on the row, don't recompute it later. The alternative — recompute the expected key on demand from source_table/started_at/watermarks, reusing build_bronze_key — needs no new column and looks cheaper. It breaks the moment the key-building logic itself ever changes (a different date format, say): every historical row would silently get the wrong expected key computed for it, and reconciliation would report false drift for data that's actually fine. Storing the key explicitly means "what actually happened" is what gets compared, always — a strictly more robust invariant for one new nullable column's cost. Nullable specifically because a no-op incremental run (Section 15's empty-batch case) succeeds but writes nothing — bronze_key is NULL for that row, and list_successful_bronze_keys filters WHERE bronze_key IS NOT NULL so a legitimate no-op is never mistaken for "should exist but doesn't."
 
- reconciliation.reconcile_bronze(engine, s3_client, bucket, pipeline_name)
-        │
-        ├─▶ actual  = object_store.list_bronze_keys(s3_client, bucket)
-        │              (what's REALLY in the bucket right now)
-        │
-        ├─▶ known   = metadata.list_successful_bronze_keys(engine, ...)
-        │              (what ingestion_metadata BELIEVES was written)
-        │
-        ├─▶ orphaned = actual - known   (exists, nobody recorded writing it)
-        └─▶ missing  = known - actual   (recorded as written, doesn't exist)
-```
+### 4. IMPLEMENTATION
 
-Idempotent writes (the top block) and reconciliation (the bottom block)
-are deliberately separate mechanisms, checked at different times, for
-different failure classes: the top block makes a *single run's own retry*
-safe; the bottom block detects drift that accumulates from *anything
-else* — a manual object upload, an out-of-band deletion, or the Section
-15.7 edge case where two runs' outputs legitimately don't collide but one
-of them still didn't get recorded correctly.
-
-### 17.3 Design Decision: store the Bronze key explicitly, don't recompute it
-
-**Context:** reconciliation needs to know, for every successful run, what
-key it wrote to Bronze — but `ingestion_metadata` never stored this before
-this increment. **Decision:** add a `bronze_key` column, set explicitly by
-`finish_run_success(..., bronze_key=key)` at the moment a run succeeds.
-**Alternatives considered:** recompute the expected key later, on demand,
-from `source_table`, `started_at` (for a full load — reusing
-`build_bronze_key`'s date-only granularity) and `watermark_start`/
-`watermark_end` (for an incremental load — reusing
-`build_bronze_incremental_key`). **Trade-offs:** recomputation needs no
-new column and would work *today* — but it depends on the exact key-building
-logic never changing behavior for historical rows (`build_bronze_key`
-already changing its date-formatting convention, for instance, would
-silently break reconciliation for every run recorded before the change),
-and would additionally require persisting `watermark_start` too, which
-`ingestion_metadata` also didn't store *at the time this decision was
-made* — so "cheaper, no new column" wasn't actually true once traced
-through fully. (`watermark_start` has since been fixed to persist
-correctly, as of Section 22 — but that came two increments later, and
-doesn't retroactively change which trade-off was correct to make *here*,
-at the time this decision was recorded.) Storing the key explicitly
-instead means "what actually
-happened" is what's compared, always, regardless of how the key-building
-functions evolve later — a strictly more robust invariant, at the cost of
-one new nullable column. **Consequences:** `bronze_key` is `NULL` for a
-run that succeeded but wrote nothing (the no-op incremental path — see
-Section 15's empty-batch handling) — `list_successful_bronze_keys`
-explicitly filters `WHERE bronze_key IS NOT NULL`, so a no-op success is
-correctly never treated as "should exist in Bronze but doesn't."
-
-### Alternatives
-
-Covered above. A third, more minor alternative also considered and
-rejected: making `bronze_key` a required (`NOT NULL`) column with a
-sentinel value for no-op runs, instead of a genuinely nullable one —
-rejected because a sentinel string is a magic value a future reader has to
-learn the meaning of, where SQL `NULL` already means exactly "no value" by
-construction, and `list_successful_bronze_keys`'s `IS NOT NULL` filter
-reads as self-explanatory.
-
-### Trade-offs
-
-| | Store explicitly (chosen) | Recompute on demand |
-|---|---|---|
-| Correctness if key-building logic changes later | Unaffected — every row remembers its own actual key | Silently wrong for every historical row once the logic changes |
-| Schema cost | One new nullable column | None |
-| Needs `watermark_start` persisted too | No | Yes, for incremental runs (also not previously stored) |
-| Conceptual model | "What actually happened" | "What should have happened, assuming today's logic always applied" |
-
-### 17.4 Implementation
-
----
-
-**CREATE:** (edit) `sql/source/003_ingestion_metadata.sql`,
-`ingestion/src/url_shortener_analytics/metadata.py` — `bronze_key` column
-and its plumbing
-
-**PURPOSE:** Durably record the exact object key a successful run wrote,
-so reconciliation has a real, per-run source of truth to compare storage
-against.
-
-**DEPENDENCIES:** none new.
-
-**IMPLEMENTATION GUIDE (write it yourself):** add `bronze_key VARCHAR(512)`
-to `ingestion_metadata`'s `CREATE TABLE` — and, since this table may
-already exist in a running dev database from an earlier increment (this
-sandbox's own local Postgres included), also add an idempotent-safe
-`ALTER TABLE ingestion_metadata ADD COLUMN IF NOT EXISTS bronze_key
-VARCHAR(512);` right after it (a fresh `docker compose up` picks up the
-`CREATE TABLE` version automatically; an already-running database needs
-the `ALTER TABLE` instead, since `docker-entrypoint-initdb.d` scripts only
-ever run once, on first container init). Then thread a new optional
-`bronze_key: str | None = None` keyword argument through
-`finish_run_success`, add it to the `UPDATE ... SET` statement, and update
-both `run_full_load` and `run_incremental_load`'s *successful, non-empty*
-call sites to pass `bronze_key=key`. Leave the no-op incremental path's
-call (`rows_read=0, rows_written=0`) unchanged — it must default to
-`None`, since nothing was written.
-
-**REFERENCE IMPLEMENTATION:**
+New file, real and already in your repo:
 
 ```python
-# ingestion/src/url_shortener_analytics/metadata.py (excerpt)
-
-def finish_run_success(
-    engine: Engine, run_id: str, *, rows_read: int, rows_written: int,
-    watermark_end: int | None = None, bronze_key: str | None = None,
-) -> None:
-    with engine.begin() as conn:
-        conn.execute(text("""
-            UPDATE ingestion_metadata
-            SET status = 'success', rows_read = :rows_read, rows_written = :rows_written,
-                watermark_end = :watermark_end, bronze_key = :bronze_key, completed_at = :completed_at
-            WHERE run_id = :run_id
-        """), {"run_id": run_id, "rows_read": rows_read, "rows_written": rows_written,
-                "watermark_end": watermark_end, "bronze_key": bronze_key,
-                "completed_at": datetime.now(UTC)})
-```
-
-```sql
--- sql/source/003_ingestion_metadata.sql (excerpt)
-ALTER TABLE ingestion_metadata ADD COLUMN IF NOT EXISTS bronze_key VARCHAR(512);
-```
-
-Full files: [`metadata.py`](../ingestion/src/url_shortener_analytics/metadata.py),
-[`003_ingestion_metadata.sql`](../sql/source/003_ingestion_metadata.sql),
-[`extract_full.py`](../ingestion/src/url_shortener_analytics/extract_full.py),
-[`extract_incremental.py`](../ingestion/src/url_shortener_analytics/extract_incremental.py).
-
-**RUN:** `make ingest-full` or `make ingest`, then inspect the row it
-created.
-
-**VERIFY:** `psql "$DATABASE_URL" -c "SELECT source_table, status,
-bronze_key FROM ingestion_metadata ORDER BY started_at DESC LIMIT 5;"`
-
-**EXPECTED:** every `status='success'` row for a *non-empty* run has a
-non-`NULL` `bronze_key` matching the object actually written; a no-op
-incremental success has `bronze_key IS NULL`.
-
-**TEST:** `test_metadata.py` (bronze-key persistence and its `NULL`
-default), `test_extract_full.py`/`test_extract_incremental.py` (bronze-key
-recorded end-to-end, including staying `NULL` on the no-op path).
-
----
-
-**CREATE:** (edit) `ingestion/src/url_shortener_analytics/object_store.py`
-— `list_bronze_keys`
-
-**PURPOSE:** The object store's own, independent view of what actually
-exists — the other half of what reconciliation compares.
-
-**IMPLEMENTATION GUIDE (write it yourself):** one call to
-`s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)`, returning
-`[obj["Key"] for obj in response.get("Contents", [])]` — use `.get(...,
-[])` rather than indexing `["Contents"]` directly, since an empty
-prefix/bucket omits the `"Contents"` key from the response entirely rather
-than returning it as an empty list.
-
-**REFERENCE IMPLEMENTATION:**
-
-```python
-# ingestion/src/url_shortener_analytics/object_store.py (excerpt)
-
-def list_bronze_keys(s3_client: BaseClient, bucket: str, prefix: str = "bronze/") -> list[str]:
-    """POC SIMPLIFICATION: a single list_objects_v2 call, capped at 1,000
-    keys (S3's per-call limit) -- no pagination. Production equivalent:
-    paginate with s3_client.get_paginator("list_objects_v2")."""
-    response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
-    return [obj["Key"] for obj in response.get("Contents", [])]
-```
-
-**TEST:** `test_object_store.py` — two new tests (keys returned correctly;
-empty-prefix case returns `[]` rather than raising a `KeyError`).
-
----
-
-**CREATE:** `ingestion/src/url_shortener_analytics/reconciliation.py`
-
-**PURPOSE:** Compare `ingestion_metadata`'s record of what this pipeline
-wrote against what actually exists in Bronze, surfacing exactly two kinds
-of drift.
-
-**DEPENDENCIES:** `metadata.list_successful_bronze_keys`,
-`object_store.list_bronze_keys`/`head_object`.
-
-**IMPLEMENTATION GUIDE (write it yourself):** two set-difference functions
-and one that combines them. `find_orphaned_bronze_objects`: `actual =
-set(list_bronze_keys(...))`, `known =
-set(metadata.list_successful_bronze_keys(...))`, return `sorted(actual -
-known)` — objects storage has that no successful run claims to have
-written. `find_missing_bronze_objects`: for every key
-`list_successful_bronze_keys` returns, call `head_object` and keep the
-ones where it returns `None` — keys the database believes exist but
-storage doesn't have. `reconcile_bronze`: call both, return them together
-in a small result object with a `clean` property (`True` only when both
-lists are empty). Resist the urge to make this one function that also
-*fixes* the drift it finds — detecting drift and deciding how to remediate
-it are different responsibilities; see Section 17.6's Failure Scenario for
-why automatic remediation here would be actively dangerous.
-
-**REFERENCE IMPLEMENTATION:**
-
-```python
-# ingestion/src/url_shortener_analytics/reconciliation.py (excerpt)
+# ingestion/src/url_shortener_analytics/reconciliation.py
 
 @dataclass
 class ReconciliationResult:
@@ -3301,220 +3037,41 @@ def reconcile_bronze(engine, s3_client, bucket, pipeline_name=None) -> Reconcili
         missing_objects=find_missing_bronze_objects(engine, s3_client, bucket, pipeline_name),
     )
 ```
+Wired into cli.py's reconcile-bronze command — exits 1 unless result.clean.
 
-Full file: [`reconciliation.py`](../ingestion/src/url_shortener_analytics/reconciliation.py).
+### 5. CODE WALKTHROUGH
 
-**TEST:** new `test_reconciliation.py` — nine tests: the result object's
-`clean` property in both states, orphan detection, missing detection, and
-`reconcile_bronze` combining both, all against a mocked S3 client and the
-`sqlite_engine` fixture.
+find_missing_bronze_objects reuses head_object (which you already read in object_store.py) rather than a bulk listing — it's a targeted existence check per known key, not "list everything and diff," because the question here is specifically "does this key I believe I wrote still exist," not "what's in the bucket generally" (that's find_orphaned_bronze_objects's job, which does need the bulk listing).
 
----
+Both functions are plain set arithmetic once you have the two lists — the actual engineering decision already happened, back in Section 17.3, in how known_keys gets populated (stored, not recomputed). The functions themselves are almost trivially simple, which is the intended shape: a small, cheap check built on top of data that was already being durably recorded for other reasons.
 
-**CREATE:** (edit) `ingestion/src/url_shortener_analytics/cli.py` —
-`reconcile_bronze_command` / `reconcile-bronze` subcommand
+### 6. RUN
 
-**PURPOSE:** Make reconciliation something an operator (or a scheduled
-job) can actually invoke.
+bash
+python -m url_shortener_analytics.cli reconcile-bronze
 
-**REFERENCE IMPLEMENTATION:**
+Clean state: "bronze reconciliation clean", exit 0. To manufacture drift, delete a real object directly from MinIO (or upload a stray one under bronze/) without going through the pipeline, then rerun — expect one "missing bronze object" (or "orphaned bronze object") warning line per drifted key, and exit 1.
 
-```python
-# ingestion/src/url_shortener_analytics/cli.py (excerpt)
+### 7. EXPERIMENT
 
-def reconcile_bronze_command(config_path: Path = DEFAULT_PIPELINE_CONFIG) -> int:
-    settings = get_settings()
-    configure_logging(settings.log_level)
-    config = _load_pipeline_config(config_path)
-    engine = engine_from_settings(settings)
-    s3_client = get_s3_client(settings)
+Think through this before running it: if you manually DELETE FROM ingestion_metadata WHERE run_id = '<some real successful clicks run>' — removing the row entirely, not just its bronze_key — what does reconciliation report? Walk it through: list_successful_bronze_keys no longer includes that key (the row is gone), but the real Parquet object is still sitting in MinIO. That object now shows up in actual_keys - known_keys — orphaned, even though nothing is actually wrong with the data itself. This is worth sitting with: reconciliation compares the record against reality, not "reality" against some independent ground truth — deleting the record itself, not the object, is enough to trigger a false-positive-looking orphan. It's not a bug in reconciliation; it's exactly what "the control plane's memory and the storage layer disagree" means, correctly detected, just triggered by an unusual cause (someone tampering with the metadata table itself, rather than the storage).
 
-    result = reconcile_bronze(engine, s3_client, settings.minio_bucket, config["pipeline_name"])
-    for key in result.orphaned_objects:
-        logger.warning("orphaned bronze object", extra={"key": key})
-    for key in result.missing_objects:
-        logger.warning("missing bronze object", extra={"key": key})
-    if not result.clean:
-        logger.error("bronze reconciliation found drift",
-                      extra={"orphaned": len(result.orphaned_objects), "missing": len(result.missing_objects)})
-        return 1
-    logger.info("bronze reconciliation clean")
-    return 0
-```
+### 8. PRODUCTION VIEW
 
-**RUN:** `make reconcile-bronze`
+Right now reconciliation is a manual, on-demand CLI invocation — nobody's watching for drift unless someone runs reconcile-bronze and reads the output. Production wires this into a scheduled check (nightly, say) with alerting on result.clean == False. At real scale, list_bronze_keys's single list_objects_v2 call (capped at 1,000 keys, no pagination — you already saw this POC simplification in object_store.py) stops being sufficient the moment a table's object count grows past that cap; production needs the paginator. Also worth naming: reconciliation only proves drift exists — it doesn't auto-fix anything. A missing object still needs a human (or an automated backfill trigger) to decide whether to re-run that historical load or accept the gap.
 
-**VERIFY:** manually upload a stray object to the bucket (`aws --endpoint
-... s3 cp` or the MinIO console) or delete one that `ingestion_metadata`
-recorded, then rerun `make reconcile-bronze`.
+### 9. PRINCIPAL ENGINEER VIEW
 
-**EXPECTED:** a stray, unrecorded object is reported under "orphaned
-bronze object"; a recorded-but-deleted object under "missing bronze
-object"; exit code 1 in either case, 0 when clean.
+The distinction between "this write is idempotent" and "this system never drifts" is a genuinely underappreciated one, and it's a strong thing to say clearly in an interview: idempotency is a local property of one operation retried in isolation; reconciliation is a global property of two independently-maintained sources of truth staying in agreement over time, under influences the idempotent operation itself has no control over (manual intervention, external deletion, partial failures that land in non-overlapping states). Conflating the two — believing "my writes are idempotent, therefore my system can't drift" — is exactly the kind of gap that looks fine in a demo and quietly rots in production.
 
-**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections
-17.7/17.9.
+The bronze_key-storage decision is also a clean example of a recurring principle: prefer storing "what actually happened" over recomputing "what should have happened, assuming today's logic always applied." The second option is always tempting because it needs no schema change — and it's exactly the option that silently breaks the moment your own logic evolves.
 
----
+### 10. REMEMBER
 
-### Hands-on Challenge (implement-yourself)
-
-Before LAB 13 below, try this without looking at `reconciliation.py`:
-using only `psql` and the MinIO console (or `aws s3 --endpoint-url ...
-ls`), *manually* find every orphaned and missing Bronze object for one
-table, by eye, comparing `SELECT bronze_key FROM ingestion_metadata WHERE
-status='success'` against the bucket listing. Time yourself. Then run
-`make reconcile-bronze` and compare. The point isn't that the manual
-version is hard for a handful of objects — it's that this exact by-hand
-comparison is what an operator would otherwise have to do, repeatedly,
-forever, without this section's code; automating a genuinely tedious,
-error-prone manual check is most of this feature's actual value.
-
-### 17.5 Hands-on Exercise
-
-**LAB 13 — Manufacture drift and detect it with `reconcile-bronze`.**
-
-Prerequisites: real MinIO reachable (`make up`), since this lab needs a
-real bucket to manually tamper with — this specific lab was **not**
-runnable in this sandbox (no MinIO here; see 17.6 below for what *was*
-genuinely verified instead).
-
-```bash
-make ingest-full                     # produces known, recorded Bronze objects
-make reconcile-bronze                # step 1: confirm clean -- exit 0
-
-# Manufacture an ORPHAN: upload a stray object nothing recorded
-aws --endpoint-url http://localhost:9000 s3 cp \
-  some_local_file.parquet s3://analytics-lake/bronze/clicks/manual-upload.parquet
-
-make reconcile-bronze                # step 2: reports the orphan, exit 1
-
-# Manufacture a MISSING object: delete a key ingestion_metadata still
-# believes exists
-aws --endpoint-url http://localhost:9000 s3 rm \
-  s3://analytics-lake/bronze/urls/ingestion_date=2026-09-19/urls.parquet
-
-make reconcile-bronze                # step 3: reports the orphan AND the
-                                      # missing object together, exit 1
-```
-
-*(DESIGN EXPECTATION for LAB 13's exact commands and output — run it
-yourself with real MinIO; see Section 17.6 for what this guide verified
-directly instead, against the underlying functions with a mocked S3
-client and real Postgres.)*
-
-### 17.6 How to test
-
-```bash
-make test                # unit: SQLite + mocked S3, no Docker needed
-```
-
-The full unit suite — 59 tests, genuinely run in this environment
-(`PYTHONPATH=ingestion/src python3 -m pytest ingestion/tests/unit -q`) —
-passed. ACTUAL OBSERVED:
-
-```
-59 passed in 6.96s
-```
-
-`test_reconciliation.py` specifically exercises `find_orphaned_bronze_objects`,
-`find_missing_bronze_objects`, and `reconcile_bronze` against a mocked S3
-client (scripted `list_objects_v2`/`head_object` responses) and the real
-`sqlite_engine` fixture — genuinely running the real reconciliation logic,
-just against a fake object store rather than real MinIO.
-
-`ruff check ingestion/` was also run against every file touched this
-increment (`metadata.py`, `object_store.py`, `reconciliation.py`,
-`cli.py`, plus every edited test file) and passed cleanly — ACTUAL
-OBSERVED: `All checks passed!`
-
-**What this sandbox could NOT verify (no MinIO/Docker here):** LAB 13's
-full end-to-end scenario against a real bucket. What it genuinely could,
-and did, verify against real infrastructure instead: `bronze_key`
-persistence and `find_stale_running_runs`/`list_successful_bronze_keys`
-against this sandbox's real, locally installed Postgres 16 (Section 16.6)
-— including applying the new `ALTER TABLE ... ADD COLUMN IF NOT EXISTS
-bronze_key` statement to that already-running database and confirming the
-column appears via `\d ingestion_metadata`. The S3-touching half of this
-section's code (`list_bronze_keys`, `head_object`, and therefore
-`reconciliation.py`'s two find-functions) is covered by genuine unit tests
-against a mocked `boto3` client, but has never executed against a real S3-
-compatible endpoint in this environment — that remains a DESIGN
-EXPECTATION, same as every other MinIO-touching path in this guide (Section
-14.6, 15.6's equivalent notes).
-
-### 17.7 Failure Scenario
-
-**What happens if `reconcile-bronze` finds an orphaned object — should it
-just delete it automatically?**
-
-This is worth answering explicitly rather than leaving implicit, because
-"automatically clean up what it finds" is the natural next feature to want
-— and it's the wrong default. An orphaned object (exists in storage, no
-successful run recorded writing it) has more than one honest
-explanation: it could genuinely be leftover garbage (a failed run's
-partial write that somehow still landed, or a stray manual upload) — safe
-to delete. But it could just as easily be a **legitimate** write this
-guide's own `ingestion_metadata` simply doesn't know about yet — a
-concurrent run still in flight whose `finish_run_success` hasn't committed
-yet at the exact moment `reconcile-bronze` ran, or (closer to home) exactly
-the Section 15.7 residual edge case: a retried incremental run that landed
-a second, non-overlapping-but-superset object, which is redundant but
-still contains real, correct data. Auto-deleting on the second case would
-be a genuine, silent data-loss bug introduced by a "cleanup" feature. This
-is why `reconcile_bronze` deliberately **only detects and reports** —
-remediation is left as a human decision, consistent with this repo's
-broader "don't overstate the guarantee" posture (Section 15.7's own
-honesty about its residual gap; ADR-007's stance on never deleting Bronze
-data automatically).
-
-**What about a missing object — is that recoverable?** Not by this
-pipeline alone: a `bronze_key` recorded as successfully written but no
-longer present in storage means the *only* record of that data was the
-object itself (Bronze's row-level content isn't duplicated anywhere else
-in this repo's Phase 1 design). Recovery means re-running the original
-extraction against OLTP — which is possible only if the source data still
-exists there unchanged, and re-derives the *current* state of the source
-table, not necessarily bit-for-bit what was originally captured if OLTP
-has since changed. This is exactly why ADR-007 treats Bronze as
-effectively the system of record for historical raw data, and why a real
-production deployment (Section 17.8, below) needs a retention/backup
-story for the bucket itself, not just for `ingestion_metadata`.
-
-### 17.8 Production Considerations
-
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Reconciliation cadence | Manual (`make reconcile-bronze`) | Scheduled (daily/hourly cron or orchestrator step), with the same non-zero-exit-code alerting pattern as `check-stale-runs` |
-| Remediation | None — detection only, by design (see 17.7) | A documented runbook per drift type; orphan cleanup requires explicit human sign-off, missing-object recovery triggers a backfill/re-extraction workflow |
-| Listing scale | `list_bronze_keys`: single `list_objects_v2` call, capped at 1,000 keys | Paginated listing (`get_paginator`) once any table's object count could plausibly exceed 1,000 |
-| Bucket durability | MinIO's own default settings, no explicit backup/versioning configured | S3 versioning and/or cross-region replication, so a missing-object drift is itself often preventable rather than only detectable after the fact |
-| Coverage | Bronze layer only | A mature platform reconciles at every layer (Bronze, Silver, Gold — Phase 2+), not just the ingestion boundary |
-
-### Principal Data Engineer Perspective
-
-The judgment call worth defending here is resisting the tempting shortcut
-of building reconciliation *and* auto-remediation as one feature. It would
-have been less code, in the moment, to have `reconcile_bronze` just delete
-every orphan it finds — and it would have been a real, if rare, latent
-data-loss bug, for exactly the reason named in Section 17.7 (a legitimate,
-recently-completed write that simply hasn't landed in `ingestion_metadata`
-yet, or Section 15.7's documented redundant-but-correct duplicate). A
-principal engineer separates "detect and report" from "decide what to do
-about it" as a matter of course when the two have meaningfully different
-risk profiles — not because remediation could never be automated safely,
-but because automating it safely requires more context (how fresh is
-"fresh enough to not be a false orphan," what's this specific object's
-provenance) than a reconciliation pass alone has available. The second
-thing worth flagging: this section's two new pieces — a persisted
-`bronze_key` and a reconciliation job — exist specifically because Section
-15.8's Production Considerations table already named "a periodic
-reconciliation job comparing `ingestion_metadata` against actual Bronze
-object listings" as a gap, two increments ago. Treating a documented gap
-in an earlier section as a concrete backlog item, and coming back to close
-it explicitly rather than letting it quietly age out of the guide, is
-itself a habit worth calling out — it's the same discipline a real
-platform team applies to its own tech-debt tracking.
+Idempotent write = safe to retry this one operation. It says nothing about whether the rest of the system stays in sync.
+Reconciliation compares two independently-maintained records of truth (the metadata table, the actual bucket contents) and reports where they disagree — it doesn't fix anything by itself.
+Store what actually happened (bronze_key on the row) rather than recomputing it later from logic that might change — recomputation quietly breaks every historical row the moment the key-building function's behavior changes.
+NULL for "nothing was written" beats a sentinel value — let SQL's own "no value" do the work instead of inventing a magic string someone has to learn.
 
 ### 17.9 Principal Engineer Interview Questions
 
