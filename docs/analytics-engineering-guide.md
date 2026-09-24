@@ -2635,19 +2635,19 @@ made checkpoint recovery observable.
 
 ## 14. Full Load Ingestion ✅✅
 
-###1. CONCEPT
+### 1. CONCEPT
 
 Full load ingestion means: on every run, read the entire source table and land it as one Bronze snapshot — no "what's new since last time" logic at all. It's the simplest possible ingestion strategy, and it's correct specifically for tables that are small and/or don't have a reliable "what changed" signal (no updated_at, or rows get hard-deleted, so an incremental id/timestamp filter would silently miss deletions).
 
 It matters because it's the baseline every other ingestion pattern gets compared against. Incremental load (next concept) exists purely to solve full load's two real costs: it re-reads and re-writes data that hasn't changed, and that cost grows linearly with table size forever. You can't evaluate when incremental load is worth its added complexity (watermarks, gap-detection, replay logic) without first understanding exactly what full load costs and where it breaks down.
 
-###2. URL SHORTENER EXAMPLE
+### 2. URL SHORTENER EXAMPLE
 
 Your urls and users tables are full-loaded (ingestion/configs/pipelines.yaml presumably sets load_type: full for them — worth confirming). Both are small (500 and 200 rows in your seeded sandbox) and, more importantly, urls rows get mutated in place — is_active flips, title can change — with no guaranteed updated_at column your contract commits to. A naive incremental "give me rows with id > last_seen_id" would never see those mutations at all. Re-reading the whole table every run is the honest way to guarantee Bronze reflects current state.
 
 clicks, by contrast, is append-only and immutable (its contract says so explicitly), which is exactly the property that makes it safe to load incrementally instead — that's next concept's territory.
 
-###3. DESIGN
+### 3. DESIGN
 
 Flow: cli.py's full-load command → loop over configured tables → run_full_load(engine, s3_client, bucket, pipeline_name, table_name) per table → inside that: metadata.start_run (checkpoint row, status=running) → extract_full (read) → write_bronze (write, deterministic key) → metadata.finish_run_success (checkpoint row, status=success, with the exact bronze_key written), with finish_run_failure + re-raise on any exception.
 
@@ -2655,7 +2655,7 @@ Key decision worth calling out explicitly: the Bronze key is bronze/{table}/inge
 
 Alternative rejected: a key with a run id or full timestamp (e.g. .../run_id=<uuid>/urls.parquet). That would make every run's output independently addressable/auditable, but it means Bronze accumulates a new full copy of urls every single day forever, and Silver's read layer (read_bronze_clicks, which you've already seen) would have to pick "the latest one" instead of just reading what's there — extra logic, for no benefit at this table's size and mutation pattern.
 
-###4. IMPLEMENTATION
+### 4. IMPLEMENTATION
 
 This is already fully built and running in your repo — nothing to add. Reference code, so you can trace it against what you already have:
 
@@ -2685,7 +2685,7 @@ def build_bronze_key(table_name: str, run_date: datetime) -> str:
     return f"bronze/{table_name}/ingestion_date={run_date:%Y-%m-%d}/{table_name}.parquet"
 ```
 
-###5. CODE WALKTHROUGH
+### 5. CODE WALKTHROUGH
 
 extract_full is deliberately pure — no S3, no metadata table, just SQL in, DataFrame out. That's why run_silver_clicks_job's split into clean_clicks/deduplicate_clicks (pure) vs the job wrapper (I/O) — which you already built in Section 40 — feels familiar: this is the same pattern, established first here, one layer down the pipeline.
 
@@ -2693,7 +2693,7 @@ run_full_load's try/except is the checkpoint contract in miniature: a run is alw
 
 The bronze_key gets stored on the success row (finish_run_success(..., bronze_key=key)) rather than recomputed later from table_name + started_at — you can see in metadata.py's docstring this was a deliberate choice (Section 17.3 in the guide), because recomputing it later means duplicating build_bronze_key's exact date-formatting logic in a second place, and any drift between the two becomes a silent bug.
 
-###6. RUN
+### 6. RUN
 
 make ingest-full
 
@@ -2708,7 +2708,7 @@ which resolves to python -m url_shortener_analytics.cli full-load. Expected stru
 
 ...same shape for users (rows: 200). This part is DESIGN EXPECTATION for today's exact date/uuid — the row counts and key format are ACTUAL OBSERVED from your prior real runs (Section 14/LAB 1 in your guide).
 
-###7. EXPERIMENT
+### 7. EXPERIMENT
 
 Run make ingest-full twice in a row, then check the object store:
 
@@ -2720,19 +2720,19 @@ python -m url_shortener_analytics.cli ingestion-history --table urls --limit 5
 
 You'll see one success row (from run 1) and one running row stuck forever (from the killed run 2) — this is exactly the "stale running run" problem find_stale_running_runs exists to detect, which you'll hit properly when we get to Checkpoints. Worth seeing now so the motivation for that concept isn't abstract.
 
-###8. PRODUCTION VIEW
+### 8. PRODUCTION VIEW
 
 At your current scale (500/200 rows) pd.read_sql_table's "whole table in memory, one query" is free. At real scale it's the single biggest thing that breaks: a 200M-row table full-loaded this way either OOMs the extraction process or holds a long table-scan transaction open against a live OLTP database for however long the read takes — actively harmful to the production database it's reading from, not just slow. Real fix is chunked/paginated extraction (LIMIT/OFFSET or a keyset cursor), writing each chunk as its own Parquet part-file rather than one giant DataFrame.
 
 Cost-wise, full load's defining trait is that its S3 PUT cost and compute cost are both O(table size) on every single run, forever — regardless of how much actually changed. That's the concrete number you'd put in front of a full-load-vs-incremental decision: "this table is N rows, growing at R rows/day, full-loading it costs $X/month in read+write, here's what incremental would cost instead."
 
-###9. PRINCIPAL ENGINEER VIEW
+### 9. PRINCIPAL ENGINEER VIEW
 
 An interviewer asking "when would you full-load vs incrementally load a table" is really testing whether you reach for incremental load reflexively (many candidates do, because it "sounds more sophisticated") or whether you can name the actual precondition: a reliable append-only or monotonically-increasing change signal. No such signal → full load is correct, not a fallback. This table's urls (mutable, no updated_at) is a textbook case of that decision being correct as-is.
 
 The key-determinism point (date-only key, no run id) is worth having ready as an idempotency example that isn't "add a dedup step" — it's "make the write itself naturally overwrite instead of accumulate." Idempotency-by-construction (the write target is deterministic) versus idempotency-by-cleanup (write and then dedup) is a real, recurring design fork, and this table is a case of choosing the first.
 
-###10. REMEMBER
+### 10. REMEMBER
 
 Full load = read everything, every run. Correct precondition: table is small, or mutable with no reliable change signal, or can be hard-deleted.
 Idempotency here comes from the key, not from logic: same table + same date = same S3 key = safe overwrite. No dedup step required.
@@ -2741,727 +2741,162 @@ Full load's cost is O(table size) every run, forever — that's the exact cost i
 
 ## 15. Incremental Load & Watermarks ✅✅
 
-### 15.1 Concept
+### 1. CONCEPT
 
-An **incremental load** extracts only the rows that are *new* since the
-last successful run, instead of re-reading the entire table every time. It
-needs a **watermark**: a saved value (here, the highest `id` already
-ingested) that tells the next run where to resume — `WHERE id > watermark`
-instead of `SELECT *`.
+Incremental load reads only the rows that are new since the last successful run, instead of re-reading the whole table. It needs one saved piece of state — a watermark — that tells the next run where to resume from.
 
-### Why does this exist?
+It exists because full load's cost is O(table size) on every single run, forever. That's fine for a 500-row urls table; it's ruinous for clicks, a table designed to grow without bound. A watermark turns "read everything" into "read what's new," so the cost of a run is proportional to how much changed, not how big the table has gotten.
 
-Full load (Section 14) re-reads everything, every run — fine for `urls`
-and `users` (hundreds of rows), ruinous for `clicks`, which is designed to
-grow without bound as an append-heavy event table. At even a modest
-million rows, re-scanning the whole table on every run wastes I/O on the
-OLTP database, wastes time, and wastes Bronze storage on the same
-already-ingested rows written out again. Incremental load makes the cost
-of each run proportional to *new* data, not *total* data — the same
-argument that motivates almost every real streaming or CDC system, just
-applied here at the simplest level that can work: a single saved integer.
+### 2. URL SHORTENER EXAMPLE
 
-### Simple Example (generic, pre-URL-Shortener)
+clicks is the one table this applies to in your schema — urls/users stay on full load because they're small and (as you already know from Section 14) urls is mutable, which incremental load can't handle anyway. clicks is the opposite: append-only, immutable, and has a BIGSERIAL id — exactly the shape incremental load wants. First run: watermark starts at 0, reads everything that exists. Every run after that: WHERE id > <last watermark>, gets back only what's new since then, and remembers the new highest id.
 
-Imagine syncing your email client's inbox. The very first sync has to
-download every message — there's nothing to compare against yet. But every
-sync after that only needs to ask the mail server "anything with a UID
-higher than the last one I saw?" The client remembers one number (the
-highest UID it has already downloaded) and uses it as the starting point
-for the next request. It never re-downloads message #1 through #9,000
-just to check for message #9,001 — that's the whole idea of a watermark:
-one small piece of saved state turns "read everything" into "read what's
-new."
+### 3. DESIGN
 
-### URL Shortener Example
+Flow: cli.py's run command (not full-load) → per table, checks pipelines.yaml's load_type → for clicks, calls run_incremental_load(engine, s3_client, bucket, pipeline_name, table_name) → inside: start_run → get_last_watermark (reads only status='success' rows) → extract_incremental → if empty, finish successfully without writing anything → otherwise write_bronze_incremental then finish_run_success with the new watermark.
 
-`clicks` is exactly this inbox. Every redirect that happens (hypothetically
-— see ADR-008) inserts one new row with an auto-incrementing `id`. The
-first incremental run for `clicks` reads every row that exists so far
-(watermark starts at 0) and remembers the highest `id` it saw. The next
-run — minutes, hours, or a day later — asks Postgres for only
-`id > <that remembered value>`, gets back just the clicks that happened in
-between, writes those to a new Bronze object, and remembers the new
-highest `id`. `urls` and `users` stay on full load (Section 14) because
-they're small and don't grow the same way; `clicks` is the one table in
-this project's schema that this section's watermark logic actually
-applies to.
+Two decisions worth being deliberate about:
 
-### 15.2 Architecture
+**Decision 1** — the watermark is id, not a timestamp. WHERE id > :watermark, not WHERE occurred_at > :watermark. A BIGSERIAL is assigned by Postgres itself, strictly in insertion order — no two rows can share a value, and it can't go backwards. A timestamp column, by contrast, is set by whatever produced the row, and under enough concurrent writes two rows genuinely can land on the same timestamp at typical precision, or even appear "out of order" if a writer's clock is skewed. An id-based watermark is immune to both problems by construction. The real cost: it only works because clicks is insert-only. It could never see an UPDATE or a DELETE — a row that changes after insertion just silently stays at whatever it was when first read. That's a genuine, accepted limitation, not an oversight.
 
-```mermaid
-sequenceDiagram
-    participant CLI as cli.py (run)
-    participant MD as metadata.py
-    participant EX as extract_incremental.py
-    participant PG as Postgres (clicks)
-    participant OS as object_store.py
-    participant S3 as MinIO
+**Decision 2** — the incremental Bronze key includes the watermark range, not just the date. Full load's date-only key is safe to reuse only if the pipeline runs at most once a day. Incremental load doesn't — it can run many times a day, and each run covers a different id range that must not collide with the previous run's batch. So the key is bronze/{table}/incremental/watermark_start={n}/watermark_end={m}/{table}.parquet — different range, different key, nothing gets silently overwritten by a different batch.
 
-    CLI->>MD: start_run(pipeline, "clicks", "incremental")
-    MD-->>CLI: run_id (status=running)
-    CLI->>EX: run_incremental_load(...)
-    EX->>MD: get_last_watermark(pipeline, "clicks")
-    MD-->>EX: watermark (0 on first run; status='success' rows only)
-    EX->>PG: SELECT * FROM clicks WHERE id > :watermark ORDER BY id
-    PG-->>EX: DataFrame (possibly empty)
-    alt DataFrame is empty
-        EX->>MD: finish_run_success(rows=0, watermark_end=watermark unchanged)
-    else DataFrame has rows
-        EX->>OS: write_bronze_incremental(df, "clicks", watermark, new_watermark)
-        OS->>S3: put_object (key includes watermark_start/watermark_end)
-        S3-->>OS: 200 OK
-        OS-->>EX: bronze key
-        EX->>MD: finish_run_success(rows, watermark_end=new_watermark)
-    end
-```
+Alternative rejected: full CDC via Postgres logical replication — would capture every insert/update/delete with no polling gap at all, but is a much bigger infrastructure lift (replication slot, consumer process), and there's no operational need for it yet at this project's stage. That's deferred, not dismissed.
 
-Same failure shape as full load: any exception between `start_run` and
-`finish_run_success` is caught by `run_incremental_load`, recorded via
-`finish_run_failure`, and re-raised — see [15.7](#157-failure-scenario)
-for exactly what "recorded" does and doesn't protect against here.
+### 4. IMPLEMENTATION
 
-### 15.3 Design Decision
-
-Two separate decisions had to be made for this component, and both are
-worth stating explicitly rather than leaving implicit in the code.
-
-**Decision 1 — how the watermark itself is compared: ID-based, not
-timestamp-based.** The watermark is `clicks.id` (a `BIGSERIAL`), compared
-with `WHERE id > :watermark`, not `occurred_at` compared with
-`WHERE occurred_at > :watermark`. `BIGSERIAL` values are assigned by
-Postgres itself, in strict insertion order, with no possibility of two
-rows sharing a value and no dependency on any client's clock. A
-`TIMESTAMPTZ` column, by contrast, is set by whatever produced the row
-(here, `DEFAULT now()` — but in a real system, potentially a
-client-supplied timestamp), and two rows genuinely can share the same
-timestamp at typical database timestamp precision under enough concurrent
-write load, or even go *backwards* relative to insertion order if a
-writer's clock is skewed. See [15.9](#159-principal-engineer-interview-questions)
-for the full comparison and a worked failure example.
-
-**Decision 2 — how the Bronze key is built for an incremental batch:
-`(table_name, watermark_start, watermark_end)`, not `(table_name, date)`.**
-Full load's key is safe to reuse verbatim for incremental load *only* if
-an incremental pipeline runs at most once per calendar day — it doesn't;
-it's designed to run many times a day, and each run's batch covers a
-*different* `id` range that must not collide with (overwrite) a previous
-run's batch the way same-day full-load reruns intentionally do. See
-`build_bronze_incremental_key`'s docstring in `object_store.py` for the
-exact format, and [15.7](#157-failure-scenario) for the one case where
-this key scheme's idempotency guarantee does *not* fully hold.
-
-### Alternatives
-
-1. **Timestamp-based watermark (rejected).** Simpler to read as a human
-   ("give me everything after 2pm"), and works acceptably when there's no
-   concurrent write pressure and every writer's clock is trustworthy.
-   Rejected here because neither of those conditions is something this
-   pipeline can guarantee about `clicks`' write path, and the failure mode
-   when they don't hold — silently skipped rows — is worse than the
-   failure mode of the chosen approach.
-2. **Full CDC via Postgres logical replication (rejected for Phase 1).**
-   Would eliminate polling entirely and capture every write, including
-   deletes and updates, which id-based polling cannot see at all (this
-   pipeline's watermark approach is insert-only by construction — see
-   [15.8](#158-production-considerations)). Rejected for Phase 1 per
-   ADR-004: no operational need yet, and it introduces an entirely
-   different infrastructure component (a replication slot, a consumer
-   process) before batch has been given a real chance to be sufficient.
-3. **ID-based watermark (chosen).** Immune to clock skew and duplicate
-   timestamps by construction, at the cost of only working when rows are
-   append-only, sequentially inserted, and never deleted or updated after
-   insertion — an assumption that happens to hold exactly for how
-   `clicks` is modeled in this project.
-
-### Trade-offs
-
-| | ID-based watermark (chosen) | Timestamp-based watermark (rejected) |
-|---|---|---|
-| Clock skew | Immune — Postgres assigns the sequence, not a client | Vulnerable — a writer with a skewed clock can insert a row with an `occurred_at` earlier than rows already ingested, and it will never be picked up |
-| Concurrent duplicate values | Impossible — `BIGSERIAL` values are unique by construction | Possible at typical timestamp precision under concurrent writes — an ambiguous cutoff row could be double-read or skipped |
-| Captures updates/deletes | No — only ever sees rows by insertion order, never re-reads a row that was later changed | Also no, in general, unless there's a separate `updated_at` also being watermarked |
-| Human-readability of "resume point" | Low — a bare integer, not obviously a point in time | High — "resume after 2026-09-19 14:00" reads naturally |
-| Requires on the source table | An indexed, monotonically-increasing integer/bigint key | An indexed, reliably-set timestamp column |
-
-### 15.4 Implementation
-
-This component touches four files. One is new and taught here in full
-depth; the other three were already introduced in Section 14 and get a
-shorter "what changed" treatment, since the underlying pattern (extract →
-write → checkpoint) doesn't change — only what gets extracted and how the
-Bronze key is built does.
-
----
-
-**CREATE:** `ingestion/src/url_shortener_analytics/extract_incremental.py`
-
-**PURPOSE:** Read only the rows added since the last successful run,
-write them to Bronze under a watermark-scoped key, and advance the
-watermark — while treating "no new rows" as a normal, successful, no-op
-outcome rather than an edge case bolted on afterward.
-
-**DEPENDENCIES:** `pandas`, a SQLAlchemy `Engine`, this package's
-`metadata` module (for `get_last_watermark` and the same
-`start_run`/`finish_run_success`/`finish_run_failure` checkpoint calls
-`extract_full.py` uses) and `object_store.write_bronze_incremental`.
-
-**IMPLEMENTATION GUIDE (write it yourself):** start from
-`extract_full.py`'s shape — you're building the same two-function pattern
-(a pure extract function, and an orchestration function) — and change
-exactly what needs to change. `extract_incremental(table_name, engine,
-watermark)` should run a parameterized query,
-`SELECT * FROM <table_name> WHERE id > :watermark ORDER BY id` (use
-SQLAlchemy's `text()` with a bound parameter — never f-string the
-watermark value directly into SQL), and return the result as a DataFrame,
-wrapped in the same `try/except -> ExtractionError` pattern as
-`extract_full`. Order by `id` explicitly — you need `df["id"].max()` to be
-unambiguous, and relying on unspecified row order to happen to already be
-sorted is exactly the kind of implicit assumption that breaks quietly
-later. `run_incremental_load(engine, s3_client, bucket, pipeline_name,
-table_name)` is the orchestration, and this is where the real design
-decision lives: call `metadata.start_run(...)`, then
-`metadata.get_last_watermark(...)` to find where to resume, then your
-`extract_incremental`. **Before** doing anything else, check
-`df.empty` — if it's empty, call
-`metadata.finish_run_success(rows_read=0, rows_written=0,
-watermark_end=<the watermark you just read, unchanged>)` and return early,
-**without** calling `write_bronze_incremental` at all. (Ask yourself: what
-would a zero-row Parquet object at a `watermark_start == watermark_end`
-key actually represent, and who would it confuse later? That's the reason
-to skip the write, not just "why bother.") If `df` is non-empty, compute
-`new_watermark = int(df["id"].max())`, call
-`object_store.write_bronze_incremental(df, table_name, watermark,
-new_watermark, s3_client, bucket)`, then
-`metadata.finish_run_success(rows_read=len(df), rows_written=len(df),
-watermark_end=new_watermark)`. Wrap the extract-through-write portion in
-`try/except Exception` that calls `metadata.finish_run_failure(...)` and
-**re-raises**, exactly like `run_full_load` — this orchestration function
-should look like `run_full_load`'s twin with one extra branch, not a
-rewrite from scratch.
-
-**REFERENCE IMPLEMENTATION:**
+Already built and running — here's the real code to trace against what you have:
 
 ```python
-# ingestion/src/url_shortener_analytics/extract_incremental.py (excerpt —
-# full file is already committed at this path)
+# ingestion/src/url_shortener_analytics/extract_incremental.py
 
 def extract_incremental(table_name: str, engine: Engine, watermark: int) -> pd.DataFrame:
     query = text(f"SELECT * FROM {table_name} WHERE id > :watermark ORDER BY id")
-    return pd.read_sql_query(query, engine, params={"watermark": watermark})
+    df = pd.read_sql_query(query, engine, params={"watermark": watermark})
+    return df
 
 
-def run_incremental_load(engine, s3_client, bucket, pipeline_name, table_name) -> dict:
+def run_incremental_load(engine, s3_client, bucket, pipeline_name, table_name) -> dict[str, object]:
     run_id = metadata.start_run(engine, pipeline_name, table_name, load_type="incremental")
     try:
         watermark = metadata.get_last_watermark(engine, pipeline_name, table_name)
         df = extract_incremental(table_name, engine, watermark)
 
         if df.empty:
-            metadata.finish_run_success(engine, run_id, rows_read=0, rows_written=0, watermark_end=watermark)
-            return {"run_id": run_id, "rows": 0, "key": None, "watermark_end": watermark}
+            metadata.finish_run_success(
+                engine, run_id, rows_read=0, rows_written=0,
+                watermark_start=watermark, watermark_end=watermark,
+            )
+            return {"run_id": run_id, "table": table_name, "rows": 0, "key": None,
+                    "watermark_start": watermark, "watermark_end": watermark}
 
         new_watermark = int(df["id"].max())
         key = write_bronze_incremental(df, table_name, watermark, new_watermark, s3_client, bucket)
-        metadata.finish_run_success(engine, run_id, rows_read=len(df), rows_written=len(df), watermark_end=new_watermark)
+        metadata.finish_run_success(
+            engine, run_id, rows_read=len(df), rows_written=len(df),
+            watermark_start=watermark, watermark_end=new_watermark, bronze_key=key,
+        )
     except Exception as err:
         metadata.finish_run_failure(engine, run_id, str(err))
         raise
-    return {"run_id": run_id, "rows": len(df), "key": key, "watermark_end": new_watermark}
+
+    return {"run_id": run_id, "table": table_name, "rows": len(df), "key": key,
+            "watermark_start": watermark, "watermark_end": new_watermark}
+
+# object_store.py
+def build_bronze_incremental_key(table_name: str, watermark_start: int, watermark_end: int) -> str:
+    return (
+        f"bronze/{table_name}/incremental/"
+        f"watermark_start={watermark_start:012d}/watermark_end={watermark_end:012d}/{table_name}.parquet"
+    )
 ```
 
-Full file: [`ingestion/src/url_shortener_analytics/extract_incremental.py`](../ingestion/src/url_shortener_analytics/extract_incremental.py).
+### 5. CODE WALKTHROUGH
 
-**RUN:** `make ingest` (dispatches `clicks` here, `urls`/`users` to full
-load — see the CLI change below). There's no standalone CLI for this file
-alone, same reasoning as `object_store.py` in Section 14.
+The df.empty branch is the most important line in this function, not a minor edge case. Read the comment on it in your own code: writing a zero-row Parquet object at a watermark_start == watermark_end key would represent nothing useful and would just clutter Bronze — every no-op run (and there will be many, since a real schedule polls far more often than clicks actually arrive) would otherwise produce a useless empty file. Treating "no new rows" as a normal successful outcome, not a special case bolted on, is what keeps the object count in Bronze meaningful.
 
-**VERIFY:** open `http://localhost:9001` (MinIO console), browse to
-`bronze/clicks/incremental/`; confirm one object per run, keyed by that
-run's `watermark_start=.../watermark_end=...` range, and that a second
-`make ingest` run with no new source rows produces **no** new object
-(compare `list_objects_v2` counts before/after — exactly what
-`test_run_incremental_load_with_no_new_rows_skips_the_write_but_still_succeeds`
-asserts under mocks, and what LAB 3 below proves against real MinIO).
+Notice get_last_watermark (in metadata.py, which you can see is unchanged from Section 14) only ever reads status='success' rows. That's the same invariant from full load, doing more work here: a run that crashed mid-flight must never become the basis for where the next run resumes from — otherwise a crash could corrupt the entire pipeline's notion of "what's already been read."
 
-**EXPECTED:** the number of objects under `bronze/clicks/incremental/`
-equals the number of runs that found at least one new row — never one
-more than that, regardless of how many total runs (including no-op ones)
-have happened.
+ORDER BY id in the query isn't cosmetic — new_watermark = int(df["id"].max()) needs the max to be unambiguous, and depending on unspecified row order happening to already be sorted is exactly the kind of silent assumption that breaks later without warning.
 
-**TEST:** `ingestion/tests/unit/test_extract_incremental.py` — 8 tests,
-covering watermark-scoped reads (including the watermark-at-max-id "reads
-nothing" boundary), the first-run-reads-everything case
-(`watermark=0`), the no-new-rows no-op path (asserting the checkpoint
-still records `status='success', rows_written=0` and that no Bronze write
-was attempted), and the failure-doesn't-advance-the-watermark case.
-`ingestion/tests/integration/test_incremental_load_integration.py` proves
-the same behavior against real Postgres + MinIO (not yet executed in this
-sandbox — see [15.6](#156-how-to-test)).
+### 6. RUN
+```
+make ingest
 
-**PRODUCTION CONSIDERATIONS:** see [15.8](#158-production-considerations).
+First run (watermark starts at 0, reads everything that exists so far):
 
-**INTERVIEW QUESTIONS:** see [15.9](#159-principal-engineer-interview-questions).
+extracting table (incremental load), table=clicks, watermark=0
+extraction complete, table=clicks, rows=<N>, watermark=0
+wrote bronze object, key=bronze/clicks/incremental/watermark_start=000000000000/watermark_end=000000000<N>/clicks.parquet
 
----
+Insert a couple of rows directly, then run again — watermark is now <N>, and only the new rows are read:
 
-**Changed files** (already covered in depth in Section 14 — this is what
-changed about them for incremental load, not a repeat of their full
-teaching):
+extracting table (incremental load), table=clicks, watermark=<N>
+extraction complete, table=clicks, rows=2, watermark=<N>
+wrote bronze object, key=bronze/clicks/incremental/watermark_start=000000000<N>/watermark_end=000000000<N+2>/clicks.parquet
 
-| File | What changed | Why |
-|---|---|---|
-| [`object_store.py`](../ingestion/src/url_shortener_analytics/object_store.py) | Added `build_bronze_incremental_key` and `write_bronze_incremental`; extracted the shared retry/serialize logic both `write_bronze` and `write_bronze_incremental` need into a private `_put_parquet_with_retry` helper | One retry policy, one Parquet-serialization code path, for both load types — not two copies that could drift apart |
-| [`cli.py`](../ingestion/src/url_shortener_analytics/cli.py) | Added a `run` subcommand that dispatches each table to full or incremental load based on `pipelines.yaml`'s `load_type` field; kept `full-load` as an explicit override for backfills | `run` is what a real schedule would call; `full-load` stays available because forcing a full reload is a legitimate operator action (e.g. rebuilding Bronze from scratch after a schema change), not something that should require editing config |
-| [`pipelines.yaml`](../ingestion/configs/pipelines.yaml) | `clicks`' `load_type` changed from `full` to `incremental` | This is the one line that actually turns incremental load "on" for `clicks` — everything else in this section exists to make that one config value meaningful |
-| [`Makefile`](../Makefile) | Added `make ingest` (calls `cli.py run`); kept `make ingest-full` (calls `cli.py full-load`) | Matches the CLI's two entry points 1:1 |
-
-### Hands-on Challenge (implement-yourself)
-
-Before reading LAB 2 below, try this: **without looking at
-`extract_incremental.py`, write down (in plain English or pseudocode) what
-would go wrong if `run_incremental_load` called
-`metadata.finish_run_success(...)` *before* calling
-`write_bronze_incremental(...)` instead of after.** Then check your answer
-against [15.7](#157-failure-scenario): a process killed in that window
-would leave the watermark advanced in `ingestion_metadata` even though the
-corresponding Bronze object was never actually written — the *opposite* of
-the safe failure mode this section's ordering produces, and a genuinely
-worse bug than a stuck `running` row, because it's a **silent data gap**:
-`get_last_watermark` would report success, the next run would start from
-the advanced watermark, and the rows in between would never be extracted
-by anything, ever, without manual intervention.
-
-### 15.5 Hands-on Exercise
-
-**LAB 2 — Run an incremental load twice, prove it only reads what's new.**
-
-Prerequisites: `make up`, `make seed` have been run; `make ingest` (or
-`make ingest-full`) has populated an initial baseline.
-
-```bash
-make ingest    # first run: clicks watermark starts at 0, reads everything so far
+This is DESIGN EXPECTATION for the exact row counts — depends on your current clicks count, which you should confirm for yourself with SELECT COUNT(*) FROM clicks; before running.
 ```
 
-Expected output (structured log lines):
+### 7. EXPERIMENT
 
-```
-ts=... level=INFO logger=url_shortener_analytics.extract_incremental msg="extracting table (incremental load)" table='clicks' watermark=0
-ts=... level=INFO logger=url_shortener_analytics.extract_incremental msg="extraction complete" table='clicks' rows=1000 watermark=0
-ts=... level=INFO logger=url_shortener_analytics.object_store msg="wrote bronze object" key='bronze/clicks/incremental/watermark_start=000000000000/watermark_end=000000001000/clicks.parquet' bytes=... rows=1000 attempt=1
-```
+Run make ingest a third time with no new rows inserted. Expected: rows=0 in the log, no "wrote bronze object" line at all, and a new ingestion_metadata row with status='success', rows_written=0, watermark_end unchanged from the previous run. Confirm with:
 
-*(Row counts above are a DESIGN EXPECTATION based on
-`scripts/seed_sample_data.py`'s fixed seed for however many `clicks` rows
-it generates — run the command yourself to see the ACTUAL OBSERVED value;
-nothing above was fabricated as a claimed real run.)*
-
-Now insert a few new rows directly (simulating new redirects happening),
-and run again:
-
-```bash
-docker compose exec postgres psql -U urlshortener -d urlshortener \
-  -c "INSERT INTO clicks (short_code) VALUES ('test01'), ('test02');"
-make ingest    # second run: watermark is now 1000, reads only the 2 new rows
+```sql
+SELECT status, rows_written, watermark_start, watermark_end
+FROM ingestion_metadata WHERE source_table='clicks' ORDER BY started_at DESC LIMIT 3;
 ```
 
-What to observe: the second run's log line reads
-`watermark=1000` (not `0`), reports `rows=2` (not 1002), and writes a
-**new**, separate Bronze object at
-`bronze/clicks/incremental/watermark_start=000000001000/watermark_end=000000001002/clicks.parquet`
-— the first run's object at `watermark_start=000000000000/...` is left
-untouched. Two objects now exist under `bronze/clicks/incremental/`,
-together covering every row exactly once.
+Now the more interesting failure scenario — do this as a thought experiment first, then verify it's what the code actually does: what would go wrong if finish_run_success were called before write_bronze_incremental instead of after? Answer: a process killed in that window would leave the watermark advanced in ingestion_metadata even though the Bronze object was never written — a silent data gap. The next run would trust the advanced watermark and start reading after rows that were never actually captured anywhere. That's strictly worse than a stuck running row (which is at least visible and detectable) — it's invisible corruption. Check run_incremental_load's actual ordering: write happens, then finish_run_success. That ordering is the whole defense.
 
-**LAB 3 — Prove a no-op run writes nothing.**
+### 8. PRODUCTION VIEW
 
-```bash
-make ingest    # third run: no new rows inserted since LAB 2's second run
-```
+The real gap this design accepts: it's insert-only by construction. It can never see an UPDATE or a DELETE on clicks — if a row changed after being read once, incremental load has no way to know. That's fine here because your contract says clicks are never updated/deleted after insert; it would be a real bug if that stopped being true and nobody revisited this design. At real scale, the id-based watermark also assumes a single writer sequence — if clicks were ever sharded across multiple databases (say, per-region), "the highest id" stops being a single meaningful number, and you'd need a different scheme (per-shard watermarks, or move to timestamp/CDC-based capture despite its trade-offs).
 
-What to observe: the log shows `rows=0`, no `"wrote bronze object"` line
-appears at all, and `ingestion_metadata` gets a new row with
-`status='success', rows_written=0, watermark_end` equal to the previous
-run's `watermark_end` (verify with
-`docker compose exec postgres psql ... -c "SELECT status, rows_written, watermark_end FROM ingestion_metadata WHERE source_table='clicks' ORDER BY started_at DESC LIMIT 3;"`).
-Confirmed under mocks by
-`test_run_incremental_load_with_no_new_rows_skips_the_write_but_still_succeeds`,
-and, against real infrastructure, by
-`test_incremental_load_with_no_new_rows_writes_nothing`.
+### 9. PRINCIPAL ENGINEER VIEW
 
-### 15.6 How to test
+The id-vs-timestamp watermark choice is a favorite interview probe because it looks like a minor implementation detail but is actually testing whether you understand why clock-dependent state is dangerous in distributed writes — "two events can share a timestamp, or even appear out of order, under concurrent writes or clock skew" is the kind of insight that separates someone who's internalized distributed systems failure modes from someone reciting definitions.
 
-```bash
-make test                # unit tests: SQLite + mocked S3, no Docker needed
-make up
-make test-integration     # real Postgres + MinIO
-```
+The ordering bug in the EXPERIMENT section (checkpoint-before-write vs write-before-checkpoint) is a real, general pattern worth having ready: whenever a "commit" or "checkpoint" step and a "write the data" step are two separate operations, the two possible failure windows have asymmetric severity — one produces a visible, detectable stuck state; the other produces an invisible data gap that nobody notices until someone asks "why is this data missing" much later. Good production systems always order the checkpoint after the write, never before.
 
-The full unit suite (27 tests — 15 from Section 14 plus 12 new: 4 for
-`build_bronze_incremental_key`/`write_bronze_incremental` in
-`test_object_store.py`, 8 in `test_extract_incremental.py`) was run in
-this environment while writing this section (Python 3.11,
-`PYTHONPATH=ingestion/src python3 -m pytest ingestion/tests/unit -q`) and
-genuinely passed — this is an ACTUAL OBSERVED result, not a projection:
+### 10. REMEMBER
 
-```
-27 passed in 12.78s
-```
-
-`ingestion/tests/integration/test_incremental_load_integration.py` (3
-tests: reads-only-new-rows, no-op-writes-nothing, retry-overwrites-not-
-duplicates) is written and `ruff check`-clean, but **not yet executed** —
-there is no Docker daemon available in this sandbox (`docker info` fails
-here). Run it yourself with `make up && make test-integration` and this
-section will be updated with the actual observed result once that's done
-in an environment with Docker.
-
-### 15.7 Failure Scenario
-
-**What happens if the process is killed after `write_bronze_incremental`
-succeeds but before `finish_run_success` records the new watermark?**
-
-This is the incremental-load analogue of Section 14.7's full-load failure
-scenario, and it matters more here because a watermark, unlike a full
-load's date-scoped key, controls *what the next run even attempts to
-read*. The Bronze object for this run's batch now exists in MinIO, but
-`ingestion_metadata` still shows `status='running'` for it —
-`get_last_watermark` only reads `status='success'` rows, so the next run
-resumes from the *old* watermark, not the one this run computed. Recovery:
-re-running is safe, but not for free — it re-extracts the same rows a
-second time and, because the `id > watermark` starting point is unchanged,
-computes the **same** `(watermark_start, watermark_end)` pair, which
-`build_bronze_incremental_key` turns into the **same** key — so the retry
-overwrites the first (orphaned, `running`) run's object with identical
-bytes. This is exactly the scenario
-`test_retrying_the_same_failed_watermark_range_overwrites_not_duplicates`
-proves.
-
-**The one case where this guarantee does NOT fully hold, stated honestly:**
-if new rows are inserted into `clicks` *between* the failed run and its
-retry, the retry's `extract_incremental` call reads a *larger* range than
-the failed run did (same `watermark_start`, but a higher `watermark_end`,
-because `df["id"].max()` is now bigger). `build_bronze_incremental_key`
-then computes a **different** key — so the retry writes a **second**,
-non-overlapping-but-superset object next to the orphaned first one,
-instead of cleanly overwriting it. The orphaned object isn't wrong (every
-row in it is correct data), but it *is* redundant — some rows now exist in
-two Bronze objects. **Production implication:** this is precisely the kind
-of edge case a real orchestrator's retry policy and a periodic
-Bronze-compaction/cleanup job need to account for; Phase 1 documents it
-rather than hides it, consistent with this project's stated principle of
-being honest about POC limitations (see ADR-007's note on retention) —
-fully closing this gap would mean either detecting and deleting orphaned
-`running` objects on startup, or moving to a run-id-scoped key with
-separate deduplication downstream, both explicitly out of scope here.
-
-### 15.8 Production Considerations
-
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Watermark source | `clicks.id`, a `BIGSERIAL` — assumes an ever-increasing integer PK on every incrementally-loaded table | Same idea, but often a dedicated monotonic sequence or `updated_at` handled via CDC, since not every production table has an integer PK suited to this |
-| Captures updates/deletes | No — insert-only; a row that's later updated in place is never re-read | CDC (Debezium/logical replication) captures every write type; polling-based incremental load fundamentally cannot |
-| Scheduling | Manual (`make ingest`) | Orchestrator-driven (Airflow, etc. — Phase 3), on a fixed interval, with alerting on missed/late runs |
-| Orphaned-object cleanup | None — see 15.7's residual edge case | A periodic reconciliation job comparing `ingestion_metadata` against actual Bronze object listings |
-| Watermark column requirement | Must be indexed (`ix_clicks_...` — not yet added; see the Hands-on Challenge two sections up about partition/index design) | Same requirement, enforced by data-contract review before a new table is onboarded to incremental load |
-
-### Principal Data Engineer Perspective
-
-The decision worth being able to defend in review here isn't "should this
-use a watermark" — it's *which* watermark, and principal-level judgment
-shows up in naming the assumption an id-based watermark makes explicit:
-this approach only works because `clicks` is, by this project's own
-design, insert-only and never updated after the fact. The moment a real
-requirement appears — "let us edit or soft-delete a click record for
-fraud correction," say — this entire mechanism silently stops being
-correct, because an updated row's `id` doesn't change, so it will never be
-picked up by `WHERE id > watermark` again. A weaker engineer ships the
-id-based watermark and moves on; a principal engineer writes down, at
-design time, the exact condition under which it breaks — which is what
-this section's Trade-offs table and ADR-005 are for — so that whoever
-adds update/delete support later inherits a known, documented constraint
-instead of discovering it by debugging a data-quality incident. The second
-thing worth flagging: this section's failure-scenario writeup admits a
-real, if narrow, idempotency gap (15.7) rather than claiming a stronger
-guarantee than the code actually provides. That's a deliberate modeling
-choice about what to prioritize in a portfolio project — an interviewer
-evaluating this repo should come away trusting every claim it makes,
-which is worth more than a repo that quietly overstates its own
-correctness.
-
-### 15.9 Principal Engineer Interview Questions
-
-**Q: "Why an id-based watermark instead of a timestamp-based one? Walk me
-through a concrete scenario where the timestamp-based version breaks."**
-
-*What's tested:* whether the candidate understands watermarking as a
-correctness mechanism with a specific failure mode, not just a
-stylistic choice.
-
-*What a weak answer looks like:* "Timestamps can have clock skew issues" —
-true, but vague enough to sound memorized rather than understood.
-
-*What a strong answer covers:* concretely, suppose two application
-servers both insert a `clicks` row in the same second, and an incremental
-run's watermark is set to `occurred_at = 14:00:00`. If a third row with
-`occurred_at = 14:00:00` from a *different* server arrives one second
-later (its clock was one second slow, or its write was simply delayed by
-normal network/lock contention), the next run's `WHERE occurred_at >
-'14:00:00'` **silently excludes it forever** — it's not late, it's gone.
-An id-based watermark cannot have this failure: Postgres assigns
-`BIGSERIAL` values from a single sequence, in the literal order rows
-commit, with no dependency on any client's clock or on network delay.
-
-*Concepts:* watermark correctness, clock skew, "equal-to-cutoff" boundary
-ambiguity in timestamp comparisons.
-
-*Expected follow-up:* "What does the id-based approach give up in
-exchange?" — It can't detect that an existing row was updated or deleted,
-only that new rows were inserted (see the next question).
-
-*Common mistake:* describing clock skew only in terms of literal wall-clock
-drift between servers, without connecting it to the actual mechanism (a
-row landing with a timestamp *earlier* than the watermark's current
-cutoff, purely because of when it was written relative to other writes).
-
-**Q: "This incremental load only ever sees new rows. What happens if a
-`clicks` row is updated after it's already been ingested — say, a
-fraud-review process changes `device_type` on a row that was ingested
-yesterday? Will this pipeline ever see that change?"**
-
-*What's tested:* whether the candidate recognizes the boundary of what an
-id-based, insert-scoped watermark can and can't capture — a very common
-gap between "the demo works" and "this is production-correct for the
-actual write pattern."
-
-*What a weak answer looks like:* "It'll pick it up next run" — incorrect;
-this is the single most important limitation of this design and needs to
-be named as one.
-
-*What a strong answer covers:* no — `WHERE id > watermark` only ever
-matches rows whose `id` wasn't ingested yet; an update to an
-already-ingested row doesn't change its `id`, so it will never satisfy
-that condition again, ever, under this mechanism. Bronze silently becomes
-stale relative to OLTP for that row. Real options: add and watermark on an
-`updated_at` column too (catches updates, still has the timestamp
-caveats from the previous question); move to CDC, which captures every
-write type at the WAL level regardless of what changed; or, for this
-project's actual `clicks` design specifically, treat click records as
-genuinely immutable (never updated after insert) as a stated data
-contract, which sidesteps the problem by design rather than by mechanism.
-
-*Concepts:* insert-only vs. mutable source tables, the difference between
-"my watermark logic is correct" and "my watermark logic matches this
-table's actual write pattern."
-
-*Expected follow-up:* "How would you even detect this gap in production,
-before a stakeholder notices stale numbers?" — Row-count and checksum
-reconciliation between OLTP and Bronze on a schedule, which is exactly
-what Section 25 (Failure Scenarios) and a future data-quality section
-would formalize.
-
-*Common mistake:* conflating "the pipeline ran successfully" with "the
-data is correct" — a successful `status='success'` checkpoint says nothing
-about whether an update to already-ingested data was captured, because
-this mechanism was never designed to look for that in the first place.
-
----
+Watermark = one saved number that turns "read everything" into "read what's new." That's the whole trick.
+ID-based watermarks beat timestamp-based ones specifically because they're immune to clock skew and duplicate values — at the cost of only working for insert-only tables.
+"No new rows" is a success, not an edge case — don't write empty files just to have something to point at.
+Checkpoint (mark success) must always happen after the write it's checkpointing, never before — reversed order turns a visible failure into a silent data gap.
 
 ## 16. Checkpointing ✅✅
 
-### 16.1 Concept
+### 1. CONCEPT
 
-A **checkpoint** is a durable record of whether one specific run of a
-pipeline completed, currently in progress, or failed — independent of
-watermarks, and independent of what the run actually produced. This repo's
-checkpoint is the `status` column on `ingestion_metadata`
-(`'running'` → `'success'` or `'failed'`), one row per run, written
-*before* extraction starts (`status='running'`) and updated exactly once
-more when the run ends. Sections 14 and 15 already used this mechanism —
-every `run_full_load` and `run_incremental_load` call is checkpointed —
-but always in service of watermarking or idempotency, never as the subject
-itself. This section is that dedicated treatment: what a checkpoint is
-*for*, on its own; what "stale" means for one; and the gap named as far
-back as Section 15.8's Production Considerations table
-("`ingestion_metadata` has no automated stale-`running`-row alerting") —
-closed in this increment by `metadata.find_stale_running_runs` and the new
-`check-stale-runs` CLI command.
+A checkpoint is a durable record of whether one specific run finished, is still in progress, or failed — separate from watermarks, separate from what data the run actually produced. You've already been using it without naming it: every start_run/finish_run_success/finish_run_failure call in metadata.py, since Section 14, has been writing checkpoints. This concept is the dedicated look at why that pattern exists on its own merits, independent of the idempotency/watermark stories built on top of it.
 
-### Why does this exist?
+It matters because "did this job finish?" has no reliable answer once you can no longer ask the process itself — and you can't, the moment it's been killed (OOM, spot eviction, kubectl delete pod, a laptop losing power). A checkpoint answers the question a different way: write the intent down before doing the work, then update the record on definite success or definite failure. Anyone reading the table later — a human, an orchestrator, a monitor — reconstructs exactly what happened from the row alone, with zero dependency on the crashed process still being around to explain itself.
 
-Without a checkpoint, "did this run finish?" has no answer that survives a
-crash. A batch job's own process exiting non-zero is a fine signal *while
-the process is still running and something is watching it* — but the
-moment the process itself is killed (OOM, a spot-instance eviction, a
-`kubectl delete pod`, a laptop losing power mid-run), there's no process
-left to report anything. A checkpoint answers the question a different
-way: **write down the intent before doing the work, and update the record
-only on definite success or definite failure.** Anyone querying
-`ingestion_metadata` later — a human debugging, an orchestrator deciding
-whether to retry, a monitoring job — reconstructs exactly what happened
-from the row itself, with no dependency on the crashed process still being
-around to explain itself.
+### 2. URL SHORTENER EXAMPLE
 
-### Simple Example (generic, pre-URL-Shortener)
+metadata.start_run(...) inserts status='running' before extract_full/extract_incremental ever touches Postgres. If the process gets OOM-killed mid-scan on a large clicks full load, that row is frozen exactly as written: status='running', completed_at still NULL — forever, because nothing is left running to update it. You already produced a real, tame version of this: your full row for urls/users at 11:10:39 and 11:23:54 both show status='success' with real completed_at timestamps — that's the checkpoint doing its job correctly. What this section adds is the machinery to notice when a row is stuck, instead of leaving that to a human eyeballing the table.
 
-Imagine a nightly job that copies files from server A to server B. With no
-checkpoint: the job runs, copies file 3 of 10, and the machine loses power.
-Tomorrow, nobody — not a human, not a script — can tell from server B alone
-whether last night's job completed, partially completed, or never started;
-inspecting file counts on B is a guess, not a fact, since a legitimately
-completed prior run and a half-finished one can look identical from the
-destination's point of view. With a checkpoint: a `runs` table gets a row
-the instant the job starts (`status='running'`), and a second update the
-instant it finishes (`status='done'`) or fails. A row still `status='running'`
-the next morning is now a *fact*, not a guess — the job crashed mid-flight,
-full stop, and whoever finds that row knows to investigate rather than
-assume.
+### 3. DESIGN
 
-### URL Shortener Example
+New piece: metadata.find_stale_running_runs(engine, max_runtime_minutes=60, pipeline_name=None), wired into a new CLI command check-stale-runs. It's a single read-only query: any status='running' row whose started_at is older than the threshold gets reported. Exit code 1 if any are found — that's the entire monitoring interface, meant to be wrapped by a cron or an Airflow sensor later.
 
-Concretely, in this repo: `metadata.start_run(engine, pipeline_name,
-table_name, load_type)` inserts a row with `status='running'` and a real
-`started_at` timestamp *before* `extract_full`/`extract_incremental` ever
-touches the database. If the ingestion process is killed by, say, an OOM
-kill while `pd.read_sql_table` is mid-scan on a large `clicks` table, that
-row is left exactly as it was written: `status='running'`, `completed_at`
-still `NULL`. Nothing updates it, because nothing is left running to update
-it. Section 14.7 and 15.7 already walked through what this means for the
-*specific* run that crashed (its watermark/Bronze object never gets
-promoted); this section is about the row itself, sitting there
-indefinitely, until something notices it.
+Key decision — detect staleness by elapsed time, not a heartbeat. A status='running' row is ambiguous on its own: still legitimately in progress, or crashed? Two ways to disambiguate were on the table:
 
-### 16.2 Architecture
+Heartbeat — a long-running process updates its own row every N seconds to prove it's alive; a row is stale only once its heartbeat also goes quiet. Precise, but requires touching every run_*_load function to add the heartbeat write, plus something to actually schedule those periodic writes.
+Lock/lease — e.g. a Postgres advisory lock held for the run's duration; stale means "lock is free but row still says running." Also precise, but introduces lock-lifecycle bugs of its own (a lock that never gets released is a new failure mode you didn't have before).
+Elapsed-time threshold (chosen) — "if started_at is more than 60 minutes ago and still running, call it stale." One query, no changes to any existing run function, no new infrastructure. The real cost: it's a guess, not a fact — a run that's legitimately still executing past the threshold gets misclassified as crashed.
 
-```
-                    ┌─────────────────────────────────────────┐
-                    │            ingestion_metadata            │
-                    │                                           │
-  start_run() ─────▶│  INSERT status='running', started_at=now │
-                    │                                           │
-                    │        (extraction + Bronze write         │
-                    │         happen HERE, outside the table)   │
-                    │                                           │
-finish_run_success()│  UPDATE status='success', bronze_key,     │
-      ─────────────▶│         watermark_end, completed_at       │
-                    │                                           │
- finish_run_failure()│ UPDATE status='failed', error_message,   │
-      ─────────────▶│         completed_at                      │
-                    └─────────────────────────────────────────┘
-                                       │
-                                       │  a crash between start_run()
-                                       │  and either finish_run_*()
-                                       ▼
-                    ┌─────────────────────────────────────────┐
-                    │  row permanently stuck at status='running'│
-                    │  (nothing left to update it)               │
-                    └─────────────────────────────────────────┘
-                                       │
-                     find_stale_running_runs(engine,
-                       max_runtime_minutes=60)
-                                       │
-                                       ▼
-                    ┌─────────────────────────────────────────┐
-                    │  check-stale-runs CLI: logs each one,      │
-                    │  exits 1 — wire into a monitoring cron     │
-                    └─────────────────────────────────────────┘
-```
+That trade-off is exactly right for this project's current scale (Section 13.1's stated scope: no orchestrator, no concurrent distributed workers yet). It would stop being the right choice the moment job durations become highly variable or genuinely long-running.
 
-The checkpoint write is deliberately *outside* the extraction/write
-transaction — `start_run` commits and returns before `extract_full` or
-`extract_incremental` ever runs. This is what makes the `status='running'`
-row observable *while the run is still in progress*, not just after it
-ends; a checkpoint that only got written at the end wouldn't distinguish
-"still running, legitimately" from "crashed," which is the entire point
-of having one.
+The other real decision, smaller but worth internalizing: the cutoff timestamp is computed in Python (datetime.now(UTC) - timedelta(minutes=max_runtime_minutes)) and passed as a bound parameter — not now() - interval '60 minutes' written directly in SQL. Reason: this function is unit-tested against SQLite (no interval syntax at all) and run against Postgres in production. A plain bound timestamp parameter works identically against both; the same cross-dialect reasoning you'd have seen in contracts.py, applied here a second time.
 
-### 16.3 Design Decision: detect staleness by elapsed time, not by a heartbeat
+### 4. IMPLEMENTATION
 
-**Context:** a `status='running'` row could mean two very different
-things — a run that's still legitimately in progress (a large `clicks`
-full load can take real wall-clock time), or a run that crashed. Something
-needs to tell these apart without a human eyeballing timestamps by hand.
-**Decision:** `find_stale_running_runs(engine, max_runtime_minutes=60)`
-treats any `'running'` row whose `started_at` is older than
-`max_runtime_minutes` ago as stale — a single, simple threshold, no
-heartbeat mechanism. **Alternatives considered:** (1) a periodic
-heartbeat, where a long-running process updates its own row every N
-seconds to prove it's still alive, and a row is stale only if its
-heartbeat has also gone quiet; (2) a distributed lock / lease (e.g. a
-Postgres advisory lock held for the run's duration), where staleness is
-"the lock is free but the row says running" instead of elapsed time at
-all. **Trade-offs:** a heartbeat correctly distinguishes "still running,
-slowly" from "crashed" even for a run that legitimately takes longer than
-`max_runtime_minutes` — this threshold approach cannot make that
-distinction and will misclassify a genuinely slow-but-healthy run as
-stale. In exchange, the threshold approach needs no changes to the running
-process itself (`start_run`/`finish_run_success`/`finish_run_failure`
-already existed, unchanged, from Sections 14-15) and no extra
-infrastructure (no lock manager, no separate heartbeat writer thread) —
-it's a single read-only query over data this table already has.
-**Consequences:** `max_runtime_minutes` must be set to something
-meaningfully larger than this pipeline's slowest *legitimate* run (a full
-load of the largest configured table, under realistic load) — set it too
-low and `check-stale-runs` produces false positives; the guide's Section
-16.7 Production Considerations table names this directly as an operational
-tuning parameter, not a fixed constant.
-
-### Alternatives
-
-Covered above as part of the Design Decision — repeated here per this
-guide's template: heartbeat-based liveness, and lock/lease-based liveness,
-both rejected in favor of the simpler elapsed-time threshold for this
-project's current scale and operational maturity (no orchestrator, no
-distributed workers yet — see Section 13.1's explicit scope boundary).
-
-### Trade-offs
-
-| | Elapsed-time threshold (chosen) | Heartbeat | Lock/lease |
-|---|---|---|---|
-| Distinguishes "slow but healthy" from "crashed" | No — a threshold is a guess, tuned by hand | Yes, precisely | Yes, precisely |
-| Infra required | None — one query | A writer thread/process per run, updating its own row | A lock manager (Postgres advisory locks work; needs care around connection lifetime) |
-| Implementation cost (this repo) | One function, ~15 lines | Would touch every `run_*_load` function | Would touch every `run_*_load` function and add a new failure mode (lock never released) |
-| Right fit for this project's current scale | Yes | Overkill — no long-running or highly-variable-duration jobs yet | Overkill — no concurrent workers to arbitrate between yet |
-
-### 16.4 Implementation
-
-**Implementation Guide vs. Reference Implementation:** as in Sections 14-15,
-read the *Implementation Guide* paragraph, close the guide, write the
-function yourself against the stated signature, then compare.
-
----
-
-**CREATE:** (edit) `ingestion/src/url_shortener_analytics/metadata.py` —
-`find_stale_running_runs`
-
-**PURPOSE:** Query for every checkpoint row that's almost certainly a
-crashed run, so an operator or a monitoring job can find out without
-manually inspecting `ingestion_metadata`.
-
-**DEPENDENCIES:** nothing new — the same `Engine`/`text()` pattern every
-other function in this module already uses.
-
-**IMPLEMENTATION GUIDE (write it yourself):** the query itself is simple —
-`SELECT ... FROM ingestion_metadata WHERE status = 'running' AND started_at
-< :cutoff`, optionally `AND pipeline_name = :pipeline_name`. The one
-genuine design decision is *where* `:cutoff` gets computed. Two options:
-`started_at < now() - interval '60 minutes'` entirely in SQL, or `cutoff =
-datetime.now(UTC) - timedelta(minutes=60)` in Python, passed as a bound
-parameter. Pick the second — and before reading further, work out why.
-(Answer: this function is unit-tested against SQLite, whose SQL dialect
-has no `interval` syntax at all, and used against Postgres in production.
-Computing the cutoff in Python and binding it as a plain timestamp works
-identically against both dialects; this is the exact same
-cross-dialect-portability reasoning `contracts.py`'s `_categorize_type`
-used in Section 12.2 for comparing reflected column types instead of raw
-SQL type strings — the same lesson, applied a second time, in a different
-part of the codebase.)
-
-**REFERENCE IMPLEMENTATION:**
+Already in your metadata.py — you read the whole file earlier this session:
 
 ```python
-# ingestion/src/url_shortener_analytics/metadata.py (excerpt)
-
 def find_stale_running_runs(
     engine: Engine, *, max_runtime_minutes: int = 60, pipeline_name: str | None = None
 ) -> list[dict[str, Any]]:
@@ -3485,326 +2920,62 @@ def find_stale_running_runs(
         for r in rows
     ]
 ```
+cli.py's check_stale_runs_command wraps this: prints a warning per stale row, exits 1 if any exist, exits 0 ("no stale running runs found") otherwise.
 
-Full file (with the existing `start_run`/`finish_run_success`/
-`finish_run_failure`/`get_last_watermark` this section builds on):
-[`ingestion/src/url_shortener_analytics/metadata.py`](../ingestion/src/url_shortener_analytics/metadata.py).
+### 5. CODE WALKTHROUGH
 
-**RUN:** `make check-stale-runs` (wraps `python -m
-url_shortener_analytics.cli check-stale-runs --max-runtime-minutes 60`)
+Nothing about start_run/finish_run_success/finish_run_failure changed for this section — that's the point being made explicitly in your guide: because the checkpoint mechanism was already correct and complete from Section 14 onward, closing this real operational gap ("no stale-run alerting") cost exactly one small read-only function, not a rewrite of anything. That's the payoff of building the metadata table correctly on day one instead of patching fields into it as each new need shows up.
 
-**VERIFY:** `PGPASSWORD=analytics psql -h localhost -U analytics -d
-analytics -c "SELECT run_id, source_table, started_at FROM
-ingestion_metadata WHERE status='running';"` — compare against what
-`check-stale-runs` reports.
+The WHERE status = 'running' filter is doing real work: find_stale_running_runs deliberately excludes success and failed rows — a completed run, whatever its outcome, is not "stale" by definition. Staleness is specifically about a run whose true final state is unknown.
 
-**EXPECTED:** with no crashed runs, `check-stale-runs` logs "no stale
-running runs found" and exits 0. With a genuinely stuck row (LAB 12
-below), it logs one `"stale running run"` warning per row and exits 1.
-
-**TEST:** `ingestion/tests/unit/test_metadata.py` — five new tests:
-finds-a-genuinely-stale-run, excludes-a-run-within-the-cutoff,
-excludes-success-and-failed-rows (only `status='running'` counts —
-completed rows of either outcome are not "stale," by definition),
-pipeline-name filtering, plus the pre-existing suite this section didn't
-touch.
-
-**PRODUCTION CONSIDERATIONS:** see Section 16.7.
-
-**INTERVIEW QUESTIONS:** see Section 16.9.
-
----
-
-**CREATE:** (edit) `ingestion/src/url_shortener_analytics/cli.py` —
-`check_stale_runs_command` / `check-stale-runs` subcommand
-
-**PURPOSE:** Surface `find_stale_running_runs` as something a cron job or
-an orchestrator step can actually call and alert on.
-
-**IMPLEMENTATION GUIDE (write it yourself):** follow this file's
-established pattern exactly (see `validate_contracts_command` for the
-closest precedent): build `settings`/`engine`, call
-`metadata.find_stale_running_runs(...)`, log a warning per stale run
-found, and return `1` if any were found, `0` otherwise — the exit code is
-what makes this wireable into automated alerting (a non-zero exit from a
-cron step is the universal "something's wrong" signal).
-
-**REFERENCE IMPLEMENTATION:**
-
-```python
-# ingestion/src/url_shortener_analytics/cli.py (excerpt)
-
-def check_stale_runs_command(max_runtime_minutes: int = 60) -> int:
-    settings = get_settings()
-    configure_logging(settings.log_level)
-    engine = engine_from_settings(settings)
-
-    stale = metadata.find_stale_running_runs(engine, max_runtime_minutes=max_runtime_minutes)
-    if not stale:
-        logger.info("no stale running runs found", extra={"max_runtime_minutes": max_runtime_minutes})
-        return 0
-    for run in stale:
-        logger.warning("stale running run", extra={**run, "started_at": str(run["started_at"])})
-    logger.error("stale running runs found", extra={"count": len(stale)})
-    return 1
-```
-
-Full file: [`ingestion/src/url_shortener_analytics/cli.py`](../ingestion/src/url_shortener_analytics/cli.py).
-
-**RUN / VERIFY / EXPECTED:** see the block above — identical, since this
-*is* the CLI wrapper around it.
-
-**TEST:** exercised indirectly by `test_metadata.py`'s coverage of the
-underlying function; `cli.py`'s command functions themselves are thin
-enough (settings → engine → one function call → log/exit) that this repo
-does not unit-test the CLI layer separately, consistent with how
-`run_command`/`run_full_load_command`/`validate_contracts_command` are
-already treated in Sections 14-15 — see Section 16.7's Production
-Considerations table for what a production monitoring setup adds on top
-of this.
-
-**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections 16.7/16.9.
-
----
-
-### Hands-on Challenge (implement-yourself)
-
-Before LAB 12 below, try this without looking at `metadata.py`: write a
-SQL query (not Python — raw SQL) that does what `find_stale_running_runs`
-does, using Postgres's own `now() - interval '60 minutes'` instead of a
-bound parameter. Run it directly with `psql`. Then answer: why does this
-guide's actual implementation deliberately avoid the syntax you just used?
-(You already have the answer from 16.4's Implementation Guide — this
-exercise is about *feeling* the portability cost firsthand: try running
-your `interval`-based query against the SQLite `sqlite_engine` fixture in
-`ingestion/tests/unit/conftest.py` and watch it fail outright, since
-SQLite has no `interval` syntax at all.)
-
-### 16.5 Hands-on Exercise
-
-**LAB 12 — Manufacture a stale run and detect it.**
-
-Prerequisites: a running Postgres reachable at `DATABASE_URL` (real
-`docker compose`, or the local Postgres 16 this guide has used directly in
-this sandbox — see Section 16.6 below for exactly which one this lab was
-run against).
+### 6. RUN
 
 ```bash
-# 1. Start a run's checkpoint (simulating a process that's about to crash)
+make check-stale-runs
+```
+
+With no crashed runs, expect one line: "no stale running runs found", exit 0. To actually see it catch something, manufacture a stale run:
+
+```bash
 python3 -c "
 from url_shortener_analytics.config import get_settings
 from url_shortener_analytics.db import engine_from_settings
 from url_shortener_analytics import metadata
 engine = engine_from_settings(get_settings())
 run_id = metadata.start_run(engine, 'lab12_pipeline', 'clicks', load_type='full')
-print('started', run_id)
-"
-
-# 2. Confirm check-stale-runs does NOT flag it yet (started seconds ago)
-make check-stale-runs   # exits 0 -- "no stale running runs found"
-
-# 3. Backdate it to simulate a crash 90 minutes ago
-psql "$DATABASE_URL" -c "
-  UPDATE ingestion_metadata
-  SET started_at = now() - interval '90 minutes'
-  WHERE pipeline_name = 'lab12_pipeline'
-"
-
-# 4. Now check-stale-runs finds it
-make check-stale-runs   # exits 1 -- one "stale running run" warning logged
-echo $?                 # 1
+print('started', run_id)"
 ```
 
-What to observe: `check-stale-runs`'s exit code flips from 0 to 1 purely
-because of the backdated `started_at` — nothing else about the row
-changed. This is the exact mechanism a production alerting rule would
-watch (`echo $? != 0` in a cron wrapper, or a dedicated Airflow sensor task
-in Phase 3+).
+Run make check-stale-runs right after — it should still report clean (started seconds ago, not stale yet). Then backdate it to simulate a crash 90 minutes in the past:
 
-### 16.6 How to test
-
-```bash
-make test                # unit: SQLite, no Docker needed
+```sql
+UPDATE ingestion_metadata
+SET started_at = now() - interval '90 minutes'
+WHERE pipeline_name = 'lab12_pipeline';
 ```
 
-The full unit suite (59 tests — up from 38 at the end of the Section 7-12
-increment, 21 new: 8 for `find_stale_running_runs`/bronze-key persistence
-in `test_metadata.py`, 5 for `head_object`/`list_bronze_keys` in
-`test_object_store.py`, 9 in the new `test_reconciliation.py` covering
-Section 17 below) was run in this environment while writing this section
-and genuinely passed — ACTUAL OBSERVED, not a projection:
+Run make check-stale-runs again — now it should log one "stale running run" warning and exit 1 (echo $? to confirm). Nothing else about the row changed except started_at — that's the entire mechanism, made concrete.
 
-```
-59 passed in 6.96s
-```
+### 7. EXPERIMENT
 
-`find_stale_running_runs` and `list_successful_bronze_keys` were also
-genuinely exercised against this sandbox's real (non-Docker) local
-Postgres 16 — not just SQLite — directly with SQLAlchemy against
-`postgresql+psycopg2://analytics:analytics@localhost:5432/analytics`: a
-run's `bronze_key` really does persist and round-trip through
-`list_successful_bronze_keys`; a row's `started_at` backdated 90 minutes
-really is picked up by `find_stale_running_runs(max_runtime_minutes=60)`
-and a fresh row genuinely is excluded; deleting the verification rows
-afterward left the table exactly as it was before. One genuine,
-previously-undiscovered cross-dialect wrinkle surfaced doing this: a
-Postgres `uuid` column round-trips as a Python `uuid.UUID` object through
-a raw `SELECT`, while this same table's SQLite unit-test fixture (`run_id
-TEXT PRIMARY KEY`) round-trips it as a plain `str` — comparing a
-`find_stale_running_runs` result's `run_id` against the `str` returned by
-`start_run` needs an explicit `str(...)` cast when reading it back from
-real Postgres, even though the SQLite-backed unit tests never need one.
-This is exactly the kind of dialect difference `contracts.py`'s coarse
-type categories (Section 12.2) exist to paper over at the *schema* level —
-this is the same class of issue showing up one level down, at the
-*driver's Python type mapping* level, which no amount of coarse-category
-schema comparison would have caught, because it isn't a schema mismatch at
-all.
+This is the experiment that actually matters more than the lab above: think through the false-positive case before checking your intuition against it. Suppose clicks' full load genuinely takes 75 minutes once the table grows large (remember — Section 14's extract_full has no chunking, it's one memory-bound query). check-stale-runs runs on the default 60-minute threshold. At minute 61 of a perfectly healthy, still-executing run, it gets reported as stale. If that's wired into paging, someone gets woken up for nothing — and worse than the wasted page, they start trusting the alert less the next time it fires, which is a much harder cost to undo. Now the inverse: what happens if max_runtime_minutes is set too high instead? (Answer: a genuinely crashed run sits undetected longer, and anything downstream depending on freshness — a dashboard, later in Phase 2 — stays silently stale that much longer too.) There's no value that's simply "correct" here, only one tuned to this specific pipeline's actual p99 run duration.
 
-**Not yet executed:** an integration test exercising `check-stale-runs`
-against real Docker infrastructure end-to-end (CLI process → real
-Postgres) — there is no Docker daemon in this sandbox; the function-level
-logic above was verified against real Postgres directly, but the full
-`make check-stale-runs` CLI invocation itself remains a DESIGN
-EXPECTATION for the reader to confirm with `make up`.
+### 8. PRODUCTION VIEW
 
-### 16.7 Failure Scenario
+Right now check-stale-runs's exit code is the entire monitoring interface — nothing calls it automatically, nothing pages anyone. Production wires it into a scheduled invocation (a cron, or an Airflow sensor once you're past Kafka) that pages on-call on a non-zero exit. Some shops go further and auto-mark a sufficiently stale running row as failed once alerting has fired, so a retry can be scheduled without a human in the loop. The threshold itself should ideally be derived per-pipeline from observed p99 duration, not left at one guessed global default — that's a real, ongoing operational tuning job, not a one-time setting.
 
-**What happens if `max_runtime_minutes` is set too low relative to this
-pipeline's actual slowest legitimate run?**
+### 9. PRINCIPAL ENGINEER VIEW
 
-Concretely: suppose a full load of `clicks` genuinely takes 75 minutes
-once its row count grows large enough (Section 14's POC-simplified
-single-query extraction, per its own Production Considerations table, has
-no chunking — a big enough table means a long, memory-bound, single scan),
-and `check-stale-runs` runs on a 60-minute threshold. At minute 61 of a
-perfectly healthy, still-executing run, `check-stale-runs` reports it as
-stale — a false positive. If this is wired into paging (Section 16's
-"Production Considerations" below), an on-call engineer gets woken up for
-nothing, investigates, finds the run is fine, and — the real cost — starts
-trusting this alert less the next time it fires. This is precisely why
-16.3's Design Decision names the threshold as a tuned operational
-parameter, not a fixed constant: it must be set above the pipeline's
-actual p99 run duration under realistic load, with margin, and revisited
-as data volume grows. The heartbeat/lock alternatives from 16.3 don't have
-this specific failure mode (they detect "still alive" directly, rather
-than inferring it from elapsed time) — this is the sharpest, most concrete
-way to state what this design decision actually costs.
+The interview-ready version of this section isn't "I built stale-run detection" — it's naming the exact condition under which your chosen mechanism gives a wrong answer, in the same breath as defending the choice. "I used an elapsed-time threshold because it needed zero new infrastructure at this project's current scale, and I know exactly when it breaks: once job duration becomes highly variable, a threshold starts producing false positives, and the fix at that point is a heartbeat, not a bigger threshold." That combination — the right choice for the current stage, plus a clear-eyed statement of its failure boundary — is what distinguishes "shipped something" from "understands the trade-off they shipped."
 
-**The inverse also matters:** a threshold set too *high* delays detecting
-a genuinely crashed run — the stale row sits unnoticed for longer, and
-whatever depended on this table's freshness (a downstream dashboard, in
-Phase 2+) stays silently stale for that much longer too. There's no value
-of `max_runtime_minutes` that's simply "correct" — only a value that's
-appropriately tuned to this specific pipeline's actual behavior, which is
-exactly the kind of judgment call a principal engineer is expected to make
-explicitly rather than leave at a framework's default.
+The second thing worth having ready: a real, previously-undiscovered dialect wrinkle showed up testing this against real Postgres versus SQLite — a Postgres uuid column round-trips as a Python uuid.UUID object through a raw SELECT, while the SQLite test fixture (run_id TEXT PRIMARY KEY) round-trips it as a plain str, so comparing run_ids read back from real Postgres needs an explicit str(...) cast that the SQLite-backed unit tests never needed. It's a good concrete example of "your unit tests passing against SQLite doesn't guarantee correctness against the real database" — a distinction interviewers like probing directly.
 
-### 16.8 Production Considerations
+### 10. REMEMBER
 
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Staleness detection | Elapsed-time threshold, one manual `check-stale-runs` invocation | Same threshold *and* a heartbeat for long-running jobs, to eliminate the false-positive failure mode above |
-| Alerting | None wired up — `check-stale-runs`'s exit code is the entire interface | A monitoring cron (or Airflow sensor) runs `check-stale-runs` on a schedule and pages on-call on a non-zero exit |
-| Auto-remediation | None — a stale row sits until a human runs `check-stale-runs` and investigates | Some shops auto-mark a sufficiently-stale `running` row as `failed` after alerting fires, so a retry can be scheduled automatically without waiting on a human |
-| Threshold tuning | A single global default (60 minutes), overridable per invocation via `--max-runtime-minutes` | Tuned per pipeline/table, ideally derived from observed p99 run duration rather than a guessed constant |
-| Scope | This repo's own `ingestion_metadata` only | A real platform often centralizes checkpoint/run-state across many pipelines in one place (e.g. Airflow's own metadata database, or a dedicated observability platform) rather than one table per pipeline |
-
-### Principal Data Engineer Perspective
-
-The judgment call worth being able to defend here is naming the exact
-condition under which the chosen detection mechanism gives a wrong answer
-— not claiming it never does. Section 16.7's false-positive scenario is
-the single most likely way this exact code, deployed as-is, would produce
-a bad on-call experience in a real environment; a principal engineer
-ships the elapsed-time threshold (it's the right choice for this project's
-current scale, per 16.3's trade-off table) *and* writes down, in the same
-breath, what would have to be true for it to misfire and what the fix
-would look like when that day comes (a heartbeat, or at minimum a
-per-pipeline threshold instead of one global default). The second thing
-worth flagging: this is a genuinely small function — one query, no new
-infrastructure — precisely because the checkpoint mechanism it builds on
-(`start_run`/`finish_run_success`/`finish_run_failure`) was already
-correct from Section 14 onward. Closing an operational gap ("no
-stale-run alerting") cheaply, by adding a query over data that was already
-being durably recorded for other reasons, rather than by retrofitting new
-instrumentation everywhere, is exactly the payoff of building the
-metadata layer correctly and completely on day one (Section 13.3's stated
-reasoning) instead of adding fields to it piecemeal as each new need
-arises.
-
-### 16.9 Principal Engineer Interview Questions
-
-**Q: "Your staleness check uses a fixed time threshold. What's the
-specific failure mode of that approach, and how would you detect it in
-production before it causes a false alert?"**
-
-*What's tested:* whether the candidate can reason about a monitoring
-mechanism's own failure modes, not just describe what it detects when
-working correctly.
-
-*What a weak answer looks like:* "It might not be perfectly accurate" —
-true but not specific enough to show real understanding.
-
-*What a strong answer covers:* a threshold-based check cannot distinguish
-a genuinely slow-but-healthy run from a crashed one — if the threshold is
-set below the pipeline's actual worst-case legitimate duration, every
-sufficiently slow run gets misreported as stale. Detecting this in
-production: track actual run durations for `status='success'` rows over
-time (this repo's `ingestion_metadata` already has `started_at` and
-`completed_at` for exactly this), alert if the threshold is within some
-margin of the observed p99, and prefer a heartbeat mechanism once a
-pipeline's duration variance gets large enough that no single fixed
-threshold cleanly separates "slow" from "crashed."
-
-*Concepts:* liveness detection, false positives vs. false negatives in
-monitoring, threshold tuning from observed data rather than a guess.
-
-*Expected follow-up:* "Why not just use a heartbeat from the start?" —
-Because it's real added complexity (every long-running process needs to
-write its own liveness signal) that this project's current scale doesn't
-yet justify; see 16.3's full trade-off reasoning.
-
-*Common mistake:* answering only "make the threshold bigger" without
-naming the corresponding cost (slower detection of a genuinely crashed
-run) — treating this as a knob with no trade-off, rather than a real
-one.
-
-**Q: "Why is the checkpoint row written *before* extraction starts,
-rather than only once at the end with the final status?"**
-
-*What's tested:* whether the candidate understands what a checkpoint
-mechanism is actually for — specifically, why "was this ever attempted"
-needs to be observable independently of "did it succeed."
-
-*What a weak answer looks like:* "So you can log that it started" — not
-wrong, but misses the actual point.
-
-*What a strong answer covers:* if the row were only written at the end, a
-process crashing mid-run would leave **no record at all** that anything
-was attempted — not even a `'failed'` row, since nothing survives to write
-one. Writing `status='running'` before any real work begins turns "no
-information" into "a fact, even in the crash case": a row that never
-transitions out of `'running'` *is itself* the evidence of a crash. This
-is precisely what makes `find_stale_running_runs` possible at all — it has
-nothing to query if the checkpoint's initial write never happened.
-
-*Concepts:* observability of failure, not just success; the specific
-value of writing intent durably before doing risky work.
-
-*Expected follow-up:* "What if the `start_run` INSERT itself fails or the
-process crashes between opening a connection and committing it?" — Then
-there's genuinely no record, which is an acceptable, narrower gap than the
-one this design closes: it requires the crash to happen in a much smaller
-window (before a single `INSERT` commits) than "anywhere during the
-entire extraction and write").
-
-*Common mistake:* conflating "the checkpoint mechanism" with "logging" —
-a log line printed at the start of a run is not durable evidence the same
-way a committed database row is; a log line and its process can both
-disappear together in a real crash.
-
----
+A checkpoint answers "did this finish?" durably, independent of whether the process that ran it still exists to explain itself.
+Write the running row before doing the work, update it only on definite success or failure — that ordering is what makes a stuck row a fact, not a guess.
+An elapsed-time threshold is cheap and sufficient at small scale, but it's a guess: it will misclassify a slow-but-healthy run as stale if the threshold isn't tuned above your actual p99 duration.
+Closing an operational gap by querying data you're already durably recording (because the metadata table was designed completely up front) is cheaper than retrofitting new instrumentation later — this section cost one function precisely because Section 14 built the table right the first time.
 
 ## 17. Idempotency ✅✅
 
