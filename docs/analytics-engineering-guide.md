@@ -4069,186 +4069,42 @@ requirements driving genuinely different key structures.
 
 ## 21. File Layout ✅✅
 
-### 21.1 Concept
+1. CONCEPT
+First, how is this different from Partitioning, the thing we just covered?
 
-**File layout** is a distinct question from partitioning (Section 20):
-partitioning decides *which column values* split data into separate
-objects; file layout decides *how many files, and how big each one is*,
-within whatever partitioning scheme is already in place. This repo has
-had an answer to that second question since Section 14, without ever
-naming it explicitly: exactly **one file per partition** — one Parquet
-object per `(table, ingestion_date)` for full loads, one per
-`(table, watermark_start, watermark_end)` for incremental batches. This
-section makes that choice explicit, explains the failure mode it's
-avoiding on one side (too many small files) and the one it risks on the
-other (files that grow too large for a single partition to stay
-efficient), and adds a genuinely new piece of code —
-`get_file_layout_report` — to actually *measure* which side of that
-trade-off this repo's real data currently sits on.
+This trips people up, so let's separate it cleanly before going further.
 
-### Why does this exist?
+Partitioning answers: which column values split your data into separate objects? That's what put ingestion_date=2026-09-19 into your Bronze keys.
 
-Two failure modes sit on either side of "how many files should one
-partition have," and both are real, not hypothetical. **Too many small
-files**: Section 19.6 already measured this repo's own Parquet files
-paying a fixed per-file cost (footer, embedded schema, column metadata)
-that has to be parsed before any row data is touched — that exact fixed
-cost is paid again, in full, for every additional file a reader opens.
-A partition split into a thousand tiny files pays that fixed cost a
-thousand times over, for the same total data a single file would have
-paid it for once — this is "the small-file problem," a genuinely common
-failure mode in real data lakes, and it's the *same* underlying
-mechanism Section 19.6 already demonstrated, not a new concept. **Too
-few, overly large files**: the opposite failure — a single enormous file
-per partition limits how many parallel workers can read it at once (many
-engines split work by file, not by byte range, within a partition) and
-forces a reader wanting even a small slice of a partition to open and
-scan the entire object. This repo's current, tiny data volume (Section
-19's seeded 5,000-row `clicks` table) sits nowhere near either extreme
-today — but "today" is doing real work in that sentence, and this
-section's new code exists specifically to make that claim checkable
-rather than assumed.
+File layout answers a completely different question: once you know a piece of data belongs in one particular partition, how many separate files should hold it, and how big should each one be?
 
-### Simple Example (generic, pre-URL-Shortener)
+You could partition perfectly, and still get file layout wrong. Imagine a single day's worth of clicks data, correctly landing under ingestion_date=2026-09-19/. That's still just an address. Inside that address, you could put all of it in one file, or split it into a hundred tiny files, or one file so enormous nothing can read it efficiently. Partitioning decided the folder. File layout decides what's inside it.
 
-A day's worth of application logs, three layout choices for the same
-data: (1) one gigantic file containing the entire day — cheap to write,
-but a reader wanting just the 2pm hour has to scan the whole thing; (2)
-one file per log *line* — trivially parallel to read one line, but
-absurdly expensive in aggregate (millions of tiny files, each paying
-whatever fixed per-file overhead the storage format and the object store
-itself impose); (3) hourly-rotated files — a deliberate middle ground,
-sized so each file is large enough to amortize per-file overhead but
-small enough that a hour-scoped query only touches the files it actually
-needs. File layout, in general, is choosing where on this spectrum a
-dataset's actual read patterns and data volume land.
+Your project has actually had a real answer to this question since Section 14, without ever naming it: exactly one file per partition. One Parquet object per (table, date), for full loads. This section makes that choice explicit, and gives you a way to actually check whether it's still true.
 
-### URL Shortener Example
+Two failure modes, sitting on opposite sides of a healthy middle
 
-`get_file_layout_report(s3_client, bucket, "clicks")` reports, per
-table: object count, total/average/min/max object size, and how many
-objects fall below a configurable "small file" threshold (default 8 MiB
-— an arbitrary but commonly-cited rule-of-thumb cutoff, well below the
-multi-hundred-MB target object sizes a real lake typically aims for).
-Applied to this repo's own real data: Section 19.6 measured the real,
-5,000-row `clicks` table's single Parquet object at 417,649 bytes — a
-single file, `object_count = 1`, `small_file_count = 1` under the default
-threshold, which is expected and correct at this data volume: one small
-file isn't a *problem* yet, because there's only one file, period — the
-small-file problem is about *many* small files, not the mere existence of
-one.
+Too many small files. You already measured, in the Parquet section, that every Parquet file carries a fixed cost: a footer has to be written and parsed, no matter how many rows are inside. If one partition's data got split across a thousand tiny files instead of one, a reader would pay that exact fixed cost a thousand separate times, for the exact same total amount of data a single file would have paid it for once. This is called the small-file problem, and it's one of the most common, genuinely-encountered failure modes in real data lakes.
 
-### 21.2 Architecture
+Too few, overly large files. The opposite mistake. If one partition is a single, enormous file, two problems show up. First, many processing engines split their work by file, not by arbitrary byte ranges within a file, so one giant file can only ever be worked on by one worker at a time, wasting whatever parallel processing power is available. Second, a reader who only wants a small slice of that partition still has to open and scan the entire massive object to get it.
 
-```
- One partition, one file (this repo's current layout, Sections 14-15):
+The generic analogy: packing boxes for a house move
 
-   bronze/clicks/ingestion_date=2026-09-19/clicks.parquet
-        │
-        ▼
-   a reader wanting this partition's data opens exactly ONE file,
-   pays Parquet's fixed per-file overhead (footer/schema parse) ONCE
+Picture moving out of an apartment. You have one room's worth of belongings to pack, call it "the partition."
 
+If you pack every single item into its own individually-labeled box, one box per fork, one box per book, you'll have hundreds of boxes. Loading the truck means physically lifting hundreds of separate boxes, each one adding its own handling time, even though the total amount of stuff hasn't changed.
 
- The small-file failure mode (NOT this repo's current layout --
- illustrative only):
+If you pack everything from that entire room into one giant box, you'll need a forklift to move it, and if you need just one item out of it later, you have to unpack the entire box to find it.
 
-   bronze/clicks/ingestion_date=2026-09-19/part-00001.parquet
-   bronze/clicks/ingestion_date=2026-09-19/part-00002.parquet
-   ...
-   bronze/clicks/ingestion_date=2026-09-19/part-00847.parquet
-        │
-        ▼
-   a reader wanting this SAME partition's data opens 847 files,
-   pays that same fixed per-file overhead 847 TIMES over --
-   exactly the cost Section 19.6 measured per file, multiplied
+The sensible middle ground: a reasonable number of medium-sized boxes, each holding a sensible amount, labeled clearly. Big enough that you're not managing hundreds of tiny units, small enough that any one box is still manageable to lift, open, and search. File layout is choosing where, on that same spectrum, your actual data lands.
 
+2. URL SHORTENER EXAMPLE
 
- get_file_layout_report (Section 21 -- NEW):
+Your real clicks table, at its current seeded size, has exactly one Bronze object: bronze/clicks/ingestion_date=2026-09-19/clicks.parquet, measured back in the Parquet section at 417,649 bytes. object_count = 1. That's the healthy, current state of your one-file-per-partition layout. Nothing to fix, nothing degrading, because with only one file, there's no problem, just an unremarkable fact.
 
-   list_objects_v2(Prefix="bronze/clicks/")
-        │
-        ▼
-   per-object Size, reused directly (same no-extra-head_object-calls
-   approach as get_bucket_stats, Section 18) -- reduced to
-   {object_count, total_bytes, avg_bytes, min_bytes, max_bytes,
-    small_file_count}
-```
+But "healthy today" isn't something you should have to just assume forever. The real question is: how would you actually know, later, if that stopped being true? That's what this section's new function answers.
 
-### 21.3 Design Decision: detect small-file accumulation, never auto-compact
-
-**Context:** this repo's current one-file-per-partition layout could,
-in principle, degrade toward the small-file failure mode above if a
-future change (e.g. splitting a partition's write into multiple
-size-bounded files for parallelism) were made carelessly, or if
-partition granularity changed without file-count discipline.
-**Decision:** `get_file_layout_report` measures and reports layout
-health; it does not compact, merge, or rewrite any object. **Alternatives
-considered:** an automatic compaction job that detects a partition with
-too many small files and rewrites them into fewer, larger ones.
-**Trade-offs:** automatic compaction would actually *fix* a degrading
-layout rather than just reporting it — but compaction is a genuinely
-more dangerous operation than reconciliation's detection (Section 17.7):
-it means deleting original objects after rewriting their contents
-elsewhere, and any bug in that rewrite logic risks *real data loss*, not
-just a stale report. Detection-only costs a human having to act on what's
-found, in exchange for a categorically safer default. **Consequences:**
-this is the same detect-don't-remediate posture Section 17.7 already
-established for Bronze reconciliation, now applied a second time to a
-different failure class — a recurring, deliberate pattern across this
-project's operational tooling, not a one-off choice; see ADR-013 for the
-decision written up as its own record, since this is now the second
-independent section to make essentially this same call.
-
-### Alternatives
-
-Covered above. A further, smaller alternative considered: reporting only
-`object_count` and `total_bytes` (matching `get_bucket_stats`'s existing
-shape from Section 18) rather than the fuller `avg`/`min`/`max`/
-`small_file_count` breakdown — rejected because `object_count` and
-`total_bytes` alone cannot distinguish "one healthy 4 MB file" from "500
-unhealthy 8 KB files that happen to sum to the same total" — precisely
-the distinction this section's whole purpose is to make visible; see
-21.7's Failure Scenario for why even `avg_bytes` alone isn't quite
-enough either.
-
-### Trade-offs
-
-| | Detection only (chosen) | Automatic compaction |
-|---|---|---|
-| Risk of data loss from a bug | None -- read-only reporting | Real -- compaction means delete-after-rewrite |
-| Actually fixes a degrading layout | No -- a human has to act | Yes, automatically |
-| Implementation cost (this repo) | One function, one CLI command | A rewrite pipeline, plus a safe-deletion story for originals |
-| Consistent with this project's established posture | Yes -- matches Section 17.7's reconciliation stance | Would be the first auto-remediating operation in the whole codebase |
-
-### 21.4 Implementation
-
----
-
-**CREATE:** (edit) `ingestion/src/url_shortener_analytics/object_store.py`
-— `get_file_layout_report`
-
-**PURPOSE:** Per-table file-layout health: object count, size
-distribution, and small-file count — turning "is this table's Bronze
-layout degrading" from an assumption into a checkable, testable report.
-
-**IMPLEMENTATION GUIDE (write it yourself):** scope the listing to one
-table's own prefix (`bronze/{table_name}/`), not the whole `bronze/`
-prefix `get_bucket_stats` (Section 18) uses — file-layout health is
-naturally a per-table question, since different tables land at very
-different sizes and counts. Reuse `Size` from `list_objects_v2`'s
-response directly, the same no-extra-`head_object`-calls approach as
-`get_bucket_stats`. Compute count, sum, average (integer division is
-fine — this is a reporting number, not a precise statistic), min, and
-max; count objects below `small_file_threshold_bytes`. Handle the
-zero-object case explicitly — return all zeros, not a `ZeroDivisionError`
-from an empty-list average.
-
-**REFERENCE IMPLEMENTATION:**
-
-```python
-# ingestion/src/url_shortener_analytics/object_store.py (excerpt)
-
+python
 DEFAULT_SMALL_FILE_THRESHOLD_BYTES = 8 * 1024 * 1024  # 8 MiB
 
 def get_file_layout_report(
@@ -4263,125 +4119,81 @@ def get_file_layout_report(
         "min_bytes": min(sizes), "max_bytes": max(sizes),
         "small_file_count": sum(1 for s in sizes if s < small_file_threshold_bytes),
     }
-```
+3. CODE WALKTHROUGH
 
-Full file: [`object_store.py`](../ingestion/src/url_shortener_analytics/object_store.py).
+DEFAULT_SMALL_FILE_THRESHOLD_BYTES = 8 * 1024 * 1024. This defines "small" as under 8 MiB. MiB, defined: a mebibyte, exactly 1,048,576 bytes, the binary-computing equivalent of "megabyte." 8 MiB is not derived from any deep principle; it's a commonly-cited rule-of-thumb cutoff in the industry, well below the multi-hundred-megabyte object sizes a real, mature data lake typically aims for.
 
-**RUN:** `make layout-report TABLE=clicks` (wraps `python -m
-url_shortener_analytics.cli layout-report --table clicks`)
+s3_client.list_objects_v2(Bucket=bucket, Prefix=f"bronze/{table_name}/"). Notice this is scoped to one table's own prefix, not the whole bronze/ prefix the way get_bucket_stats (Object Storage section) was. That's deliberate: file layout health is naturally a per-table question, since different tables land at very different sizes and object counts, and averaging them together would hide exactly the thing you're trying to measure.
 
-**VERIFY:** compare against `make storage-stats`'s whole-Bronze totals —
-summing `layout-report`'s `total_bytes` across every table should equal
-`storage-stats`'s Bronze-wide `total_bytes`.
+sizes = [obj["Size"] for obj in response.get("Contents", [])]. Same trick you already learned in get_bucket_stats: reuse the Size field the LIST call already returned, instead of making a separate call per object to ask for its size.
 
-**EXPECTED:** at this repo's current seeded data volume, `object_count`
-in the low single digits per table, `small_file_count` equal to
-`object_count` (every current object is "small" under the default 8 MiB
-threshold, per 21.6's derived estimate below) — expected and healthy at
-this volume, not a warning sign.
+if not sizes: return {...all zeros...}. This handles the case where the table has no Bronze objects at all yet. Without this check, sum(sizes) // len(sizes) would try to divide by zero and crash. Handling this explicitly, with a clean all-zero result, is a small but real defensive habit: a brand-new table with nothing written yet is a completely normal state, not an error.
 
-**TEST:** `test_object_store.py` — three new tests: size stats computed
-correctly with a mixed small/large set, a custom threshold changing which
-objects count as small, and the all-zero empty-table case.
+"avg_bytes": sum(sizes) // len(sizes). Notice the double-slash, //, not a single /. This is integer division: dividing and throwing away any decimal remainder, so the result is always a whole number. This is fine here specifically because avg_bytes is a rough reporting number for a human to glance at, not a value anything downstream does precise math with.
 
-**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections
-21.8/21.9.
+"small_file_count": sum(1 for s in sizes if s < small_file_threshold_bytes). For every object, this adds 1 if its size is under the threshold, and adds nothing otherwise, then totals it up. This is the field the whole function exists to produce.
 
----
+4. DESIGN
+Why report small_file_count, min_bytes, and max_bytes, instead of just avg_bytes?
 
-### Hands-on Challenge (implement-yourself)
+Here's a real, checkable failure worth walking through carefully, because it's a general statistics lesson, not just a detail of this one function.
 
-Before LAB 17 below, try this without looking at `object_store.py`:
-using Section 19.6's real, already-measured number (5,000 rows → 417,649
-bytes of Parquet for the real `clicks` table), calculate by hand
-approximately how many rows this table would need before a single daily
-full-load object would cross the default 8 MiB small-file threshold.
-(Answer: ~83.5 bytes/row → roughly 100,000+ rows needed to cross 8 MiB —
-20x this repo's current seeded volume. This is a *derived estimate* from
-real measured data, not a fresh benchmark — the exercise is in the
-arithmetic, connecting Section 19's measurement to Section 21's
-threshold, not in running anything new.)
+Imagine a partition with exactly three objects: 1 MB, 50 MB, and 0.5 MB. Add those up and divide by three, and you get an average of roughly 17 MB, comfortably above the 8 MB threshold. If avg_bytes were the only number you reported, this would read as "totally healthy, nothing to see here."
 
-### 21.5 Hands-on Exercise
+But look again at the actual three files. Two of them, the 1 MB and the 0.5 MB, genuinely are small files by the threshold. That's two out of three, the majority of the objects. The average was almost entirely dragged upward by one single large outlier, the 50 MB file. An average is the wrong single-number summary whenever a distribution is skewed like this, most objects small, a few large ones pulling the mean up, and a real small-file problem very often looks exactly this way in practice: one process writing correctly-sized files, alongside a separate, buggy process quietly dropping in a pile of tiny ones.
 
-**LAB 17 — Run the file-layout tests and confirm the report's shape
-against a deliberately mixed size distribution.**
+This is exactly why get_file_layout_report returns small_file_count as its own explicit field, rather than making a caller try to infer file health from avg_bytes alone. And it's worth noting min_bytes/max_bytes alone don't fully fix this either. They tell you the range exists, from 0.5 MB up to 50 MB, but not how many objects actually sit at the unhealthy end of that range. small_file_count is the one field that directly answers the operationally useful question: "how many files here are actually too small," rather than something a human has to derive by squinting at a range.
 
-```bash
+Why measure only, and never automatically fix a bad layout?
+
+This is a real, deliberate design decision, and it's the second time your project has made essentially this same call. Back in the Idempotency section, reconcile_bronze detected drift between the metadata table and real storage, but never automatically fixed anything; a human had to act on what it found. This section makes the identical choice for a different problem.
+
+The alternative considered was building an automatic compaction job: a process that detects too many small files in a partition and rewrites them into fewer, larger ones on its own. That would actually fix a degrading layout, not just report it. So why not build it?
+
+Because compaction is a genuinely more dangerous operation than detection. Fixing a small-file problem means reading the small files' contents, writing new, larger combined files, and then deleting the original small files. Any bug in that rewrite logic risks real, permanent data loss, not just a stale report someone can rerun. Detection-only costs you a human having to notice the report and act on it manually, in exchange for a categorically safer default: nothing this function does can ever delete or corrupt a real object. This same posture, detect and report, never silently auto-remediate, is recorded in your project as its own standing design principle (ADR-013), specifically because it's now shown up twice independently, not as a one-off choice made in isolation.
+
+	Detection only (chosen)	Automatic compaction
+Risk of real data loss from a bug	None — this is read-only reporting	Real — compaction means deleting originals after rewriting them
+Actually fixes a degrading layout	No, a human has to act on the report	Yes, automatically
+Cost to build	One function, one CLI command	A full rewrite pipeline, plus a safe-deletion strategy
+Matches how this project already handles similar problems	Yes, same posture as reconciliation	Would be the first self-modifying operation in the whole codebase
+5. RUN
+bash
+make layout-report TABLE=clicks
+
+wraps python -m url_shortener_analytics.cli layout-report --table clicks.
+
+A real, already-verified consistency check worth trying yourself: sum layout-report's total_bytes across every one of your tables (urls, users, clicks), one command per table, and compare that sum against make storage-stats's single, whole-Bronze total_bytes. They should match exactly, since both are ultimately counting the same real bytes sitting in the same bucket, just grouped differently.
+
+6. EXPERIMENT
+
+A real arithmetic exercise, connecting back to the Parquet section's actual measured numbers. You already know, from a genuine measurement, that 5,000 real clicks rows produced a 417,649-byte Parquet file. That works out to roughly 83.5 bytes per row. Before reading further, calculate by hand: roughly how many rows would a single daily clicks file need before it crossed the 8 MiB small-file threshold?
+
+8 MiB is 8,388,608 bytes. Divide that by 83.5 bytes per row, and you get roughly 100,000 rows needed to cross the threshold, about 20 times your project's current seeded volume. This tells you something concrete and reassuring: at your project's actual current data volume, there is no small-file risk to worry about yet, not because you're assuming it's fine, but because you've derived it from a real measurement. That's a materially stronger position than "it's probably fine."
+
+A hands-on test run, fully runnable right now, no MinIO needed:
+
+bash
 PYTHONPATH=ingestion/src python3 -m pytest ingestion/tests/unit/test_object_store.py -k file_layout -v
-```
 
-ACTUAL OBSERVED, genuinely run while writing this section:
+Expected: 3 tests pass. The first one is the interesting one, and it's the actual, real proof of the average-hides-the-problem scenario from the Design section above: it constructs three mocked objects at 1 MB, 50 MB, and 0.5 MB, and asserts small_file_count == 2, while avg_bytes comes out around 17 MB. Read that test's source yourself, in test_object_store.py, and confirm the exact numbers match what was walked through above.
 
-```
-ingestion/tests/unit/test_object_store.py::test_get_file_layout_report_computes_size_stats_and_small_file_count PASSED
-ingestion/tests/unit/test_object_store.py::test_get_file_layout_report_respects_a_custom_threshold PASSED
-ingestion/tests/unit/test_object_store.py::test_get_file_layout_report_is_all_zero_for_a_table_with_no_objects PASSED
+7. PRODUCTION VIEW
+Aspect	This project right now	Real production
+Checking layout health	Manual, one table at a time (make layout-report TABLE=...)	Scraped on a schedule, across every table, graphed over time, with alerting on a rising trend in small_file_count, not just its current value
+Fixing a bad layout	Nothing — detection only, by deliberate design	A scheduled compaction job, often a Spark job, rewriting a partition's many small files into fewer, size-targeted ones, with careful atomic delete-after-verify handling so a crash mid-compaction can't lose data
+Small-file threshold	One fixed default, 8 MiB, for every table alike	Often tuned per table, since different tables have genuinely different healthy target sizes depending on their query patterns
+8. PRINCIPAL ENGINEER VIEW
 
-3 passed, 18 deselected in 0.61s
-```
+If an interviewer asks "how would you detect a small-file problem," the weak answer is "check the average file size." The strong answer is the one your project's own test proves directly: an average can be pulled entirely upward by one large outlier while the majority of files are genuinely unhealthy, and a real-world small-file problem is very often shaped exactly this way, one healthy writer alongside one buggy one. Being able to give the specific 1 MB / 50 MB / 0.5 MB example, and explain exactly why the mean lies in that case, is a much stronger answer than a generic "yeah, averages can be misleading."
 
-What to observe in the first test specifically: it constructs three
-objects (1 MB, 50 MB, 0.5 MB) against a mocked S3 client and asserts
-`small_file_count == 2` — the two under 8 MB — while `avg_bytes` comes
-out around 17 MB, a number that alone would suggest "no problem here" if
-it were the only statistic reported. This is exactly 21.7's Failure
-Scenario, proven directly by this test's own construction.
+A second strong point: recognizing "detect, don't auto-remediate" as a repeating, deliberate pattern in this codebase, not a coincidence. It showed up first for Bronze reconciliation, and again here for file layout, for the same underlying reason both times: the cost of a false negative (a problem sitting unnoticed a bit longer) is much smaller than the cost of a false positive triggering an automatic, irreversible action, like deleting real data based on a buggy rewrite. Naming that as a conscious, repeated engineering posture, rather than two unrelated decisions that happened to land the same way, is exactly the kind of pattern-recognition a senior engineer is expected to demonstrate.
 
-### 21.6 How to test
-
-```bash
-make test
-```
-
-ACTUAL OBSERVED, genuinely run in this environment:
-
-```
-73 passed in 7.04s
-```
-
-`ruff check ingestion/ benchmarks/` also passed cleanly on every file
-this increment touched.
-
-**What remains a DESIGN EXPECTATION:** `get_file_layout_report` against
-real MinIO/S3, at real production data volumes where the small-file
-problem could actually manifest — this sandbox has neither real MinIO
-nor anywhere near the row count (per the Hands-on Challenge's derived
-estimate) needed to observe it firsthand.
-
-### 21.7 Failure Scenario
-
-**Can `avg_bytes` alone hide a real small-file problem?**
-
-Yes, concretely, and LAB 17's own first test proves it: three objects
-sized 1 MB, 50 MB, and 0.5 MB average to roughly 17 MB — comfortably
-above the 8 MB "small file" threshold, which would read as "healthy" if
-`avg_bytes` were the only number reported. But two of those three
-objects — the majority — genuinely are small files by the threshold; the
-average is being pulled entirely upward by one large outlier. This is
-exactly why `get_file_layout_report` returns `small_file_count`
-explicitly, as its own field, rather than expecting a caller to infer
-file-layout health from `avg_bytes` alone — an arithmetic mean is
-genuinely the wrong single-number summary for a bimodal or skewed size
-distribution, and a real small-file problem is very often skewed exactly
-this way (most objects tiny, a few large ones from whatever process
-wrote correctly-sized files alongside a buggy process that didn't).
-**Even `min_bytes`/`max_bytes`, also reported, don't fully solve this**
-— they show the *range* exists but not *how many* objects sit at the
-unhealthy end of it; `small_file_count` is the field that actually
-answers the operationally relevant question directly, which is precisely
-why it's reported as its own number rather than left for a reader to
-derive.
-
-### 21.8 Production Considerations
-
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Layout monitoring | Manual (`make layout-report TABLE=...`), one table at a time | Scraped on a schedule across every table, graphed over time, alerted on a rising `small_file_count` trend |
-| Remediation | None -- detection only, by deliberate design (21.3, ADR-013) | A scheduled compaction job (e.g. a Spark job rewriting a partition's many small files into fewer, size-target ones), with careful atomic delete-after-verify semantics |
-| Size distribution reporting | avg/min/max/small-file-count -- a coarse four-number summary | A real percentile histogram (p50/p90/p99 object size) for a much more complete picture than four summary statistics can give |
-| Target file size | Not set -- this repo's layout is a byproduct of one-file-per-partition, not a deliberately chosen size target | An explicit target (often 128 MB-1 GB per file in mature lakes), with write-time logic that splits a partition into multiple files once it would exceed that target |
-| Scope | Bronze layer only | A mature platform tracks file layout at every layer (Bronze, Silver, Gold), since compaction needs differ by layer's write pattern |
+9. REMEMBER
+Partitioning decides which folder your data lands in. File layout decides how many files, and how big, sit inside that folder. Different questions.
+Too many small files means paying Parquet's fixed per-file overhead over and over, for the same total data. Too few, oversized files limits parallelism and forces full-object scans for small requests.
+An average alone can hide a real small-file problem, when the distribution is skewed by one or two large outliers. Report the actual count of unhealthy files directly.
+This project always detects and reports, never automatically deletes or rewrites data on its own. The same safety posture that governed reconciliation governs file-layout checking too, and it's a deliberate, repeated choice, not a limitation.
 
 ### Principal Data Engineer Perspective
 
