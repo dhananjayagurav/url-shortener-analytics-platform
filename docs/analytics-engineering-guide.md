@@ -3830,185 +3830,44 @@ disk-I/O-level skipping, as though they were the same optimization.
 
 ## 20. Partitioning ✅✅
 
-### 20.1 Concept
+1. CONCEPT
+The problem first
 
-**Partitioning** splits a dataset's files across separate keys/paths by
-the value of one or more columns — typically ones a reader will commonly
-filter on — so that a query can skip entire files it doesn't need without
-opening them at all. This repo has been partitioning data since Section
-14 without ever calling it that: `build_bronze_key`'s
-`ingestion_date=2026-09-19/` and `build_bronze_incremental_key`'s
-`watermark_start=.../watermark_end=.../` are both **Hive-style
-partitioning** — a `key=value` convention embedded directly in the object
-key — already in production use in every Bronze write this pipeline
-performs. This section makes that explicit, explains *why* the convention
-looks the way it does, and adds the piece genuinely missing so far:
-**partition pruning** — actually using the partition structure to avoid
-listing objects a query doesn't need, rather than listing everything and
-filtering afterward, which is what `list_bronze_keys` (Section 17) does
-today.
+Imagine your urls table has been full-loaded every single day for the last two years. That's over 700 Bronze objects sitting in MinIO by now. Someone asks a simple question: "show me what Bronze had for urls on September 19th, 2026." How does your code find just that one object, without wading through the other 729?
 
-### Why does this exist?
+You already have the tool for "list everything": list_bronze_keys, from Section 17. It calls list_objects_v2 once, gets back every object under bronze/urls/, and hands you all 730 keys. To find just the one date you wanted, you'd then have to filter that list yourself, in Python, throwing away 729 results you never needed. That's real, wasted work: MinIO had to find, package, and send you metadata for 729 objects you were always going to discard.
 
-Without partitioning, "give me `clicks` data for 2026-09-19" means
-listing (and potentially reading) *every* object this table has ever had
-written, then filtering by date in application code — wasted work that
-grows without bound as history accumulates, for a query that only ever
-needed one day's worth of data. Partitioning by the columns queries
-actually filter on turns that into "list only the objects under this
-date's own prefix" — the filtering happens by *choosing which prefix to
-list at all*, not by discarding unwanted objects after they've already
-been listed (or, worse, read). This is exactly the same idea as an index
-on a database column, applied to an object store instead of a table: put
-the thing queries filter on into the key/path structure itself, so
-lookups can skip straight past what they don't need.
+Partitioning is the fix for exactly this. It means physically organizing where objects live based on the value of some column, usually a column people will commonly filter by, so a search can skip straight to what it needs without even looking at the rest.
 
-### Simple Example (generic, pre-URL-Shortener)
+The generic analogy: a library, organized two different ways
 
-An unpartitioned dataset: every day's export lands as
-`exports/export_2026_09_01.csv`, `exports/export_2026_09_02.csv`, ... all
-under one flat `exports/` prefix. Answering "what's in the September 19th
-export" means listing all of `exports/` (however many files exist,
-growing forever) and picking out the one matching filename by string
-comparison. A Hive-partitioned version instead uses
-`exports/date=2026-09-01/data.csv`, `exports/date=2026-09-02/data.csv`,
-... — "what's in the September 19th export" becomes `list(Prefix=
-"exports/date=2026-09-19/")`, a single, cheap call that only ever touches
-objects for that one day, regardless of how many other days' worth of
-data exists elsewhere in the bucket.
+Picture a library with two years of daily newspapers, one per day.
 
-### URL Shortener Example
+Unorganized library. Every single newspaper, all 730 of them, is stacked in one giant pile in the lobby, in no particular order. To find September 19th's paper, a librarian has to pick up and check the date on every single paper in the pile, until they find the right one, or confirm it isn't there.
 
-`bronze/clicks/incremental/watermark_start=000000005000/watermark_end=000000005103/clicks.parquet`
-is already exactly this pattern — a Hive-style partition on
-`watermark_start`/`watermark_end` for incremental loads;
-`bronze/urls/ingestion_date=2026-09-19/urls.parquet` the same, on
-`ingestion_date`, for full loads. What's new this section:
-`list_bronze_keys_for_date_range` (full-load tables only — see 20.3's
-Design Decision for why incremental tables are explicitly out of scope
-for this specific function), which issues one `list_objects_v2` call
-**per date**, each scoped to that date's own partition prefix, instead of
-one call over the table's entire `bronze/{table}/` prefix followed by
-client-side filtering (which is what `list_bronze_keys`, Section 17,
-still does today, and continues to do — it's the right tool for "list
-everything," just not for "list one date range").
+Organized library. The papers are sorted into 730 separate labeled shelf slots, one slot per date, like Sept-01, Sept-02, Sept-03, and so on. To find September 19th's paper, the librarian walks directly to the shelf labeled Sept-19 and picks it up. They never touch any of the other 729 papers at all.
 
-### 20.2 Architecture
+Both libraries hold the exact same papers. The only difference is where each paper physically sits, organized in a way that matches how people are actually going to search for it. That's the entire idea of partitioning.
 
-```
- Unpruned (list_bronze_keys, Section 17):
+A term you need first: Hive-style partitioning
 
-   list_objects_v2(Prefix="bronze/urls/")
-        │
-        ▼
-   returns EVERY urls object ever written, every ingestion_date
-        │
-        ▼
-   caller filters by date in Python, if it only wanted one range
-   (cost scales with TOTAL history, not the range actually needed)
+Hive-style partitioning is a specific naming convention for the "shelf labels" in our library analogy, when the library is really an object store instead of a real building. Instead of labeling a shelf just Sept-19, you encode both the column name and its value directly into the object's key, as columnname=value. So a key looks like:
 
+bronze/urls/ingestion_date=2026-09-19/urls.parquet
 
- Pruned (list_bronze_keys_for_date_range, Section 20 -- NEW):
+That ingestion_date=2026-09-19 segment is doing exactly the same job as the Sept-19 shelf label. It's not a real folder MinIO tracks specially, as you learned in the Object Storage section. It's just a text convention, but a very useful one, because it lets you predict the exact prefix to search for, before you ever ask MinIO anything.
 
-   for each date in [start_date, end_date]:
-       list_objects_v2(Prefix=f"bronze/urls/ingestion_date={date}/")
-                             │
-                             ▼
-                    returns ONLY that date's own object(s)
-        │
-        ▼
-   caller concatenates -- S3 itself never even considered objects
-   outside the requested range (cost scales with the RANGE requested,
-   not total history)
-```
+Partition pruning, the piece that's actually new this section
 
-The two functions coexist deliberately, not because one replaces the
-other: `list_bronze_keys` is still the right call for "give me
-everything" (reconciliation, Section 17, genuinely needs a full listing
-to detect orphans and cannot know in advance which dates to prune to);
-`list_bronze_keys_for_date_range` is the right call for "give me a known
-range" — exactly the access pattern a Phase 2 transform reading, say,
-"the last 7 days of `urls` snapshots" would have.
+Having a key=value structure in your keys is only half the story. You have to actually use that structure when searching, instead of listing everything and filtering afterward. Partition pruning means constructing the exact narrow prefix for what you want, and only ever asking the object store for that prefix, so objects outside your range are never even considered by MinIO, let alone returned to you.
 
-### 20.3 Design Decision: scope pruning to full-load's date partitions only
+You've actually been doing the labeling half of this since Section 14, without ever naming it. build_bronze_key's ingestion_date=2026-09-19/ and build_bronze_incremental_key's watermark_start=.../watermark_end=.../ are both real, already-in-production Hive-style partitioning. What's genuinely new this section is the pruning half: actually exploiting that structure on the read side, instead of just on the write side.
 
-**Context:** this repo has two different partitioning schemes in
-production already — full-load's `ingestion_date=` (a calendar date) and
-incremental-load's `watermark_start=`/`watermark_end=` (an integer
-range) — and pruning needs to actually construct valid prefixes to query,
-which means knowing the scheme in advance. **Decision:**
-`list_bronze_keys_for_date_range` handles the date-partitioned scheme
-only; no equivalent watermark-range-pruned function was built this
-increment for incremental tables. **Alternatives considered:** a single,
-more general pruning function that accepts either a date range or a
-watermark range, dispatching on `load_type`; deferring date-range pruning
-entirely until both schemes could be handled uniformly. **Trade-offs:** a
-unified function would present one interface for both cases, but a
-watermark range isn't queryable the same way a date range is — the whole
-point of a watermark is that it's an opaque, monotonically-increasing
-id boundary discovered from `ingestion_metadata` (Section 15), not a
-value a caller can enumerate in advance the way `date(2026, 9, 18)`
-through `date(2026, 9, 20)` can be listed one day at a time; building a
-"prune by watermark range" function honestly would need to first query
-`ingestion_metadata` for which specific `(watermark_start, watermark_end)`
-pairs actually exist in the requested range, which is a meaningfully
-different (and already-available, via `list_successful_bronze_keys`)
-code path, not a variant of prefix construction. **Consequences:** a
-Phase 2 reader wanting a pruned listing of *incremental* Bronze data
-should query `ingestion_metadata` directly (already possible today, via
-`list_successful_bronze_keys` with a date filter added to that query) —
-this is named as a real, current scope boundary, not silently treated as
-solved by a function that doesn't actually solve it for that case.
+2. URL SHORTENER EXAMPLE
 
-### Alternatives
+Here's the real function, already in your object_store.py, that does real partition pruning for full-load tables:
 
-Covered above. A further, smaller alternative considered for the
-date-partitioned case specifically: accepting a list of `S3 Select` or
-server-side filter expressions instead of iterating dates client-side —
-rejected as genuinely out of scope for a POC (S3 Select requires the
-object contents themselves to be scanned server-side per object, a
-different and more complex mechanism than prefix-based partition pruning,
-and MinIO's S3 Select support/performance characteristics differ from
-AWS's in ways this project hasn't evaluated).
-
-### Trade-offs
-
-| | `list_bronze_keys` (full listing) | `list_bronze_keys_for_date_range` (pruned) |
-|---|---|---|
-| Calls issued | One | One per date in range |
-| Objects S3 considers | Every object under the table's prefix | Only objects under the requested dates' prefixes |
-| Right tool for | "Give me everything" (reconciliation) | "Give me a known date range" |
-| Works for incremental tables | Yes (lists everything, any scheme) | No -- see 20.3's Design Decision |
-| Cost as history grows | Grows with total history | Stays constant for a fixed-size requested range |
-
-### 20.4 Implementation
-
----
-
-**CREATE:** (edit) `ingestion/src/url_shortener_analytics/object_store.py`
-— `list_bronze_keys_for_date_range`
-
-**PURPOSE:** Demonstrate, and make available, genuine partition pruning
-for full-load tables' date-partitioned Bronze keys — fewer S3 calls,
-fewer objects considered, for a caller that already knows the date range
-it needs.
-
-**IMPLEMENTATION GUIDE (write it yourself):** loop from `start_date` to
-`end_date` inclusive (one day at a time — `datetime.timedelta(days=1)`),
-and for each date, construct the *exact* prefix `build_bronze_key` itself
-would produce for that date (`bronze/{table}/ingestion_date={date}/`) and
-call `list_objects_v2` scoped to just that prefix. Concatenate the
-results. Resist the temptation to instead call `list_bronze_keys` once
-and filter the combined result by date in Python — that's exactly the
-*unpruned* pattern this function exists to avoid; the entire point is
-which prefix gets sent to S3, not how the result gets filtered
-afterward.
-
-**REFERENCE IMPLEMENTATION:**
-
-```python
-# ingestion/src/url_shortener_analytics/object_store.py (excerpt)
-
+python
 def list_bronze_keys_for_date_range(
     s3_client: BaseClient, bucket: str, table_name: str, start_date: date, end_date: date
 ) -> list[str]:
@@ -4020,134 +3879,83 @@ def list_bronze_keys_for_date_range(
         keys.extend(obj["Key"] for obj in response.get("Contents", []))
         current += timedelta(days=1)
     return keys
-```
+3. CODE WALKTHROUGH
 
-Full file: [`object_store.py`](../ingestion/src/url_shortener_analytics/object_store.py).
+Let's go through this one line at a time, since there's a subtlety here worth catching.
 
-**RUN:** exercised indirectly — there's no standalone CLI subcommand for
-this one (by design; it's a library function a Phase 2 reader would call
-programmatically with a known range, not an ad-hoc operator command the
-way `storage-stats` is).
+keys: list[str] = [] starts an empty list. This will collect every matching key across every date in the range.
 
-**VERIFY:** LAB 16 below, and `test_object_store.py`'s
-`test_list_bronze_keys_for_date_range_issues_one_call_per_date_scoped_to_that_dates_prefix`,
-which asserts the *exact* sequence of prefixes sent to a mocked S3
-client — not just the returned keys, but proof of which calls were
-actually issued.
+current = start_date begins a loop, starting from the first day you asked about.
 
-**EXPECTED:** for an N-day range, exactly N `list_objects_v2` calls, each
-`Prefix`-scoped to one date; a date with no object written that day
-contributes nothing (an empty `Contents`), not an error.
+while current <= end_date: keeps looping, one day at a time, until it passes the last day you asked about.
 
-**TEST:** `test_object_store.py` — two new tests: a 3-day range issuing
-exactly 3 calls, each with the exact expected prefix (using
-`unittest.mock.call` to assert the full call sequence, not just the
-count); a single-day range issuing exactly 1 call.
+date_prefix = f"bronze/{table_name}/ingestion_date={current:%Y-%m-%d}/". This is the important line. It builds the exact same prefix string that build_bronze_key would have used when writing that day's object. This has to match exactly, character for character, or the search would silently return nothing for that date.
 
-**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections
-20.8/20.9.
+response = s3_client.list_objects_v2(Bucket=bucket, Prefix=date_prefix). This is the actual LIST call from the Object Storage section, but notice it's scoped to just this one day's prefix, not the whole table's prefix. MinIO will only ever look at, and return, objects whose key starts with this narrow prefix.
 
----
+keys.extend(obj["Key"] for obj in response.get("Contents", [])). Adds whatever matched for this one day onto the running list. If nothing was written that day, Contents comes back empty, and nothing gets added; no error happens.
 
-### Hands-on Challenge (implement-yourself)
+current += timedelta(days=1). Moves forward exactly one calendar day, and the loop repeats.
 
-Before LAB 16 below, try this without looking at `object_store.py`: using
-a mocked S3 client (`unittest.mock.MagicMock`, the same pattern this
-repo's own tests use throughout), write a small script that calls
-`list_bronze_keys` once and `list_bronze_keys_for_date_range` once, both
-for a 30-day range, against a bucket that has one object per day going
-back 365 days. Print `s3_client.list_objects_v2.call_count` after each.
-Predict the two numbers before running it. (Answer: `list_bronze_keys`
-issues exactly 1 call, `list_bronze_keys_for_date_range` issues exactly
-30 — more calls, not fewer. Sit with why "more calls" is nonetheless the
-*better* choice here: `list_bronze_keys`'s single call still has to
-return, and the caller still has to transfer and hold in memory,
-metadata for all 365 objects even though only 30 days were wanted;
-`list_bronze_keys_for_date_range`'s 30 calls together transfer metadata
-for only the ~30 objects actually needed. Pruning trades call *count* for
-data *volume* — the right trade whenever total history is much larger
-than the range actually requested, and the wrong one when it isn't,
-which 20.7's Failure Scenario covers directly.)
+The subtlety worth catching: this function makes one separate LIST call per day in the range, not one call total. A 3-day range means 3 calls. This is deliberate, and it's the whole mechanism. The temptation to avoid is calling list_bronze_keys once for the whole table, and then filtering the combined result down to your date range in Python. That would technically give the same answer, but it would defeat the entire purpose: MinIO would still have had to find and return metadata for every object the table has ever had, including all the dates you didn't want, before your code got the chance to throw most of it away.
 
-### 20.5 Hands-on Exercise
+4. DESIGN
+The real design decision: why isn't there one pruning function for both partition schemes?
 
-**LAB 16 — Prove pruning issues fewer, more targeted calls than a full
-listing, against a mocked S3 client.**
+Here's something worth noticing: your project actually has two different partitioning schemes in production already. Full-load tables use ingestion_date=2026-09-19 (a calendar date). Incremental-load tables use watermark_start=.../watermark_end=... (an integer id range, from Section 15). You might expect one general "prune by whatever" function that handles both. Your project deliberately built only the date-range version this section, and it's worth understanding exactly why.
 
-```bash
+A calendar date range is something you can enumerate in advance. If you want September 1st through September 20th, you can list all 20 exact dates yourself, in Python, with nothing but a loop, before ever talking to the database or the object store. A watermark range is fundamentally different. A watermark is an opaque number, discovered by reading ingestion_metadata, and it's not something you can predict or enumerate ahead of time the way a calendar date is. You can't just guess "I want watermarks 5000 through 8000" and build 3,000 individual prefixes; you'd first have to query ingestion_metadata to find out which actual (watermark_start, watermark_end) pairs exist in that range at all, which is a genuinely different code path (and one you already have, list_successful_bronze_keys).
+
+So building one "unified" function that pretended to handle both would have been dishonest: it would either silently do the wrong thing for incremental tables, or need an entirely separate internal path anyway, hidden behind a misleadingly uniform-looking interface. Naming the boundary explicitly (this function handles date-partitioned, full-load tables only) is more trustworthy than a function that looks complete but secretly isn't.
+
+Two functions, kept deliberately separate, not one replacing the other
+	list_bronze_keys (Section 17, full listing)	list_bronze_keys_for_date_range (this section, pruned)
+Calls issued	One	One per date in the requested range
+What S3/MinIO considers	Every object under the table's whole prefix	Only objects under the requested dates' prefixes
+Right tool for	"Give me everything" — this is what reconciliation (Section 17) genuinely needs	"Give me a known, bounded range"
+Works for incremental tables	Yes	No, by design (see above)
+Cost as history grows	Grows forever, with total history	Stays constant, for a fixed-size range
+5. EXPERIMENT (the hands-on challenge, worked through before you run it)
+
+Here's a prediction exercise straight from your project's own guide, worth doing before you look at the answer.
+
+Imagine a bucket with one object per day, going back 365 days. You call list_bronze_keys once, and list_bronze_keys_for_date_range once, both asking for the same 30-day range. How many times does each one call list_objects_v2?
+
+Write your guess down before reading on.
+
+The real answer: list_bronze_keys issues exactly 1 call. list_bronze_keys_for_date_range issues exactly 30 calls. More calls, not fewer. If your instinct says "then pruning made things worse," sit with that for a second, because it's the whole point of this exercise.
+
+Here's why 30 calls is still the better choice in this scenario. list_bronze_keys's single call still has to find, package, and transfer metadata for all 365 objects, even though only 30 days were ever wanted. list_bronze_keys_for_date_range's 30 calls, together, only ever transfer metadata for the roughly 30 objects actually needed. Pruning trades call count for data volume. You make more, smaller, cheaper requests, in exchange for never touching data you didn't ask for. That's the right trade whenever the range you want is much smaller than the table's total history.
+
+This trade has a real breaking point, and it's worth knowing before it bites you. If someone asks list_bronze_keys_for_date_range for a 365-day range, on a table that has exactly 365 days of history, it issues 365 separate calls, for zero pruning benefit at all, since there was nothing left to prune. In that specific case, the plain, unpruned list_bronze_keys (one call) would actually have been faster. Nothing in list_bronze_keys_for_date_range's own code warns you about this; it will happily issue however many calls a huge range implies, with no upper limit. A caller reaching for the pruned function with a range that turns out to be someone's entire history has picked the wrong tool for the job.
+
+6. RUN
+
+This one is fully runnable right now, in this sandbox or on your own machine, with no MinIO or Docker needed at all, because it tests against a mocked S3 client rather than a real one:
+
+bash
 PYTHONPATH=ingestion/src python3 -m pytest ingestion/tests/unit/test_object_store.py -k date_range -v
-```
 
-What to observe: `test_list_bronze_keys_for_date_range_issues_one_call_per_date_scoped_to_that_dates_prefix`
-asserts the exact three `Prefix` values sent to the mocked client for a
-3-day range — this is the concrete, checkable proof that "partition
-pruning" here means specific, narrowly-scoped calls, not a vague
-performance claim. *(This LAB is fully runnable in this sandbox, unlike
-LAB 13's real-MinIO scenario — it tests this function's own call
-pattern against a mock, not real S3 network behavior, so no MinIO is
-needed. ACTUAL OBSERVED: this exact command was run while writing this
-section — 2 passed.)*
+Expected: 2 tests pass. One proves a 3-day range issues exactly 3 calls, with the exact three Prefix values checked directly, not just the count. One proves a single-day range issues exactly 1 call.
 
-### 20.6 How to test
+7. PRODUCTION VIEW
+Aspect	This project right now	Real production
+Partition granularity	One file per day (full load), or per watermark range (incremental)	Same Hive-style convention is standard; a real deployment also splits an unusually large day's data across multiple files, since your project's current files are actually too small, not too large
+Doing the pruning	Hand-written, per-date loop, in your own Python code	A real query engine (Spark, Athena, DuckDB, Trino) does this automatically, from something like WHERE date BETWEEN '...' AND '...', using its own internal catalog, no hand-written loop needed
+Protection against a huge range	None — as shown above, it issues as many calls as the range implies	A real system would warn, reject, or automatically fall back to a full listing past some sensible size threshold
+Pruning incremental tables	Not built, a named and deliberate gap	A real metastore (Hive Metastore, AWS Glue Catalog, Iceberg's metadata) tracks partition boundaries for every load type the same way, whether the partition key is a date or a watermark range
+Knowing which partitions exist at all	The caller has to already know the date range they want	A real catalog tracks which partitions actually exist, so a reader doesn't have to already know the answer before asking
+8. PRINCIPAL ENGINEER VIEW
 
-```bash
-make test
-```
+If asked "your function issues one API call per date, isn't that worse than a single call, for a large range?", the strong answer is the one you just worked through by hand: yes, in call count, for a large-enough range, but the whole benefit was never about call count. It's about how much data gets transferred and held in memory per call. Being able to state precisely when the trade-off flips, "pruning wins when the requested range is much smaller than total history, and loses when it approaches the full history," is a materially stronger answer than either "pruning is always better" or getting talked out of the design by the call-count objection alone.
 
-ACTUAL OBSERVED, genuinely run in this environment:
+A second point worth having ready: recognizing when not to unify two similar-looking things. It would have looked more impressive to ship one "generic partition pruning" function handling both date ranges and watermark ranges. It also would have been dishonest, since a watermark range isn't enumerable the way a date range is. Explicitly scoping a function to exactly the case it can do correctly, and naming the boundary rather than hiding it, is a real engineering judgment call, and it's one interviewers specifically probe for when they ask "what would you not build, and why."
 
-```
-63 passed in 7.09s
-```
-
-`ruff check ingestion/ benchmarks/` also passed cleanly on every file
-this increment touched.
-
-**What remains a DESIGN EXPECTATION:** whether pruning produces a real
-*wall-clock* speedup against genuine MinIO/S3 network latency, as opposed
-to fewer, more targeted calls in principle (proven above, against a
-mock) — there is no MinIO in this sandbox to measure real network-call
-savings against. The call-count/call-target proof above is real and
-sufficient to demonstrate the mechanism; a true latency benchmark (one
-call vs. thirty, over a real network, at meaningfully large history) is
-left for the reader with real infrastructure to run.
-
-### 20.7 Failure Scenario
-
-**When does requesting a date range with `list_bronze_keys_for_date_range`
-actually perform *worse* than just calling `list_bronze_keys` once and
-filtering client-side?**
-
-The Hands-on Challenge above already surfaces the mechanism: pruning
-issues **one call per date in the requested range**, regardless of how
-much or how little data exists for the whole table overall. Requesting a
-365-day range issues 365 calls — worse than `list_bronze_keys`'s single
-call, in call *count*, even though `list_bronze_keys`'s one call has to
-return (and the caller has to hold) metadata for every object under the
-prefix, including dates outside what's wanted. Concretely: if a caller
-wants "every date this table has ever had data for" (i.e. the range
-*is* the whole history), `list_bronze_keys_for_date_range` is strictly
-worse than `list_bronze_keys` — more calls, same total objects returned,
-no pruning benefit at all, since there's nothing left to prune. Pruning
-only pays for itself when the requested range is meaningfully smaller
-than total history — exactly the condition Section 20.3's Trade-offs
-table states but is worth restating as a concrete, checkable failure
-case: a caller reaching for `list_bronze_keys_for_date_range` with a
-range that turns out to cover this table's entire lifetime has picked
-the wrong function, and nothing in the function's own signature warns
-them of that — it will happily issue however many calls the range
-implies, with no upper bound check.
-
-### 20.8 Production Considerations
-
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Partition granularity | One partition per calendar day (full load) or per watermark range (incremental) — a single file per partition | Same convention (Hive-style) is standard in production lakes too; a real deployment additionally splits large partitions into multiple files (small-file compaction is the usual concern; this repo's files are small enough that under-splitting, not over-splitting, is the actual current risk — Section 33's named gap) |
-| Pruning | Client-side loop issuing one `list_objects_v2` call per date, in this repo's own code | A real query engine (Athena, Spark, DuckDB, Trino) does this automatically from a `WHERE date BETWEEN ...` clause via its own catalog/metastore, without hand-written per-date loops |
-| Unbounded range protection | None — `list_bronze_keys_for_date_range` issues as many calls as the range implies, with no cap (20.7) | A real implementation would reject or warn on a suspiciously large requested range, or transparently fall back to a full listing plus client-side filter past some threshold |
-| Cross-scheme pruning (incremental tables) | Not implemented — named scope boundary (20.3) | A real metastore tracks partition boundaries for every load type uniformly, regardless of whether the partition key is a date or a watermark range |
-| Partition discovery | Caller must already know the date range wanted | A real catalog (Hive Metastore, AWS Glue Catalog, Iceberg's own metadata) tracks which partitions exist, so a reader doesn't need to already know the answer before querying for it |
-
+9. REMEMBER
+Partitioning means organizing where data physically lives, by the value of a column people actually filter on, so a search can skip what it doesn't need.
+Hive-style partitioning is just a key=value naming convention baked into the object's key string. It's not a real folder; it's a predictable pattern your code can reconstruct.
+Pruning means constructing the narrow prefix yourself and asking only for that, instead of listing everything and filtering afterward in your own code.
+Pruning trades more, smaller calls for less transferred data. That's a win when your range is small relative to total history, and a loss when your range basically is the total history.
 ### Principal Data Engineer Perspective
 
 The judgment call worth defending here is scoping this section's new code
