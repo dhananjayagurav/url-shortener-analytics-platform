@@ -3580,165 +3580,90 @@ not exposing a real filesystem feature underneath.
 
 ## 19. Parquet ✅✅
 
-### 19.1 Concept
+### 1. CONCEPT
+The problem first
 
-**Parquet** is a columnar, self-describing binary file format: instead of
-storing data row-by-row (`row1: id,code,url` then `row2: id,code,url`...),
-it stores each *column* contiguously (`id: [1,2,3,...]`, then
-`code: [...]`, then `url: [...]`), with a footer that embeds the schema
-and per-column statistics. This repo has written every Bronze object as
-Parquet since Section 14 (`_dataframe_to_parquet_bytes`,
-snappy-compressed via PyArrow) — always as an assertion (ADR-003 calls it
-"efficient for analytical, column-selective reads"), never measured. This
-section closes that: a real benchmark script, genuinely run in this
-sandbox, comparing Parquet against CSV and JSON-lines on this project's
-own data, at two different scales.
+Every Bronze object you've written so far has been a Parquet file. You've seen the code call pq.write_table(...), but we've never stopped to ask: what actually is Parquet, and why not just write plain CSV files instead? CSV is simpler. Anyone can open it in a text editor. Let's build up to the real answer slowly.
 
-### Why does this exist?
+Row-oriented vs. column-oriented, defined from scratch
 
-Row-oriented formats (CSV, JSON-lines) are simple and human-readable, but
-force every reader to parse an entire row just to access one column — a
-query that only needs `device_type` still has to read and skip past
-`id`, `short_code`, `occurred_at`, `hashed_ip`, and `user_id` for every
-single row. A columnar format lets a reader skip straight to the bytes
-for exactly the column(s) it needs, and lets compression work far better,
-too — a column of a few dozen repeating `device_type` values compresses
-much more effectively sitting next to millions of other `device_type`
-values than interleaved between five other, unrelated columns. Both
-properties matter enormously for analytical workloads, which very
-commonly touch a handful of columns out of many, across a lot of rows —
-exactly the query shape Section 2 (OLTP vs. OLAP) named as this whole
-platform's reason for existing in the first place.
+Imagine a table of data, like a spreadsheet of employees. It has three columns: id, name, salary. It has three rows, for Alice, Bob, and Carol.
 
-### Simple Example (generic, pre-URL-Shortener)
+There are two fundamentally different ways to physically lay this data out in a file.
 
-A CSV with a million rows and twenty columns, where a query only needs
-one column's average: a row-oriented reader has no choice but to read
-every byte of every row, parse all twenty fields per row, and discard
-nineteen of them per row, a million times over. A columnar reader with
-the same file in Parquet form reads *only* that one column's contiguous
-byte range off disk — the other nineteen columns' bytes are never even
-touched. The difference isn't "columnar happens to be faster" as a vague
-claim — it's a structural one: the amount of data actually read from disk
-scales with *columns needed*, not *columns that exist*.
-
-### URL Shortener Example
-
-`build_bronze_key`/`write_bronze` already write every table as Parquet.
-What this section adds: `benchmarks/parquet_vs_csv_vs_json.py`, a script
-that takes this repo's own real `clicks` table (or a larger synthetic
-version with the same shape) and writes it to disk in all three formats,
-then measures file size, write time, full-table read time, and
-single-column (`device_type`) read time for each — genuinely run, twice,
-in this sandbox.
-
-### 19.2 Architecture
-
+Row-oriented layout. Store one complete row, then the next complete row, then the next. This is exactly how CSV works.
 ```
- clicks (Postgres, real seeded data OR synthetic-generated DataFrame)
-        │
-        ├──▶ df.to_csv(...)      ──▶ clicks.csv      ──▶ pd.read_csv(...)
-        │                                              ──▶ pd.read_csv(usecols=["device_type"])
-        │                                                   (still scans every row; only SKIPS
-        │                                                    building the other columns)
-        │
-        ├──▶ df.to_json(lines=True) ──▶ clicks.jsonl  ──▶ pd.read_json(...)
-        │                                              ──▶ pd.read_json(...)[["device_type"]]
-        │                                                   (no columnar shortcut exists at all --
-        │                                                    every line is fully parsed regardless)
-        │
-        └──▶ df.to_parquet(compression="snappy") ──▶ clicks.parquet ──▶ pd.read_parquet(...)
-                                                                       ──▶ pd.read_parquet(columns=["device_type"])
-                                                                            (TRUE columnar pushdown --
-                                                                             other 5 columns' bytes
-                                                                             never read off disk)
+1,Alice,50000
+2,Bob,60000
+3,Carol,70000
 ```
+Column-oriented layout. Store every value from one column together, then every value from the next column together.
+```
+[1, 2, 3]
+[Alice, Bob, Carol]
+[50000, 60000, 70000]
+```
+Now ask yourself: you need the average salary. You don't care about id or name at all. How much of the file does each layout force you to read?
 
-Three formats, four measurements each (size, write time, full read, one-
-column read), run twice — once against this project's real 5,000-row
-`clicks` table, once against a synthetic 200,000-row version of the same
-shape — because, as 19.6 shows, the *real* dataset is small enough that
-the trends aren't yet obvious at that scale.
+In the row-oriented file, there is no way to skip straight to the salaries. The salaries are scattered, one per row, mixed in between the other columns. You have to read every single row, in full, and only then discard the id and name you didn't need.
 
-### 19.3 Design Decision: benchmark at two scales, not one
+In the column-oriented file, the salaries are one contiguous block. You jump straight to that block and read only that. The id and name blocks are never even touched.
 
-**Context:** this repo's own seeded data is small (5,000 `clicks` rows by
-`make seed`'s own `N_CLICKS` constant) — small enough, it turns out, that
-Parquet's advantages are not all visible yet. **Decision:** run the
-benchmark twice — once against the real, small seeded table, once against
-a synthetic 200,000-row table of the same shape — and report both
-honestly, rather than picking whichever scale makes the intended point
-more cleanly. **Alternatives considered:** benchmark only the real seeded
-data (simpler, fully "real," but understates Parquet's actual advantage
-at realistic production scale); benchmark only a large synthetic dataset
-(shows the advantage clearly, but never touches this repo's own actual
-data at all). **Trade-offs:** two scales costs more script complexity and
-roughly twice the runtime, in exchange for a materially more honest
-result — the small-scale run is a genuine, if initially surprising,
-finding in its own right (19.6), not a number to bury because it
-complicates the intended narrative. **Consequences:** any claim in this
-guide about Parquet's advantage now has to specify *at what scale* it
-holds — "Parquet is smaller and faster" is true, but incompletely true,
-without that qualifier, and this guide's own standing rule against
-overstating results (Section 15.7, 17.7's honesty about narrower
-guarantees than initially claimed) applies here too.
+This is the entire idea behind Parquet. Parquet is a column-oriented file format. It groups the data column by column instead of row by row.
 
-### Alternatives
+Two more properties, defined plainly
 
-Covered above. A further alternative considered and rejected: running
-each format/scale combination many times and reporting a mean/median with
-variance, the way a rigorous benchmark suite would — rejected for this
-section specifically because a single-run wall-clock measurement, taken
-honestly and labeled as such, is enough to demonstrate the *structural*
-effect this section is teaching (columnar vs. row-oriented I/O) without
-overstating precision this sandbox's shared, variable-load environment
-can't actually deliver; see 19.6 and 19.8 for that caveat stated
-explicitly.
+Parquet is binary, not text. CSV is plain text. You can open it in Notepad and read it with your own eyes. Parquet stores its data in a compact, specially-encoded binary format, the way a .jpg image or a .zip file is binary. This makes Parquet files smaller and faster for a computer to process, but it means a human can't just open one and read it directly. You need a Parquet-aware tool.
 
-### Trade-offs
+Parquet is self-describing. A CSV file is just raw text; nothing in the file itself tells you that the second column is supposed to be a whole number. Whatever program reads it has to guess, or has to be told separately. Every Parquet file, by contrast, ends with a small section called a footer, which stores the exact schema (every column's name and data type) and some statistics about the data. Any program reading the file can look at the footer first and know exactly what it's dealing with, with no guessing and no separate documentation needed.
 
-| | Row-oriented (CSV/JSON) | Columnar (Parquet) |
-|---|---|---|
-| Full-table read | Reads and parses every byte of every row, always | Same total data volume, but decodes per-column, compressed |
-| Single-column read | CSV: still scans every row (`usecols` only skips building unused columns); JSON: no shortcut at all | True columnar pushdown -- only the needed column's bytes are read |
-| File size | No native compression (CSV); verbose text encoding, especially JSON's repeated keys per row | Compressed (snappy here) and compactly, binary-encoded |
-| Human-readable | Yes, directly | No -- needs a Parquet-aware tool |
-| Schema | Not self-describing -- inferred or assumed by the reader | Self-describing -- embedded in the file's own footer |
-| Small-scale overhead | Effectively none | Real, fixed per-file overhead (footer, schema encoding) that has to be amortized across enough rows to pay for itself -- see 19.6 |
+Why does any of this matter for a real pipeline?
 
-### 19.4 Implementation
+Go back to Section 2 of this whole learning plan, where you first learned the difference between OLTP and OLAP. Analytical queries, the kind this entire platform exists to answer, very commonly touch only a handful of columns out of many, across a huge number of rows. "What's the average time-to-click, broken down by device_type, across five million rows" only needs two of your clicks table's six columns. A row-oriented format forces you to pay the cost of all six columns anyway, for every single row. A column-oriented format only makes you pay for the two you actually asked for. That difference gets larger, not smaller, as your data grows, which is exactly the shape of workload this whole project is built around.
 
----
+### 2. URL SHORTENER EXAMPLE
 
-**CREATE:** `benchmarks/parquet_vs_csv_vs_json.py`
-
-**PURPOSE:** Produce real, reproducible file-size and read/write-time
-numbers comparing Parquet against CSV and JSON-lines — the benchmark
-ADR-003 named as "planned" two increments ago.
-
-**DEPENDENCIES:** `pandas`, `pyarrow` (already dependencies of the main
-package); this project's own `config`/`db` modules, to read the real
-`clicks` table when run with no `--rows` argument.
-
-**IMPLEMENTATION GUIDE (write it yourself):** load a DataFrame (real, from
-`clicks`, or synthetic via a `--rows N` flag generating the same six
-columns purely in Python — no database round-trip needed for the
-synthetic path, so it scales far beyond what a small local Postgres
-comfortably holds). For each of the three formats, time a write to a
-temp directory, record the resulting file's size on disk
-(`Path.stat().st_size`), time a full read back into a DataFrame, and time
-a read of just the `device_type` column — using each format's *fairest*
-available API for that (`usecols=` for CSV, plain read-then-select for
-JSON since it has no columnar shortcut, `columns=` for Parquet). Print a
-table; don't round-trip through the database for the synthetic case at
-all, since the entire point of that path is testing at a scale the local
-Postgres wasn't seeded for.
-
-**REFERENCE IMPLEMENTATION (excerpt — full script already committed):**
+You've already been writing Parquet since Section 14, without a dedicated look at how. Here's the actual function, already sitting in your object_store.py:
 
 ```python
-# benchmarks/parquet_vs_csv_vs_json.py (excerpt)
+def _dataframe_to_parquet_bytes(df: pd.DataFrame) -> bytes:
+    buffer = io.BytesIO()
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    pq.write_table(table, buffer, compression="snappy")
+    return buffer.getvalue()
+```
+Walking through each line:
 
+io.BytesIO() creates an empty, in-memory buffer. Think of it as a temporary file that lives only in RAM, never touching the disk. This is used instead of a real temp file because the result needs to go straight into an S3 PUT request, not sit on disk first.
+
+pa.Table.from_pandas(df, preserve_index=False). pa is PyArrow, a library built specifically for working with columnar data in memory, and it's the engine that actually knows how to write the Parquet format. This line converts your pandas DataFrame into PyArrow's own columnar Table structure, which is the format PyArrow's Parquet writer expects. preserve_index=False tells it to drop pandas' automatic row-numbering index, so it doesn't get written into the file as an extra, unwanted column.
+
+pq.write_table(table, buffer, compression="snappy"). This is the actual write. pq is PyArrow's Parquet-specific module. This line encodes the table into the real Parquet binary format and writes those bytes into the in-memory buffer from step one. compression="snappy" names the compression algorithm to use. Compression codec, defined: an algorithm that shrinks data by finding and removing repetition, at the cost of some CPU time to compress and later decompress it. Snappy is chosen here specifically because it's fast to compress and decompress, at a moderate compression ratio, a good default when write/read speed matters more than squeezing out every possible byte.
+
+### 3. DESIGN
+The design decision: benchmark at two different sizes, not one
+
+Your project made a genuine, deliberate choice here, worth understanding in full. ADR-003, an earlier design decision record in your project, had already asserted that Parquet would be "efficient for analytical, column-selective reads," two increments before anyone actually measured it. This section is where that assertion finally got tested against real numbers.
+
+Here's the decision: run the benchmark twice. Once against your project's real, small seeded clicks table, which only has 5,000 rows. Once against a synthetic table of the exact same shape, but with 200,000 rows.
+
+Why not just benchmark once, against the real data you already have? Because 5,000 rows turns out to be small enough that Parquet's advantage isn't fully visible yet, for a reason explained below. Benchmarking only at that scale would have quietly given a misleading picture.
+
+Why not just benchmark once, against a large synthetic dataset? Because then the benchmark never actually touches your project's own real data at all, and a reader can't be sure the result generalizes back to the thing they're actually building.
+
+Running both costs more script complexity and roughly double the runtime. In exchange, it produces an honest result instead of a convenient one. This matters enough that it's worth a general engineering habit, not just a one-off decision: measure a claim at the scale where it will actually apply, not at whatever scale happens to be easiest to test.
+
+Amortization, defined, since it explains the real numbers below
+
+Amortize means to spread a fixed, one-time cost across many uses, so its per-use impact shrinks the more you use it. Think of buying a $100 toolbox. If you use it once, that tool cost you $100. If you use it a thousand times, it effectively cost you 10 cents per use. The cost didn't change; how many times you divided it by did.
+
+Every Parquet file has a fixed cost: that footer we defined earlier (the embedded schema and statistics) has to be written when saving, and parsed when reading, no matter how many rows are in the file. For a file with only 5,000 rows, that fixed cost is a real, noticeable fraction of the total work. For a file with 200,000 rows, that exact same fixed cost gets divided across 40 times more rows, so it barely matters anymore. This is the amortization effect, and it's the reason a benchmark run at only one scale can be misleading.
+
+### 4. IMPLEMENTATION
+
+The benchmark script itself, real and already committed at benchmarks/parquet_vs_csv_vs_json.py. Here's the part of it that isolates the single-column read test, for each format, using each format's own fairest available approach:
+
+python
 def _read_csv_one_column(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, usecols=["device_type"])          # scans every row regardless
 
@@ -3747,165 +3672,77 @@ def _read_json_one_column(path: Path) -> pd.DataFrame:
 
 def _read_parquet_one_column(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path, engine="pyarrow", columns=["device_type"])   # true columnar pushdown
+5. CODE WALKTHROUGH
+
+_read_csv_one_column uses pandas' usecols parameter. This tells pandas which columns you actually want back. But it's important to understand what this does and doesn't save you. CSV has no columnar structure at all. Pandas still has to read every single row from start to finish, character by character, because there's no way to know where the device_type value is on a given line without first reading past everything before it. usecols only saves you the work of building unused Python objects for the other columns; it does not save you any disk reading at all.
+
+_read_json_one_column doesn't even get that partial benefit. It reads the entire file into a DataFrame with every column, and only afterward selects ["device_type"]] from the already-fully-loaded result. There is no columnar shortcut in JSON-lines whatsoever.
+
+_read_parquet_one_column passes columns=["device_type"] directly into pd.read_parquet. This is genuine columnar pushdown: the request for "just this column" gets pushed all the way down to the file-reading layer itself. PyArrow looks at the file's footer, finds exactly which byte ranges on disk hold the device_type column, and reads only those bytes. The other five columns' data is never read off disk at all, not even to be discarded.
+
+### 6. RUN
+
+Real commands:
+
+bash
+make benchmark-parquet                 # your real, seeded clicks table (~5,000 rows)
+make benchmark-parquet ROWS=200000     # a synthetic table of the same shape, 200,000 rows
+
+Your project's guide already recorded a genuine run of both, in this same sandbox. These are real, actually-observed numbers, not projections. Run the command yourself and expect the file-size columns to match exactly; the timing columns will vary a little, since wall-clock timing on a shared machine is never perfectly repeatable.
+
+At 5,000 real rows:
 ```
-
-Full file: [`parquet_vs_csv_vs_json.py`](../benchmarks/parquet_vs_csv_vs_json.py).
-
-**RUN:**
-```bash
-make benchmark-parquet                 # real seeded clicks table
-make benchmark-parquet ROWS=200000     # synthetic, larger scale
+format      size_bytes   write_s   full_read_s   one_col_read_s
+csv         597311       0.0405    0.0124         0.0063
+json        961259       0.0376    0.0288         0.0252
+parquet     417649       0.0164    0.0132         0.0024
 ```
-
-**VERIFY / EXPECTED:** see 19.6's actual output below — this is one of
-the few places in this guide where "expected" and "actually observed" are
-the same section, since the numbers below are real.
-
-**TEST:** this script isn't unit-tested (it's a one-off measurement tool,
-not pipeline code another module imports — the same category `scripts/
-seed_sample_data.py` already falls into); `ruff check benchmarks/` is
-run as part of this increment's lint pass.
-
-**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections
-19.8/19.9.
-
----
-
-### Hands-on Challenge (implement-yourself)
-
-Before LAB 15 below, try this without looking at the script: predict, in
-writing, whether you expect Parquet's *full-table* read to be faster or
-slower than CSV's at 5,000 rows, and why — before running anything. Then
-run `make benchmark-parquet` and compare your prediction against 19.6's
-real numbers. (Most people predict "Parquet wins on every metric,
-always" — the real, small-scale result is more interesting than that,
-and 19.6 explains exactly why.)
-
-### 19.5 Hands-on Exercise
-
-**LAB 15 — Run the benchmark yourself, at both scales.**
-
-```bash
-make benchmark-parquet                  # real clicks table (~5,000 rows)
-make benchmark-parquet ROWS=200000      # synthetic, 200,000 rows
+At 200,000 synthetic rows:
 ```
-
-What to observe: run it twice at the small scale and compare — wall-clock
-timings on a shared machine vary run to run (19.8 names this explicitly);
-the *size* numbers, by contrast, are deterministic and will match 19.6
-exactly. Then compare the small-scale and large-scale results side by
-side and notice which metrics *change trend* between the two (19.6 names
-exactly one that does).
-
-### 19.6 How to test
-
-The benchmark script above was genuinely run twice in this sandbox — once
-against the real, 5,000-row seeded `clicks` table, once against a
-synthetic 200,000-row version. **Both are ACTUAL OBSERVED results, not
-DESIGN EXPECTATIONS:**
-
+format      size_bytes   write_s   full_read_s   one_col_read_s
+csv         21626749     0.8884    0.4753         0.1645
+json        38586801     0.6567    1.0284         0.9612
+parquet     4329469      0.0912    0.0596         0.0082
 ```
-Loaded 5000 REAL rows from this project's own `clicks` table.
+###7. EXPERIMENT
 
-dataset              format      rows   size_bytes   write_s  full_read_s  one_col_read_s
------------------------------------------------------------------------------------------
-real_clicks          csv         5000       597311    0.0405       0.0124          0.0063
-real_clicks          json        5000       961259    0.0376       0.0288          0.0252
-real_clicks          parquet     5000       417649    0.0164       0.0132          0.0024
+Before reading further, make a written prediction. At only 5,000 rows, do you expect Parquet's full-table read to be faster or slower than CSV's? Most people confidently predict "Parquet wins on everything, always." Now look at the real numbers above: at 5,000 rows, Parquet's full read (0.0132s) is essentially tied with CSV's (0.0124s), if anything a touch slower. Only at 200,000 rows does Parquet's full read pull decisively ahead, at 0.0596s versus CSV's 0.4753s, roughly 8 times faster.
 
-real_clicks: csv is 1.43x the size of parquet
-real_clicks: json is 2.30x the size of parquet
-```
+This is the amortization effect from the Design section, made concrete. At small scale, the fixed footer/schema overhead isn't paid off yet by the columnar savings. At large scale, it is, overwhelmingly. Notice, though, what doesn't flip between the two scales: the single-column read time favors Parquet decisively at both sizes, already about 2.6 times faster than CSV even at just 5,000 rows. That's the number that actually matters most for this whole project, since selective, few-column reads are exactly the query shape this platform exists to serve.
 
-```
-Generated 200000 SYNTHETIC rows (same shape as `clicks`, not real data).
+A second, hands-on experiment, the failure case. Find one of your real Bronze Parquet files on disk, and try to open it directly:
 
-dataset              format      rows   size_bytes   write_s  full_read_s  one_col_read_s
------------------------------------------------------------------------------------------
-synthetic_200000     csv       200000     21626749    0.8884       0.4753          0.1645
-synthetic_200000     json      200000     38586801    0.6567       1.0284          0.9612
-synthetic_200000     parquet   200000      4329469    0.0912       0.0596          0.0082
+bash
+cat data/bronze/urls/ingestion_date=2026-09-24/urls.parquet
 
-synthetic_200000: csv is 5.00x the size of parquet
-synthetic_200000: json is 8.91x the size of parquet
-```
+You'll see unreadable binary garbage in your terminal. Now try the equivalent with a CSV file, if you have one lying around, or with data/bronze/urls/.../urls.parquet read properly instead:
 
-**What actually changed between the two scales, stated honestly:** file
-size and single-column read time favor Parquet decisively at *both*
-scales (at 5,000 rows, Parquet's one-column read is already ~2.6x faster
-than CSV's and ~10x faster than JSON's). But **full-table read time is
-the metric that flips**: at 5,000 rows, Parquet's full read (0.0132s) is
-essentially tied with — if anything, marginally slower than — CSV's
-(0.0124s); only at 200,000 rows does Parquet's full read pull decisively
-ahead (0.0596s vs. CSV's 0.4753s, ~8x faster). The reason is Parquet's
-own structure: every Parquet file carries fixed per-file overhead (a
-footer, embedded schema, column metadata) that a reader has to parse
-before touching any actual row data — at 5,000 rows that fixed cost isn't
-yet amortized away by the savings columnar storage provides; at 200,000
-rows it is, overwhelmingly. **The lesson, stated plainly: "Parquet is
-faster" is true, but only past a scale where its fixed overhead pays for
-itself — a claim this guide would have gotten wrong by only ever
-benchmarking this project's own small seeded dataset**, which is exactly
-why 19.3 chose to run both scales rather than one.
+bash
+python3 -c "import pandas; print(pandas.read_parquet('data/bronze/urls/ingestion_date=2026-09-24/urls.parquet').head())"
 
-**Caveat, stated honestly:** these are single-run wall-clock timings on a
-shared cloud sandbox, not a statistically rigorous multi-trial benchmark
-(no repeated runs, no variance reported) — the *size* numbers are exact
-and fully reproducible; the *timing* numbers should be read as
-directionally real, not as precise to the millisecond. Re-run
-`make benchmark-parquet` yourself and expect small run-to-run variance in
-the timing columns, none in the size columns.
+That second command works, because it uses a Parquet-aware tool. This is a genuine, if small, operational cost worth feeling once with your own hands: debugging "what's actually inside this Bronze object" always requires the right tool for Parquet, unlike CSV or JSON, which you can just open and read.
 
-### 19.7 Failure Scenario
+### 8. PRODUCTION VIEW
+Aspect	This project right now	Real production
+Compression codec	snappy, chosen for write/read speed	Same is common; some teams switch to zstd for better compression once storage cost matters more than compute cost
+Row-group sizing	PyArrow's own default, left unconfigured	Explicitly tuned, once files get large enough that this trade-off starts to matter
+Benchmark rigor	One run per scale, honestly labeled as such	Many repeated runs, with variance reported, on dedicated hardware
+Schema evolution	Not exercised yet — every write uses one fixed schema	Parquet does support adding/removing columns across files over time, but readers have to be written to expect that
+Reading files by hand	Needs a Parquet-aware tool	Same constraint, usually hidden behind a query engine like Spark, Athena, or DuckDB, so nobody inspects raw files directly
 
-**What happens if a Parquet file is read by a tool that doesn't
-understand it?**
+Row group, defined, since production tuning depends on it: internally, a Parquet file is split into chunks called row groups, each one holding a subset of the rows, stored in columnar form within that chunk. This lets a reader process different row groups in parallel, or skip a whole row group entirely if its statistics show it can't possibly contain a value you're filtering for. Tuning row-group size is a real trade-off between more parallelism (smaller row groups) and less per-row-group bookkeeping overhead (larger row groups), and it becomes worth touching only once files are large enough for it to matter, which your project's current file sizes are not.
 
-Concretely: a Bronze object opened with a plain text editor, or piped
-through `cat`, is unrecognizable binary — unlike a CSV or JSON-lines
-object, which is directly human-readable without any special tooling at
-all. This is a real, if minor, operational cost of the columnar/binary
-trade-off named in the Trade-offs table above: debugging "what's actually
-in this Bronze object" requires a Parquet-aware tool (`python -c "import
-pandas; print(pandas.read_parquet('...').head())"`, `parquet-tools`, or
-MinIO's own object browser, which can preview Parquet natively) rather
-than just opening the file. For a team without that tooling already in
-their muscle memory, this is a genuine, if small, onboarding friction
-point worth naming rather than glossing over as costless.
+### 9. PRINCIPAL ENGINEER VIEW
 
-### 19.8 Production Considerations
+The strongest thing to be able to say here isn't "Parquet is faster." It's this exact, more precise claim: "Parquet's advantage in full-table read time only shows up past a certain scale, because of fixed per-file overhead that has to be amortized, but its advantage in selective, few-column reads holds at every scale, including small ones, and that second number is the one that actually matters for this system's real query pattern." That's a materially stronger answer than a flat "Parquet is better," and it shows you actually looked at the numbers instead of repeating a claim you read somewhere.
 
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Compression codec | `snappy` (fast, moderate ratio) | Same default is common; some shops use `zstd` for a better ratio at some CPU cost once storage cost dominates over compute cost |
-| Row-group sizing | PyArrow's own default, unconfigured | Explicitly tuned row-group size, balancing read parallelism against per-row-group metadata overhead, once file sizes grow well past this repo's current scale |
-| Benchmark rigor | Single-run wall-clock timings, two scales, genuinely run once each (19.6) | Repeated trials, reported with variance, on dedicated (not shared/variable-load) hardware, at the actual production data scale rather than a synthetic stand-in |
-| Schema evolution | Not yet exercised — every write so far uses one, unchanging schema per table | Parquet supports schema evolution (adding/removing columns across files) but readers across an evolving dataset need to handle it explicitly; untested here |
-| Tooling accessibility | Requires a Parquet-aware tool to inspect (19.7) | Same constraint in production, typically mitigated by a query engine (Athena, Spark, DuckDB) sitting in front of raw files so nobody inspects them by hand regularly |
+A second point worth having ready: knowing which number in a table of benchmark results is actually load-bearing for your original design decision, rather than treating every column as equally important. This project chose object storage plus a columnar format specifically because of Section 2's OLAP query pattern, selective, few-column access. The single-column read numbers are the ones that actually justify that decision. The full-table read numbers are interesting, but they're not the reason Parquet was chosen in the first place.
 
-### Principal Data Engineer Perspective
-
-The judgment call worth defending here is reporting the small-scale
-result honestly even though it complicates the story ADR-003 originally
-told ("Parquet is efficient for analytical, column-selective reads," said
-with confidence, two increments before it was ever measured). A weaker
-approach to closing this benchmark gap would have been to run it once, at
-whatever scale made Parquet look unambiguously best, and call the
-"planned benchmark" item done. What actually happened — running it twice,
-finding a real result that doesn't uniformly favor Parquet at small
-scale, and explaining *why*, structurally — is a better outcome for a
-portfolio reviewer to see, not a worse one: it demonstrates the habit of
-verifying an assumption rather than just restating it more confidently
-after having measured it. The second thing worth flagging: the
-single-column read numbers are the more important ones for this
-project's actual eventual query shape (Section 2's whole reason object
-storage plus a columnar format was chosen at all), and those favor
-Parquet decisively at *every* scale tested, including the smallest —
-worth being able to say which of a benchmark's several numbers is
-actually load-bearing for the original design decision, rather than
-treating every column of a results table as equally important.
-
-### 19.9 Principal Engineer Interview Questions
+### 10. REMEMBER
+Row-oriented storage groups by row (CSV, JSON). Column-oriented storage groups by column (Parquet). A query needing few columns out of many is cheap in the second, expensive in the first.
+Parquet is binary and self-describing. Binary means you need a Parquet-aware tool to read it. Self-describing means the schema is embedded in the file's own footer, no external documentation needed.
+Amortization explains why Parquet's full-table-read advantage only appears at larger scale: a fixed per-file cost matters a lot when spread over few rows, and barely at all when spread over many.
+When several benchmark numbers exist, know which one actually justifies your original design decision. Here, it's single-column read time, not full-table read time.
 
 **Q: "Your own benchmark shows Parquet's full-table read time roughly
 tied with CSV's at 5,000 rows, only pulling ahead at 200,000. Does that
