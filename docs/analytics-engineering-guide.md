@@ -3254,213 +3254,231 @@ flat key space, not a directory walk.
      (flat key space -- the tree above is a READING convenience,
       not a real filesystem MinIO maintains)
 ```
+### 1. CONCEPT
+First, what problem are we even solving?
 
-Disabling boto3's own retry logic (`retries={"max_attempts": 0}`) is worth
-calling out explicitly: `_put_parquet_with_retry` (Section 14.4) already
-implements a retry loop with its own backoff. Leaving boto3's built-in
-retrying *also* enabled would mean a transient error gets retried by two
-independent layers stacked on top of each other, with two different
-backoff schedules — harder to reason about and to tune, for no real
-benefit. One retry policy, owned by this codebase and fully visible in
-Section 14.4's code, beats two overlapping ones.
+Every computer program needs somewhere to put data so it survives after the program stops running. You already know two ways to do this.
 
-### 18.3 Design Decision: one bucket, prefix-separated layers
+The first way is a file on a hard disk. You've used this your whole life. open("notes.txt", "w"), write some text, close the file. The operating system keeps track of where that file lives, inside folders, inside other folders.
 
-**Context:** Bronze exists today; Silver and Gold (Phase 2+) will need
-somewhere to land too, and that somewhere needs deciding now, since it
-shapes key-naming conventions everywhere in this codebase.
-**Decision:** one bucket, `analytics-lake`, with each layer as a top-level
-key prefix (`bronze/`, and later `silver/`, `gold/`) — not a separate
-bucket per layer. **Alternatives considered:** a bucket per layer
-(`analytics-lake-bronze`, `analytics-lake-silver`, `analytics-lake-gold`);
-a bucket per table. **Trade-offs:** separate buckets give cleaner
-per-layer IAM policies in a real AWS deployment (a bucket policy is a
-natural unit of access control — "Bronze readers can't touch Gold") and
-make a full-bucket lifecycle policy trivial to scope per layer. A single
-bucket with prefixes is simpler to provision (one `mc mb` command, one
-thing to create and tear down locally) and keeps `MINIO_BUCKET`, this
-repo's one piece of bucket-related configuration, a single value instead
-of three — the right trade for a Phase 1 POC's actual operational
-complexity, at the cost of that per-layer access-control convenience.
-**Consequences:** `MINIO_BUCKET`/`settings.minio_bucket` stays a single
-config value through Phase 2's Silver/Gold work; if a future need for
-per-layer IAM boundaries becomes real, migrating from prefixes to
-separate buckets is a genuine, non-trivial data-movement exercise (every
-existing key would need to move, not just be renamed) — worth knowing
-upfront rather than discovering only once Phase 2 is already underway.
+The second way is a database, like Postgres, which you've already used a lot in this project. A database stores structured rows and lets you update one field of one row without touching anything else.
 
-### Alternatives
+Object storage is a third way. It's neither a filesystem nor a database. It's a much simpler idea: a giant warehouse of numbered boxes, where each box holds one blob of data, and you can only ever put a box in or take a box out whole. You can't reach into a box and change one item inside it.
 
-Covered above. A third, more minor alternative also considered: prefixing
-by *table* instead of by *layer* at the top level
-(`urls/bronze/...`, `clicks/bronze/...`) — rejected because most
-operational questions ("how big is Bronze right now," Section 18.4's
-`storage-stats`) are naturally scoped by layer, not by table, and
-layer-first prefixes make those the cheap, single-prefix queries while
-table-first prefixes would make them expensive, all-tables scans instead.
+The generic analogy: a self-storage warehouse
 
-### Trade-offs
+Picture a real self-storage facility, like the kind that rents out storage units.
 
-| | Single bucket, prefix layers (chosen) | Bucket per layer |
-|---|---|---|
-| Provisioning | One `mc mb` / one bucket to create | Three (or more) buckets to create and keep in sync |
-| Per-layer IAM boundary | Not directly possible — a bucket policy covers the whole bucket | Natural — a policy per bucket |
-| Config surface | One `MINIO_BUCKET` value | One bucket name per layer |
-| Migrating to per-layer boundaries later | Requires moving every object to a new bucket | N/A -- already separated |
-| Right fit for this project's current scale | Yes | Premature for a single-operator Phase 1 POC |
+Every unit has a unique label, like Unit-4471. That label is the only way to find your stuff. There's no "walking down the third aisle, second shelf" the way a filesystem folder structure works. You just say "give me Unit-4471" and the warehouse hands it to you.
+You can put a sealed box into Unit-4471. You can take that box back out. You can replace it with a completely different sealed box, still labeled Unit-4471.
+You cannot open the box, take out one item, and put a different item in its place. If you want to change anything inside, you take the whole box away and drop off a whole new box.
+If you rent a lot of units, and you name them cleverly, like photos/2024/vacation.zip and photos/2025/vacation.zip, it looks like you have folders called photos, 2024, 2025. But the warehouse doesn't actually have a folder called photos. It just has flat labels that happen to contain slash characters. The "folder look" is something you imaged onto the labels, not something the warehouse tracks.
 
-### 18.4 Implementation
+Hold onto this analogy. Every real object storage system, including the one in your project, works exactly like this warehouse.
 
----
+Now the real technical terms
 
-**CREATE:** (edit) `ingestion/src/url_shortener_analytics/object_store.py`
-— `get_bucket_stats`
+Let's define each term exactly once, in plain words, before using it again.
 
-**PURPOSE:** A cheap, always-available capacity/growth signal — how many
-objects, how many bytes, under a given prefix — without needing a real
-observability platform wired up yet.
+Object. A single blob of data. Could be a photo, a video, a Parquet file, anything. In our warehouse analogy, this is the sealed box.
 
-**IMPLEMENTATION GUIDE (write it yourself):** `list_objects_v2`'s response
-already includes a `Size` field per object in `Contents` — resist the
-urge to loop over `list_bronze_keys`'s output and call `head_object` on
-each one to get its size; that's one HTTP round-trip per object where one
-round-trip *total* already has everything needed. Sum `Size` across
-`Contents`, count the entries, return both as a small dict.
+Key. The unique label used to find one object. In our analogy, this is Unit-4471. In your project, a real key looks like bronze/clicks/ingestion_date=2026-09-24/clicks.parquet. It's just a string of text. Nothing more.
 
-**REFERENCE IMPLEMENTATION:**
+Bucket. The warehouse itself, the top-level container that holds every object. In your project, the bucket is named analytics-lake.
+
+Prefix. The part of a key before some marker, usually the last slash. If your key is bronze/clicks/ingestion_date=2026-09-24/clicks.parquet, then bronze/clicks/ is a prefix of it. Prefixes are how you search for a group of related objects, by asking "give me every key that starts with this exact text."
+
+HTTP verb. Object storage isn't accessed through normal file-opening code like open(). It's accessed over the network, using the same HTTP protocol your web browser uses to load a webpage. There are five operations you need to know:
+
+Verb	Plain meaning
+PUT	Upload an object at a given key. Replaces whatever was already there.
+GET	Download the full object at a given key.
+HEAD	Ask "does this key exist, and how big is it?" without downloading the actual data.
+LIST	Ask "give me every key that starts with this prefix."
+DELETE	Remove the object at a given key.
+
+That's the entire vocabulary of object storage. Five verbs, plus the idea of a bucket and a key.
+
+The two properties that trip people up, explained slowly
+
+Property 1: no partial edits, ever.
+
+With a normal file, you can open it, seek to byte 500, overwrite ten bytes, and close it. Object storage has no equivalent of this. The only write operation is PUT, and PUT always uploads the entire object, from scratch, replacing anything that was there before under that key. If you want to change even one byte of a 10-gigabyte file, you have to re-upload all 10 gigabytes again, under the same key.
+
+Why does an entire technology choose to work this way, when it sounds so much more limited than a filesystem? Because giving up partial edits removes a whole category of hard problems. Two different programs can't corrupt each other by writing to different parts of the same file at the same time, because "different parts of the same file" doesn't exist. There's no lock to acquire, no lock to forget to release, no half-written file if a program crashes mid-write, since a crash mid-PUT just means the old object under that key is still there, untouched, until the new PUT finishes successfully. That simplicity is what lets object storage scale to holding an effectively unlimited number of objects, spread across enormous numbers of physical machines, without needing to coordinate those machines the way a shared filesystem would.
+
+Property 2: there are no real folders, only labels that look like folders.
+
+In our warehouse analogy: the warehouse doesn't have a section called photos. It has flat unit labels, and some of those labels happen to contain the text photos/. When you ask "show me everything under photos/", the warehouse just scans every label and returns the ones that start with those exact characters. It's a text comparison, not a folder lookup.
+
+This matters in practice for two big reasons. First, "listing a folder" in object storage is always at least as expensive as scanning through however many keys share that prefix. Filesystems can jump straight to a folder's contents because the operating system maintains a real directory structure; object storage can't take that shortcut. Second, you can accidentally match things you didn't mean to. If you ask for everything under the prefix bronze/cli (missing the trailing slash), you'll get back bronze/clicks/... and also, hypothetically, bronze/client_events/... if that ever existed, purely because both strings happen to start with the same six letters. This is exactly why real code always builds prefixes with an explicit trailing slash.
+
+### 2. URL SHORTENER EXAMPLE (your project's real code)
+
+Now let's connect the warehouse analogy to your actual code.
+
+S3 and MinIO, defined. Amazon invented a specific object storage product called S3 ("Simple Storage Service"), and its HTTP API (the exact shape of the PUT/GET/HEAD/LIST/DELETE requests) became so widely used that it's now a de facto industry standard. MinIO is a separate, open-source piece of software that you can run yourself, on your own laptop or your own servers, which speaks that exact same S3 API. Your project runs MinIO locally instead of paying for real AWS S3, but the code you write doesn't know or care which one it's actually talking to, because both understand the identical HTTP requests.
+
+boto3, defined. boto3 is the official Python library AWS publishes for talking to S3 (and every other AWS service). It handles building the correct HTTP requests for you, so your code calls plain Python functions like s3_client.put_object(...) instead of constructing raw HTTP requests by hand.
+
+Here's the real function in your codebase that builds this connection:
 
 ```python
-# ingestion/src/url_shortener_analytics/object_store.py (excerpt)
+def get_s3_client(settings: Settings) -> BaseClient:
+    return boto3.client(
+        "s3",
+        endpoint_url=settings.minio_endpoint,
+        aws_access_key_id=settings.minio_access_key,
+        aws_secret_access_key=settings.minio_secret_key,
+        config=Config(signature_version="s3v4", retries={"max_attempts": 0}),
+    )
+```
+Walking through this line by line:
 
+boto3.client("s3", ...) says "build me a client that speaks the S3 API." This is the same call you'd make to talk to real AWS S3.
+endpoint_url=settings.minio_endpoint is the one line that changes everything. It tells boto3 "don't talk to Amazon's real servers, talk to this address instead" — which in your sandbox is http://localhost:9000, MinIO running on your own machine. If you deleted this one line, and had real AWS credentials, this exact same code would talk to real AWS S3 instead. Nothing else in your entire ingestion pipeline would need to change.
+aws_access_key_id / aws_secret_access_key are a username/password pair, used to prove your code is allowed to read and write this bucket. This is a simplification worth naming honestly: real production systems use short-lived, automatically-rotating credentials instead of a fixed password sitting in a config file, because a leaked long-lived key is a serious security problem.
+retries={"max_attempts": 0} turns off boto3's own built-in automatic retrying. We'll come back to exactly why in the Design section below.
+
+And here's the function that builds a key, the "unit label" from our warehouse analogy:
+
+```python
+def build_bronze_key(table_name: str, run_date: datetime) -> str:
+    return f"bronze/{table_name}/ingestion_date={run_date:%Y-%m-%d}/{table_name}.parquet"
+
+For table_name="clicks" and today's date, this returns the plain text string bronze/clicks/ingestion_date=2026-09-24/clicks.parquet. That's it. It's just building a string. There is no folder being created anywhere. MinIO will simply remember "there is an object whose label is exactly this string."
+```
+### 3. DESIGN
+Architecture: how the pieces connect
+```
+ Your ingestion code (extract_full.py, extract_incremental.py)
+         │
+         │  calls object_store.write_bronze(...)
+         ▼
+ object_store.py
+         │
+         │  builds a boto3 S3 client, pointed at MinIO
+         │  sends a PUT request over HTTP
+         ▼
+ MinIO (running in Docker, on your machine)
+   listens on two different ports:
+     - port 9000: the actual S3 API (PUT/GET/HEAD/LIST/DELETE)
+     - port 9001: a separate web dashboard you can view in a browser
+         │
+         ▼
+ Inside MinIO: one bucket, "analytics-lake"
+   holding a flat list of objects, e.g.:
+     bronze/urls/ingestion_date=2026-09-24/urls.parquet
+     bronze/users/ingestion_date=2026-09-24/users.parquet
+     bronze/clicks/incremental/watermark_start=.../clicks.parquet
+```
+   (the indentation above is just for YOUR eyes -- MinIO stores
+    these as one flat list of strings, with no real tree structure)
+Why boto3's own retries are turned off
+
+You already learned, back in Full Load Ingestion, that _put_parquet_with_retry is a function in your own code that retries a failed write a few times, with a short pause between attempts. That's your own, custom retry logic.
+
+boto3 also ships with its own, separate, built-in retry logic, which is on by default. If you left both enabled at once, a single failed write could get retried by two different systems, each with its own timing, stacked on top of each other. That's genuinely confusing to debug: if a write takes an unexpectedly long time to fail, is that your retry loop, boto3's retry loop, or both firing at once? Setting retries={"max_attempts": 0} disables boto3's copy, so there's exactly one retry policy in this whole codebase, and it's the one you can actually read, in Section 14.4's _put_parquet_with_retry.
+
+The real design decision: one bucket, or many?
+
+Here's a genuine engineering choice your project had to make, and it's worth understanding both sides.
+
+As your project grows, it won't just have Bronze data. Section 2 of this learning plan already told you Silver and Gold layers are coming later. Where should those live?
+
+Option A, the one chosen: one bucket, analytics-lake, with the layer name baked into the key as a prefix. So Bronze objects start with bronze/, and later, Silver objects will start with silver/, all inside the exact same bucket.
+
+Option B, considered and rejected: a separate bucket per layer. So you'd have analytics-lake-bronze, analytics-lake-silver, analytics-lake-gold as three entirely separate buckets.
+
+To understand why Option B is tempting, you need one more term defined: IAM. IAM stands for Identity and Access Management. It's the system, in AWS and similar platforms, for controlling who is allowed to do what. An "IAM policy" is a rule like "this particular username is allowed to read from bucket X, but not bucket Y." A bucket is the natural unit these policies attach to; you write one policy per bucket.
+
+So Option B's real advantage is access control: with three separate buckets, you can write a rule like "the BI reporting team can only read from the Gold bucket, never Bronze," and that rule is simple and bulletproof, because it's enforced at the whole-bucket level. With Option A (one shared bucket), you can't write that same rule as easily. You'd need a more complicated kind of rule that looks inside the bucket at the key itself, which AWS supports but which is harder to write and easier to get wrong.
+
+So why did this project still choose Option A? Because right now, in Phase 1, there's exactly one person (you) operating this whole pipeline, with no separate teams needing separate access. Setting up three buckets, three sets of permissions, and three things to keep in sync is real, unnecessary work at this stage, for a security boundary nobody currently needs. One bucket keeps the code simpler too: there's exactly one config value, MINIO_BUCKET, instead of three.
+
+The honest trade-off, stated upfront rather than hidden: if a future need for that Bronze/Silver/Gold access boundary becomes real, someone will have to physically move every single object into new buckets. You can't just rename a bucket the way you can rename a folder. That's a real, non-trivial migration, and it's worth knowing this cost exists now, rather than discovering it by surprise later.
+
+	One bucket, prefix-separated (chosen)	Bucket per layer
+How many buckets to set up	1	3 or more
+Can restrict "this team can only see Gold"	Not easily	Yes, naturally
+Config values needed	1 (MINIO_BUCKET)	1 per bucket
+Cost of switching to the other option later	Must physically move every object	N/A, already separated
+Right choice for a single-person Phase 1 project	Yes	Not yet, too much setup for no current benefit
+4. IMPLEMENTATION
+
+The one genuinely new function in this section, already written and sitting in your object_store.py:
+
+```python
 def get_bucket_stats(s3_client: BaseClient, bucket: str, prefix: str = "bronze/") -> dict[str, int]:
     response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
     contents = response.get("Contents", [])
     return {"object_count": len(contents), "total_bytes": sum(obj["Size"] for obj in contents)}
 ```
+### 5. CODE WALKTHROUGH
 
-Full file: [`object_store.py`](../ingestion/src/url_shortener_analytics/object_store.py).
+Let's go through every line.
 
-**RUN:** `make storage-stats` (wraps `python -m url_shortener_analytics.cli
-storage-stats --prefix bronze/`)
+s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix). This sends the LIST request from our vocabulary table. It says "search the warehouse for every unit label that starts with this prefix text." In your project, that's every key starting with bronze/.
 
-**VERIFY:** run `make ingest-full`, then `make storage-stats` twice in a
-row — the second run's `object_count`/`total_bytes` should match the
-first (full loads overwrite the same date-scoped keys — Section 14's
-idempotency guarantee — so re-running `ingest-full` without advancing to
-a new day must not grow these numbers).
+response.get("Contents", []). The response from list_objects_v2 comes back as a Python dictionary. If any objects matched, they're listed under the key "Contents". If nothing matched (say, the bucket is completely empty), that key might be missing entirely from the response, so .get("Contents", []) says "grab that list if it exists, otherwise just give me an empty list," instead of crashing with a KeyError.
 
-**EXPECTED:** `object_count` equal to the number of distinct
-`(table, ingestion_date)` and `(table, watermark_range)` combinations
-ever successfully written; `total_bytes` roughly tracking Section 19's
-per-format size numbers, times however many objects exist.
+{"object_count": len(contents), ...}. len(contents) just counts how many matching objects came back. This is the total number of "boxes" currently sitting in the warehouse under that prefix.
 
-**TEST:** `test_object_store.py` — two new tests (size/count summed
-correctly with no `head_object` calls; zero-object case).
+"total_bytes": sum(obj["Size"] for obj in contents). Here's the detail worth slowing down on. Each item inside contents isn't just a key string. It's a small dictionary that already includes metadata about that object, including its size in bytes, under the key "Size". This line adds up the "Size" field across every matching object.
 
-**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections
-18.8/18.9.
+Why this matters, and the mistake it avoids: a tempting-but-wrong way to write this function would be to first call list_bronze_keys to get just the key names, and then call head_object once per key to separately ask "how big is this one?" That would work, but it wastes network calls. Each head_object call is its own separate HTTP round-trip to MinIO. If you have 500 objects, that's 500 extra network requests, just to re-fetch information the single list_objects_v2 call already handed you for free, in one response. get_bucket_stats avoids this by reusing the size field that was already sitting in the LIST response.
 
----
+### 6. RUN
 
-### Hands-on Challenge (implement-yourself)
+Real command, real expected shape of the output:
 
-Before LAB 14 below, try this without looking at `object_store.py`: write
-a version of `get_bucket_stats` that *also* breaks the total down
-per-table (a dict of `{table_name: {"object_count": ..., "total_bytes":
-...}}`), using only `list_bronze_keys`'s existing output — no new S3 calls.
-Hint: the table name is the second path segment of every Bronze key
-(`bronze/{table}/...`) — you already have everything you need in the key
-strings themselves, entirely client-side, once you have the flat listing.
+bash
+make storage-stats
 
-### 18.5 Hands-on Exercise
+This wraps python -m url_shortener_analytics.cli storage-stats --prefix bronze/ under the hood.
 
-**LAB 14 — Watch Bronze storage grow, then confirm idempotent reruns
-don't grow it further.**
-
-Prerequisites: `make up`, `make seed`.
+Try this exact sequence yourself, checking the output after each step:
 
 ```bash
-make storage-stats          # before anything: object_count=0, total_bytes=0
-make ingest-full            # writes urls.parquet, users.parquet
-make storage-stats          # object_count=2, total_bytes=<real total>
-
-make ingest                 # clicks: first incremental run, one more object
-make storage-stats          # object_count=3
-
-make ingest-full            # SAME day -- overwrites urls.parquet/users.parquet
-                             # in place (Section 14's idempotency guarantee)
-make storage-stats          # object_count STILL 3 -- not 5
+make storage-stats          # expect: object_count=0, total_bytes=0 (nothing ingested yet)
+make ingest-full             # writes urls.parquet and users.parquet
+make storage-stats          # expect: object_count=2
+make ingest                  # clicks, first incremental run, one more object
+make storage-stats          # expect: object_count=3
+make ingest-full             # SAME calendar day -- overwrites urls.parquet/users.parquet in place
+make storage-stats          # expect: object_count STILL 3, not 5
 ```
+### 7. EXPERIMENT (hands-on, including a "why did it not change" check)
 
-What to observe: the last `storage-stats` call is the real proof this lab
-is after — a second `make ingest-full` on the same day does not grow
-`object_count`, because `build_bronze_key`'s deterministic, date-scoped
-keys mean the rerun overwrote the exact same two objects rather than
-creating new ones. *(DESIGN EXPECTATION for the exact numbers — run it
-yourself with real MinIO; this sandbox has none.)*
+The last make storage-stats call above is the actual proof this exercise is testing. If you run make ingest-full a second time on the same day, and object_count jumps to 5 instead of staying at 3, something is wrong with build_bronze_key's determinism from Section 14. It should never grow, because the second ingest-full overwrites the exact same two keys instead of creating new ones. Run this yourself and confirm the number really does stay at 3.
 
-### 18.6 How to test
+Now a break-it exercise, to build real intuition about the "no real folders" property. Open a Python shell (or a one-off script) and, using the same s3_client, deliberately call:
 
-```bash
-make test
+```python
+s3_client.list_objects_v2(Bucket="analytics-lake", Prefix="bronze/cli")
 ```
+Notice the missing trailing slash: bronze/cli, not bronze/clicks/. Predict what comes back before you run it. Because this is a plain string-prefix match, not a folder lookup, it will return every key starting with those exact six characters, bronze/cli, which happens to include your real bronze/clicks/... objects. If your project ever had a table named something like client_events, its Bronze keys would also match this same broken prefix, purely by coincidence of spelling, and you'd get back a mixed, wrong result with no error or warning at all. Now go check list_bronze_keys_for_date_range and get_file_layout_report in your real object_store.py, and confirm every prefix they build always ends in a trailing /. That trailing slash is not a style choice; it's the fix for exactly this bug.
 
-The full unit suite — 63 tests, up from 59 at the end of the Section
-16-17 increment (4 new: `get_bucket_stats` x2, `list_bronze_keys_for_date_range`
-x2 — the latter belongs to Section 20 below) — was genuinely run in this
-environment and passed. ACTUAL OBSERVED:
+### 8. PRODUCTION VIEW
 
-```
-63 passed in 7.09s
-```
+Two real limits worth knowing before you hit them.
 
-`ruff check ingestion/ benchmarks/` was also run against every file this
-increment touched and passed cleanly — ACTUAL OBSERVED: `All checks
-passed!`
+The 1,000-key cap. list_objects_v2, by default, only returns up to 1,000 keys per call, even if a prefix actually matches more than that. Your current code (list_bronze_keys, get_bucket_stats) makes exactly one list_objects_v2 call and trusts that it got everything. At your project's current scale, a few dozen objects per table at most, this is completely safe. Once a real production table accumulates more than 1,000 objects under one prefix, get_bucket_stats would silently under-report the true total_bytes, because it would only ever see the first 1,000 keys. The real fix is pagination: boto3 provides a paginator object specifically for this, which automatically makes as many follow-up LIST calls as needed and stitches the results together.
 
-One further, genuine check specifically for this section's Failure
-Scenario below: calling `get_bucket_stats` with a mocked S3 client whose
-`list_objects_v2` raises a `NoSuchBucket` `ClientError` was run directly
-in this sandbox (no real MinIO needed for this specific check, since it
-tests this function's own lack of error handling, not S3's real
-behavior) — confirmed the `ClientError` propagates completely uncaught.
-This is what Section 18.7 is about.
+The access-control limit. As covered in the Design section, one shared bucket makes it genuinely harder to restrict "team A can only read Gold data" the way separate buckets would. This becomes a real requirement the moment more than one team, with different trust levels, needs to read from this data lake.
 
-### 18.7 Failure Scenario
+### 9. PRINCIPAL ENGINEER VIEW
 
-**What happens if `storage-stats` runs against a bucket that doesn't
-exist yet — say, before `docker compose`'s `createbuckets` service has
-finished, or after a typo'd `--prefix` pointed at an entirely different,
-nonexistent bucket via a misconfigured `MINIO_BUCKET`?**
+If an interviewer asks "why doesn't object storage support in-place edits," the strong answer isn't "it just doesn't." It's connecting that limitation back to what it buys in return: no locking needed between concurrent writers, no half-written file if a write crashes partway through, and the ability to scale to effectively unlimited objects across many physical machines without needing those machines to coordinate closely with each other. That trade, giving up partial edits in exchange for massive, simple horizontal scale, is the single idea that explains almost every other object storage design choice you'll ever run into.
 
-This is a real, currently-unaddressed gap in the code just written, found
-by reading it rather than assumed: unlike `run_full_load_command`/
-`run_command` (which wrap each table's work in `try/except Exception` and
-log a clean failure) or `validate_contracts_command` (which catches
-`ContractError` specifically), `storage_stats_command` — and, for that
-matter, `check_stale_runs_command` and `reconcile_bronze_command` from
-Section 16/17 — have **no** exception handling around their S3/database
-calls at all. A `list_objects_v2` call against a bucket that genuinely
-doesn't exist raises a `ClientError` with code `NoSuchBucket`, which this
-sandbox genuinely confirmed (Section 18.6) propagates straight out of
-`get_bucket_stats`, uncaught, all the way to a raw Python traceback on
-the operator's terminal instead of a clean logged error and a `1` exit
-code — a materially worse operator experience than every other command
-in this file provides, and inconsistent with this file's own established
-pattern. **This is a genuine, honestly-named gap, not a hypothetical
-one** — see Section 18.8's Production Considerations for what closing it
-would take, deliberately left undone here rather than silently patched
-in without calling it out as new scope.
+A second strong thing to be able to say: "prefixes are not real folders, they're string matching," and be ready to give the concrete failure example from the Experiment section above, a missing trailing slash accidentally matching an unrelated key. That's the kind of specific, first-hand detail that separates "I've read about this" from "I've actually used this."
 
-### 18.8 Production Considerations
-
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Bucket/layer separation | One bucket, prefix-separated layers (18.3) | Same, or bucket-per-layer once per-layer IAM boundaries are a real requirement |
-| Capacity monitoring | Manual (`make storage-stats`) | Scraped on a schedule into a real metrics platform (Prometheus/CloudWatch), graphed over time, alerted on unexpected growth or a stall |
-| Error handling on the reporting/monitoring commands | None — see 18.7's named gap, uncaught `ClientError` on a missing bucket | Every operator-facing command wraps its own calls and returns a clean exit code, the same standard `run_command`/`validate_contracts_command` already meet |
-| Retry policy | This repo's own loop in `_put_parquet_with_retry`; boto3's built-in retries explicitly disabled to avoid two stacked policies (18.2) | Same principle, typically with jitter added to backoff and a circuit breaker once request volume is high enough for thundering-herd retries to matter |
-| Consistency model | Relies on S3/MinIO's modern strong read-after-write consistency (not the older "eventual consistency" S3 had years ago) | Same — but worth explicitly verifying for any non-AWS, non-MinIO S3-compatible store before depending on it, since "S3-compatible" doesn't always mean "S3-consistent" |
+### 10. REMEMBER
+Object storage is a warehouse of labeled, whole boxes. You put a whole box in, or take a whole box out. You never reach inside one.
+A "key" is just a text label. A "bucket" is the whole warehouse. There is no real folder tree underneath, only labels that happen to contain slashes.
+PUT always replaces the entire object. There is no operation for editing part of one.
+MinIO and real AWS S3 speak the exact same HTTP API, which is why the same boto3 code works against both, unchanged.
+One shared bucket with prefixes is simpler to run; separate buckets per layer give cleaner access control. Pick based on how many people/teams actually need different permissions right now, not hypothetically.
 
 ### Principal Data Engineer Perspective
 
@@ -3484,8 +3502,6 @@ decision (18.3) is a real, if modest, piece of technical debt being taken
 on deliberately — it trades away clean per-layer IAM boundaries for
 Phase 1's actual, current operational simplicity, and says so plainly
 rather than presenting "one bucket" as obviously, permanently correct.
-
-### 18.9 Principal Engineer Interview Questions
 
 **Q: "Someone asks you why S3 (or MinIO) can't just support editing ten
 bytes in the middle of a large object the way a local filesystem can.
