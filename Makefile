@@ -158,3 +158,17 @@ write-local-bronze-clicks-incremental:
 # incremental together, per Section 39).
 transform-silver-clicks:
 	PYTHONPATH=ingestion/src:transformations/src python3 transformations/src/analytics_transform/silver/transform_clicks.py
+
+# Phase 2 (fresh module) -- separate from test-transform, which runs the
+# earlier transformations/analytics_transform package's own tests.
+test-phase2-spark:
+	PYTHONPATH=phase2-spark/src python3 -m pytest phase2-spark/tests/unit -v
+
+# Must run *inside* the Docker network so the driver and executors resolve
+# spark-master/minio identically -- see Design, Outcome 1.
+explore-clicks:
+	docker compose exec -e PYTHONPATH=/opt/spark/work-dir/phase2-spark/src spark-master \
+		/opt/spark/bin/spark-submit \
+		--master spark://spark-master:7077 \
+		--conf spark.pyspark.python=python3 \
+		phase2-spark/src/jobs/explore_clicks.py

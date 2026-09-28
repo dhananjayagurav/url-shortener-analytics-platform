@@ -38,8 +38,8 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-where = ["ingestion/src", "transformations/src"]
-include = ["url_shortener_analytics*", "analytics_transform*"]
+where = ["ingestion/src", "transformations/src", "phase2-spark/src"]
+include = ["url_shortener_analytics*", "analytics_transform*", "phase2_spark*"]
 
 [tool.ruff]
 line-length = 100

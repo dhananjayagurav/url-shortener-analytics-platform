@@ -56,7 +56,37 @@ services:
       mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-labadmin} ${MINIO_ROOT_PASSWORD:-labpassword} &&
       mc mb --ignore-existing local/${MINIO_BUCKET:-analytics-lake}
       "
+  
+  # Phase 2: a minimal standalone Spark cluster (one master, one worker).
+  # The official image's entrypoint only special-cases "driver"/"executor"
+  # (Kubernetes-oriented); anything else -- including spark-class here --
+  # is exec'd through unchanged, confirmed against apache/spark-docker's
+  # own entrypoint.sh.template.
+  spark-master:
+    image: spark:3.5.9-python3
+    container_name: analytics-platform-spark-master
+    restart: unless-stopped
+    command: ["/opt/spark/bin/spark-class","org.apache.spark.deploy.master.Master"]
+    volumes:
+      - .:/opt/spark/work-dir
+    ports:
+      - "7077:7077" # Spark master RPC -- workers and spark-submit connect here
+      - "8090:8080" # Spark master web UI (mapped to 8090 to avoid clashing with other local services on 8080)
+  
+  spark-worker:
+    image: spark:3.5.9-python3
+    container_name: analytics-platform-spark-worker
+    restart: unless-stopped
+    depends_on:
+      - spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker","spark://spark-master:7077"]
+    ports:
+      - "8091:8081"
+    environment:
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "2g"
 
 volumes:
   pg_data:
   minio_data:
+
