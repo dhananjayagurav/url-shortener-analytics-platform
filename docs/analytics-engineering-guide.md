@@ -2730,1204 +2730,268 @@ made checkpoint recovery observable.
 
 ## 14. Full Load Ingestion ✅✅
 
-### 14.1 Concept
+### 1. CONCEPT
 
-A full load re-extracts an entire source table on every run and writes the
-whole result as one snapshot — no matter what changed since the last run.
-It's the simplest ingestion pattern that can possibly work: the query is
-`SELECT * FROM table`.
+Full load ingestion means: on every run, read the entire source table and land it as one Bronze snapshot — no "what's new since last time" logic at all. It's the simplest possible ingestion strategy, and it's correct specifically for tables that are small and/or don't have a reliable "what changed" signal (no updated_at, or rows get hard-deleted, so an incremental id/timestamp filter would silently miss deletions).
 
-### Why does this exist?
+It matters because it's the baseline every other ingestion pattern gets compared against. Incremental load (next concept) exists purely to solve full load's two real costs: it re-reads and re-writes data that hasn't changed, and that cost grows linearly with table size forever. You can't evaluate when incremental load is worth its added complexity (watermarks, gap-detection, replay logic) without first understanding exactly what full load costs and where it breaks down.
 
-A full load is correct by construction (no watermark to get wrong, no row
-that can be silently missed) and is the fallback every more sophisticated
-pipeline eventually needs — when an incremental pipeline's state gets
-corrupted, the standard fix is "run a full load and rebuild from there."
-Small, slowly-changing tables (`users` here, at 200 rows) can legitimately
-stay on full load forever; re-extracting 200 rows every run costs nothing.
+### 2. URL SHORTENER EXAMPLE
 
-### Simple Example
+Your urls and users tables are full-loaded (ingestion/configs/pipelines.yaml presumably sets load_type: full for them — worth confirming). Both are small (500 and 200 rows in your seeded sandbox) and, more importantly, urls rows get mutated in place — is_active flips, title can change — with no guaranteed updated_at column your contract commits to. A naive incremental "give me rows with id > last_seen_id" would never see those mutations at all. Re-reading the whole table every run is the honest way to guarantee Bronze reflects current state.
 
-Imagine backing up your entire phone's photo library to a hard drive every
-night, regardless of whether you took zero new photos or five hundred. The
-backup script doesn't try to figure out "what's new" — it just copies
-everything, every time. It's slow and wasteful once your library is huge,
-but it's also the version of "backup my photos" that's almost impossible
-to get wrong: there's no bookkeeping about what was already backed up, so
-there's no bookkeeping to get out of sync with reality.
+clicks, by contrast, is append-only and immutable (its contract says so explicitly), which is exactly the property that makes it safe to load incrementally instead — that's next concept's territory.
 
-### Design Decision
+### 3. DESIGN
 
-Phase 1 uses full load for **all three** tables (`urls`, `users`,
-`clicks`), even though `clicks` is the one table that will eventually need
-to move to incremental load (Section 15, next). This is deliberate
-sequencing, not an oversight: implementing full load first, cleanly, for
-every table, gives every table a working baseline and gives the
-checkpoint/metadata layer (`metadata.py`) real, immediate use — before
-incremental load's extra complexity (watermarks, "what changed since
-last time") gets layered on top of it.
+Flow: cli.py's full-load command → loop over configured tables → run_full_load(engine, s3_client, bucket, pipeline_name, table_name) per table → inside that: metadata.start_run (checkpoint row, status=running) → extract_full (read) → write_bronze (write, deterministic key) → metadata.finish_run_success (checkpoint row, status=success, with the exact bronze_key written), with finish_run_failure + re-raise on any exception.
 
-### Alternatives
+Key decision worth calling out explicitly: the Bronze key is bronze/{table}/ingestion_date={date}/{table}.parquet — date only, no run id, no timestamp-to-the-second (object_store.build_bronze_key). That single design choice is what makes full load idempotent: run it three times today, you PUT to the same S3 key three times, and the object store just overwrites in place. No dedup logic needed anywhere downstream for "did this run happen twice today." Contrast with incremental load's key (watermark_start=/watermark_end=), which must vary per batch — you'll see why that's a harder idempotency problem next.
 
-1. **Skip full load, implement incremental load directly.** Possible, but
-   it means the *first* piece of ingestion code you write also has to get
-   watermark logic right, with no simpler baseline to fall back to if
-   something's wrong. Harder to debug, and skips the natural "build the
-   simple thing, prove it, then add complexity" progression this whole
-   project follows.
-2. **Full load for everything, forever (rejected for `clicks`).** Simple,
-   but doesn't scale — Section 15 explains exactly where this breaks down
-   for a table that grows without bound.
-3. **Full load now, incremental later, table by table (chosen).** Lets
-   each table's load strategy match its actual growth pattern, and lets
-   this guide teach both patterns clearly, one at a time, instead of
-   conflating them.
+Alternative rejected: a key with a run id or full timestamp (e.g. .../run_id=<uuid>/urls.parquet). That would make every run's output independently addressable/auditable, but it means Bronze accumulates a new full copy of urls every single day forever, and Silver's read layer (read_bronze_clicks, which you've already seen) would have to pick "the latest one" instead of just reading what's there — extra logic, for no benefit at this table's size and mutation pattern.
 
-### Trade-offs
+### 4. IMPLEMENTATION
 
-| | Full load | Incremental load (Section 15) |
-|---|---|---|
-| Correctness | Simple — no watermark to get wrong | More moving parts — a wrong watermark can silently skip or duplicate rows |
-| Cost as table grows | Grows with total table size, forever | Roughly constant — grows with new rows since last run, not total size |
-| Right for | Small, slowly-changing tables (`users`, `urls` here) | Large, append-heavy tables (`clicks`, eventually) |
-
-### 14.2 Architecture
-
-```mermaid
-sequenceDiagram
-    participant CLI as cli.py
-    participant MD as metadata.py
-    participant EX as extract_full.py
-    participant PG as Postgres
-    participant OS as object_store.py
-    participant S3 as MinIO
-
-    CLI->>MD: start_run(pipeline, table, "full")
-    MD-->>CLI: run_id (status=running)
-    CLI->>EX: run_full_load(...)
-    EX->>PG: extract_full() -- pd.read_sql_table
-    PG-->>EX: DataFrame
-    EX->>OS: write_bronze(df, table, run_date)
-    OS->>S3: put_object (deterministic key)
-    S3-->>OS: 200 OK
-    OS-->>EX: bronze key
-    EX->>MD: finish_run_success(run_id, rows, ...)
-```
-
-On any failure between `start_run` and `finish_run_success`,
-`extract_full.run_full_load` catches the exception, calls
-`finish_run_failure` (so the run is never left `running` forever), and
-re-raises — see [Section 14.7](#147-failure-scenario).
-
-### 14.3 URL Shortener example
-
-This pipeline runs the same full-load logic against all three configured
-tables (`ingestion/configs/pipelines.yaml`): `urls` (real schema), `users`
-and `clicks` (hypothetical, per Section 1.5). Each table gets its own
-`ingestion_metadata` row per run and its own Bronze object.
-
-### 14.4 Implementation
-
-This component spans five files. Two are taught here in full depth
-(they're the ones with real design decisions in them); the other three get
-a shorter treatment here and their own deep-dive later, where their
-purpose becomes fully visible (`metadata.py` in Section 16 — Checkpointing;
-`cli.py`'s command surface grows in Section 15).
-
-**Implementation Guide vs. Reference Implementation, for this component:**
-if you want the hands-on version, read the *Implementation Guide*
-paragraph under each file below, close this guide, and write the function
-yourself against the same signature — then compare against the *Reference
-Implementation* code block. If you want to move faster and study the
-finished code instead, copy the reference code directly into the named
-path; it's exactly what's already committed in this repository.
-
----
-
-**CREATE:** `ingestion/src/url_shortener_analytics/extract_full.py`
-
-**PURPOSE:** Read an entire source table into memory and hand it off to be
-written to Bronze, while recording a checkpoint before and after.
-
-**DEPENDENCIES:** `pandas`, a SQLAlchemy `Engine` (from `db.py`), this
-package's `metadata` module (for checkpointing) and `object_store` module
-(for the actual write).
-
-**IMPLEMENTATION GUIDE (write it yourself):** you need two functions.
-The first, `extract_full(table_name, engine)`, should do exactly one
-thing: run `SELECT * FROM <table_name>` and return the result as a
-DataFrame — pandas' `pd.read_sql_table` does this in one call. Wrap it in
-a `try/except` that catches whatever the database driver raises and
-re-raises your own `ExtractionError` (see `exceptions.py`) with a message
-naming the table — this is what makes failures debuggable without needing
-to know pandas' or psycopg's specific exception types. The second
-function, `run_full_load(engine, s3_client, bucket, pipeline_name,
-table_name)`, is the orchestration: call `metadata.start_run(...)` first
-to get a `run_id`, then call your `extract_full`, then call
-`object_store.write_bronze(...)` to actually write it, then call
-`metadata.finish_run_success(...)`. Wrap the extract-and-write portion in
-a `try/except Exception` that calls `metadata.finish_run_failure(...)`
-and **re-raises** — the caller (eventually the CLI) needs to know this
-table failed, and the checkpoint must never be left silently `running`.
-
-**REFERENCE IMPLEMENTATION:**
+This is already fully built and running in your repo — nothing to add. Reference code, so you can trace it against what you already have:
 
 ```python
-# ingestion/src/url_shortener_analytics/extract_full.py  (excerpt — full file
-# is already committed at this path)
+# ingestion/src/url_shortener_analytics/extract_full.py
 
 def extract_full(table_name: str, engine: Engine) -> pd.DataFrame:
-    """POC SIMPLIFICATION: reads the whole table in one query. Production
-    equivalent: chunked/paged extraction with bounded memory."""
-    try:
-        df = pd.read_sql_table(table_name, engine)
-    except Exception as err:
-        raise ExtractionError(f"failed to extract table '{table_name}'") from err
+    df = pd.read_sql_table(table_name, engine)   # POC: whole table, one query
     return df
 
 
-def run_full_load(engine, s3_client, bucket, pipeline_name, table_name) -> dict:
+def run_full_load(engine, s3_client, bucket, pipeline_name, table_name) -> dict[str, object]:
     run_id = metadata.start_run(engine, pipeline_name, table_name, load_type="full")
     try:
         df = extract_full(table_name, engine)
-        key = write_bronze(df, table_name, datetime.now(UTC), s3_client, bucket)
-        metadata.finish_run_success(engine, run_id, rows_read=len(df), rows_written=len(df))
+        run_date = datetime.now(UTC)
+        key = write_bronze(df, table_name, run_date, s3_client, bucket)
+        metadata.finish_run_success(engine, run_id, rows_read=len(df), rows_written=len(df), bronze_key=key)
     except Exception as err:
         metadata.finish_run_failure(engine, run_id, str(err))
         raise
     return {"run_id": run_id, "table": table_name, "rows": len(df), "key": key}
-```
 
-Full file, with imports, logging and docstrings:
-[`ingestion/src/url_shortener_analytics/extract_full.py`](../ingestion/src/url_shortener_analytics/extract_full.py).
-
-**RUN:** `make ingest-full` (runs it for every table in `pipelines.yaml`)
-
-**VERIFY:** `docker compose exec postgres psql -U analytics -d analytics -c "SELECT source_table, status, rows_written FROM ingestion_metadata ORDER BY started_at DESC LIMIT 5;"`
-
-**EXPECTED:** three rows, one per table, each `status = success` with
-`rows_written` matching what `make seed` inserted (500 / 200 / 5000 by
-default). *(DESIGN EXPECTATION — run it yourself for the ACTUAL OBSERVED
-numbers on your machine.)*
-
-**TEST:** `ingestion/tests/unit/test_extract_full.py` —
-`make test` runs it (part of the 15 unit tests, all currently passing).
-
-**PRODUCTION CONSIDERATIONS:** see the table in Section 14.8 below.
-
-**INTERVIEW QUESTIONS:** see Section 14.9 below (both questions there are
-specifically about this file).
-
----
-
-**CREATE:** `ingestion/src/url_shortener_analytics/object_store.py`
-
-**PURPOSE:** Serialize a DataFrame to Parquet and write it to a
-deterministic, idempotent key in MinIO/S3. This file is where the
-idempotency guarantee this whole section leans on actually lives.
-
-**DEPENDENCIES:** `boto3` (the AWS/S3 SDK — MinIO speaks the same API),
-`pyarrow` (Parquet read/write).
-
-**IMPLEMENTATION GUIDE (write it yourself):** start with the function that
-matters most conceptually: `build_bronze_key(table_name, run_date) ->
-str`. It should return a string of the shape
-`bronze/{table}/ingestion_date={date}/{table}.parquet` — using only the
-*calendar date* portion of `run_date`, not the time. Stop and think about
-*why* before moving on: if you included the exact timestamp instead of
-just the date, what would break? (Answer, once you've thought about it:
-every rerun on the same day would produce a *different* key, so reruns
-would pile up as duplicate objects instead of overwriting — which is
-exactly the idempotency property Section 14's Hands-on Exercise proves.)
-Then write `write_bronze(df, table_name, run_date, s3_client, bucket)`:
-serialize `df` to Parquet bytes in memory (`pyarrow.Table.from_pandas`
-then `pyarrow.parquet.write_table` into an `io.BytesIO()` buffer), call
-`s3_client.put_object(Bucket=..., Key=build_bronze_key(...), Body=...)`,
-and return the key. Wrap the `put_object` call in a small retry loop
-(2-3 attempts, short backoff) — S3-compatible APIs do occasionally return
-transient errors, and because the key is deterministic, retrying a write
-is always safe.
-
-**REFERENCE IMPLEMENTATION:**
-
-```python
-# ingestion/src/url_shortener_analytics/object_store.py (excerpt)
+# ingestion/src/url_shortener_analytics/object_store.py
 
 def build_bronze_key(table_name: str, run_date: datetime) -> str:
     return f"bronze/{table_name}/ingestion_date={run_date:%Y-%m-%d}/{table_name}.parquet"
-
-
-def write_bronze(df, table_name, run_date, s3_client, bucket, *, max_attempts=3, backoff_seconds=1.0) -> str:
-    key = build_bronze_key(table_name, run_date)
-    body = _dataframe_to_parquet_bytes(df)
-    for attempt in range(1, max_attempts + 1):
-        try:
-            s3_client.put_object(Bucket=bucket, Key=key, Body=body)
-            return key
-        except (ClientError, BotoCoreError) as err:
-            if attempt == max_attempts:
-                raise ObjectStoreWriteError(f"failed after {max_attempts} attempts") from err
-            time.sleep(backoff_seconds * attempt)
 ```
 
-Full file: [`ingestion/src/url_shortener_analytics/object_store.py`](../ingestion/src/url_shortener_analytics/object_store.py).
+### 5. CODE WALKTHROUGH
 
-**RUN:** exercised indirectly via `make ingest-full` — there's no
-standalone CLI for this file alone (by design; it's a library module, not
-an entrypoint).
+extract_full is deliberately pure — no S3, no metadata table, just SQL in, DataFrame out. That's why run_silver_clicks_job's split into clean_clicks/deduplicate_clicks (pure) vs the job wrapper (I/O) — which you already built in Section 40 — feels familiar: this is the same pattern, established first here, one layer down the pipeline.
 
-**VERIFY:** open `http://localhost:9001` (MinIO console), browse to
-`analytics-lake/bronze/urls/`, confirm one `.parquet` object exists per
-`ingestion_date=` prefix.
+run_full_load's try/except is the checkpoint contract in miniature: a run is always recorded as either success or failed — never left running — because get_last_watermark and (once you get to Section 16-equivalent) find_stale_running_runs both depend on running meaning "still actually in flight, or crashed." If an exception here weren't caught and re-recorded, a crashed run would sit as running forever and nothing downstream could tell "still going" from "died."
 
-**EXPECTED:** one object per table per calendar day, regardless of how
-many times you've run `make ingest-full` today.
+The bronze_key gets stored on the success row (finish_run_success(..., bronze_key=key)) rather than recomputed later from table_name + started_at — you can see in metadata.py's docstring this was a deliberate choice (Section 17.3 in the guide), because recomputing it later means duplicating build_bronze_key's exact date-formatting logic in a second place, and any drift between the two becomes a silent bug.
 
-**TEST:** `ingestion/tests/unit/test_object_store.py` — 5 tests, covering
-key determinism, the actual `put_object` call shape, and both the retry
-and give-up-and-raise paths (using a mocked S3 client with a scripted
-`side_effect`, not a real network call).
+### 6. RUN
 
-**PRODUCTION CONSIDERATIONS:** see Section 14.8.
-
-**INTERVIEW QUESTIONS:** the first question in Section 14.9 is about this
-exact file.
-
----
-
-**Supporting files** (shorter treatment — full teaching lands with their
-own sections):
-
-| File | Purpose | Deep-dive lands in |
-|---|---|---|
-| [`metadata.py`](../ingestion/src/url_shortener_analytics/metadata.py) | Watermark / checkpoint / run history reads and writes | Section 16 (Checkpointing) |
-| [`config.py`](../ingestion/src/url_shortener_analytics/config.py) | Environment-variable-driven settings (`pydantic-settings`) | Referenced throughout; no dedicated section — it's a standard pattern, not a novel concept |
-| [`db.py`](../ingestion/src/url_shortener_analytics/db.py) | Builds and caches the SQLAlchemy `Engine` | Same as above |
-| [`cli.py`](../ingestion/src/url_shortener_analytics/cli.py) | `python -m url_shortener_analytics.cli full-load` entrypoint; wires config → engine → S3 client → `run_full_load` per table | Grows a second subcommand in Section 15 |
-| [`pipelines.yaml`](../ingestion/configs/pipelines.yaml) | Which tables, which load type — config, not code | [Architectural Principle #8](#28-architectural-principles), Metadata-driven processing |
-
-### Hands-on Challenge (implement-yourself)
-
-Before reading LAB 1 below, try this: **without looking at
-`object_store.py`, write your own version of `build_bronze_key` that
-partitions by *hour* instead of by day** (`ingestion_hour=2026-09-19-14`
-instead of `ingestion_date=2026-09-19`). Then answer, in your own words:
-what would change about LAB 4/5's idempotency proof below if you made this
-change and ran `make ingest-full` twice within the same hour versus twice
-across an hour boundary? (You don't need to actually wire your version
-into the pipeline — this is a design-reasoning exercise. The real answer:
-idempotency would still hold *within* an hour, but a full load that
-happens to straddle an hour boundary would now produce two Bronze objects
-for what's conceptually "one day" of data — a preview of exactly the
-partition-granularity trade-off Section 20, Partitioning, covers in full.)
-
-### 14.5 Hands-on Exercise
-
-**LAB 1 — Run a full load.**
-
-Prerequisites: `make up` has been run and `docker compose ps` shows
-`postgres` and `minio` healthy; `make seed` has been run at least once.
-
-```bash
 make ingest-full
-```
 
-Expected output (key=value structured log lines — see
-`ingestion/src/url_shortener_analytics/logging_setup.py`):
+which resolves to python -m url_shortener_analytics.cli full-load. Expected structured log lines, per table, from what you've already genuinely run in this sandbox (real numbers, your seeded baseline):
 
-```
-ts=... level=INFO logger=url_shortener_analytics.cli msg="starting full load" pipeline='url_shortener_bronze_ingestion' tables=['urls', 'users', 'clicks']
-ts=... level=INFO logger=url_shortener_analytics.extract_full msg="extracting table (full load)" table='urls'
-ts=... level=INFO logger=url_shortener_analytics.extract_full msg="extraction complete" table='urls' rows=500 columns=8
-ts=... level=INFO logger=url_shortener_analytics.object_store msg="wrote bronze object" key='bronze/urls/ingestion_date=2026-09-19/urls.parquet' bytes=... rows=500 attempt=1
-...
-ts=... level=INFO logger=url_shortener_analytics.cli msg="full load finished successfully"
-```
+{"event": "ingestion run started", "run_id": "<uuid>", "source_table": "urls", "load_type": "full"}
+{"event": "extracting table (full load)", "table": "urls"}
+{"event": "extraction complete", "table": "urls", "rows": 500, "columns": <N>}
+{"event": "wrote bronze object", "key": "bronze/urls/ingestion_date=2026-09-24/urls.parquet", "bytes": <N>, "rows": 500, "attempt": 1}
+{"event": "ingestion run succeeded", "run_id": "<uuid>", "rows_written": 500, "bronze_key": "bronze/urls/ingestion_date=2026-09-24/urls.parquet"}
+{"event": "table done", "run_id": "<uuid>", "table": "urls", "rows": 500, "key": "bronze/urls/..."}
 
-*(Exact row counts and byte sizes are a DESIGN EXPECTATION based on
-`scripts/seed_sample_data.py`'s fixed seed — run the command yourself to
-see the ACTUAL OBSERVED values on your machine; nothing above was
-fabricated as a claimed real run.)*
+...same shape for users (rows: 200). This part is DESIGN EXPECTATION for today's exact date/uuid — the row counts and key format are ACTUAL OBSERVED from your prior real runs (Section 14/LAB 1 in your guide).
 
-Inspect what landed in MinIO: open `http://localhost:9001`, browse to the
-`analytics-lake` bucket, and confirm `bronze/urls/`, `bronze/users/`,
-`bronze/clicks/` each contain one `.parquet` object.
+### 7. EXPERIMENT
 
-**LAB 4/5 (compressed into one exercise here — full depth lands in the
-dedicated Idempotency section) — prove reruns are safe.**
+Run make ingest-full twice in a row, then check the object store:
 
-```bash
-make ingest-full
-make ingest-full   # run it again immediately
-```
+python -m url_shortener_analytics.cli storage-stats --prefix bronze/urls/
 
-What to observe: both runs report success; the object at
-`bronze/urls/ingestion_date=<today>/urls.parquet` is overwritten, not
-duplicated (confirmed by `ingestion/tests/integration/test_full_load_integration.py::test_rerunning_full_load_overwrites_not_duplicates`,
-which asserts `KeyCount == 1` after two runs). Why this matters: retries
-after a crash are the normal recovery path for any batch pipeline — if
-reruns produced duplicates, every crash-and-retry would corrupt downstream
-counts.
+Expected: object_count for urls stays at 1 after both runs, not 2 — that's the idempotency claim from Section 3 made concrete. Now try a failure scenario: kill the process (Ctrl+C) mid-way through the second run, after start_run has inserted its running row but before finish_run_success runs. Then:
 
-### 14.6 How to test
+python -m url_shortener_analytics.cli ingestion-history --table urls --limit 5
 
-```bash
-make test                # unit tests: SQLite + mocked S3, no Docker needed. Currently: 15 passed.
-make up
-make test-integration     # real Postgres + MinIO
-```
+You'll see one success row (from run 1) and one running row stuck forever (from the killed run 2) — this is exactly the "stale running run" problem find_stale_running_runs exists to detect, which you'll hit properly when we get to Checkpoints. Worth seeing now so the motivation for that concept isn't abstract.
 
-The 15 unit tests above were run in this environment while writing this
-guide (Python 3.11, `pytest -q`) and genuinely passed — this is an ACTUAL
-OBSERVED result, not a projection:
+### 8. PRODUCTION VIEW
 
-```
-15 passed in 3.72s
-```
+At your current scale (500/200 rows) pd.read_sql_table's "whole table in memory, one query" is free. At real scale it's the single biggest thing that breaks: a 200M-row table full-loaded this way either OOMs the extraction process or holds a long table-scan transaction open against a live OLTP database for however long the read takes — actively harmful to the production database it's reading from, not just slow. Real fix is chunked/paginated extraction (LIMIT/OFFSET or a keyset cursor), writing each chunk as its own Parquet part-file rather than one giant DataFrame.
 
-### 14.7 Failure Scenario
+Cost-wise, full load's defining trait is that its S3 PUT cost and compute cost are both O(table size) on every single run, forever — regardless of how much actually changed. That's the concrete number you'd put in front of a full-load-vs-incremental decision: "this table is N rows, growing at R rows/day, full-loading it costs $X/month in read+write, here's what incremental would cost instead."
 
-**What happens if the process is killed between a successful `write_bronze`
-call and the `finish_run_success` checkpoint update?**
+### 9. PRINCIPAL ENGINEER VIEW
 
-The Bronze object for that run now exists in MinIO, but `ingestion_metadata`
-still shows `status = 'running'` for that run — not `success`, and not
-`failed` either, because nothing ever got the chance to update it.
-`get_last_watermark` only reads `status = 'success'` rows (see
-`metadata.py`), so a stuck `running` row is simply ignored by future
-watermark reads — it doesn't corrupt anything for full load specifically
-(there's no watermark to protect here), but it does mean the run's own
-history is permanently ambiguous: did it actually finish? The honest
-answer, visible from the data alone, is "we don't know — the process died
-before it could tell us." **Production implication:** an orchestrator (not
-yet part of Phase 1) should alert on any `ingestion_metadata` row that's
-been `running` for longer than the pipeline's expected max runtime, and
-treat it as a crash requiring investigation, not as still-in-progress.
+An interviewer asking "when would you full-load vs incrementally load a table" is really testing whether you reach for incremental load reflexively (many candidates do, because it "sounds more sophisticated") or whether you can name the actual precondition: a reliable append-only or monotonically-increasing change signal. No such signal → full load is correct, not a fallback. This table's urls (mutable, no updated_at) is a textbook case of that decision being correct as-is.
 
-### 14.8 Production Considerations
+The key-determinism point (date-only key, no run id) is worth having ready as an idempotency example that isn't "add a dedup step" — it's "make the write itself naturally overwrite instead of accumulate." Idempotency-by-construction (the write target is deterministic) versus idempotency-by-cleanup (write and then dedup) is a real, recurring design fork, and this table is a case of choosing the first.
 
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Extraction | Whole table, one query, one DataFrame (`pd.read_sql_table`) | Chunked/paged extraction with bounded memory — see the docstring in `extract_full.py` |
-| Credentials | Static MinIO access/secret keys from `.env` | Short-lived credentials from an IAM role / workload identity |
-| Retry | 3 attempts, linear backoff, in-process (`object_store.write_bronze`) | Same idea, plus orchestrator-level retry/alerting across whole run failures |
-| Crash recovery | Manual rerun (safe, because writes are idempotent) | Orchestrator-driven automatic retry with backoff and paging on repeated failure |
-| OLTP instance | This repo's own standalone Postgres mirror (ADR-009) | Reads from the real application's read replica, never the primary |
+### 10. REMEMBER
 
-### Principal Data Engineer Perspective
-
-The interesting judgment call in this component isn't the happy path —
-it's what a principal engineer would flag in review about the *unhappy*
-path. Two things stand out here. First: `run_full_load` catches
-*every* exception during extract-and-write, records it, and re-raises —
-which means one table's `ExtractionError` doesn't corrupt another table's
-run (see `cli.py`'s loop, which continues to the next table after logging
-a failure), but it also means a systemic problem (e.g. the OLTP database
-itself being down) gets logged three separate times, once per table,
-instead of failing fast after the first failure. That's a real, debatable
-trade-off — "fail isolated" versus "fail fast" — worth being able to
-articulate rather than presenting as an obviously-correct default. Second:
-the retry logic in `write_bronze` retries *blindly*, without checking
-*why* the write failed — appropriate here because every retry is
-idempotent, but it's exactly the kind of blind retry that becomes
-dangerous the moment an operation *isn't* idempotent, which is precisely
-why Section 17 (Idempotency) treats this property as a prerequisite for
-safe retries, not an independent nice-to-have.
-
-### 14.9 Principal Engineer Interview Questions
-
-**Q: "Walk through exactly what makes `write_bronze` safe to call twice for
-the same table on the same day."**
-
-*What's tested:* whether the candidate can explain idempotency as a
-concrete mechanism, not just define the word.
-
-*What a weak answer looks like:* "It's idempotent because we designed it
-to be" — true but circular; doesn't explain the mechanism.
-
-*What a strong answer covers:* the S3 key returned by `build_bronze_key`
-depends only on `table_name` and the calendar date, not on a run id or
-exact timestamp — so two calls for the same table on the same day compute
-the identical key. `s3_client.put_object` on both S3 and MinIO fully
-replaces whatever object previously existed at that key; it's not an
-append and not a partial write. So the second call's `PUT` simply
-overwrites the first call's bytes with (in this case, identical) new
-bytes — the *object storage system's own atomic-overwrite behavior* is
-what `write_bronze` leans on, not any locking or deduplication logic built
-into this codebase.
-
-*Concepts:* idempotent-by-overwrite vs. idempotent-by-dedup, atomic PUT
-semantics in object storage.
-
-*Expected follow-up:* "What would break this guarantee?" — Including a
-random UUID or a sub-day timestamp in the key; then every rerun would
-produce a new object instead of overwriting.
-
-*Common mistake:* describing this as "we check if the file exists first
-and skip if it does" — that's not what happens, and that approach would
-be wrong anyway (it would prevent legitimately re-extracting a table
-whose data changed since the last run today).
-
-**Q: "This pipeline currently reads `pd.read_sql_table` — the whole table,
-every run. At what point does that become a real production problem, and
-what's the first thing that actually breaks?"**
-
-*What's tested:* whether the candidate can name a concrete failure mode
-instead of a vague "it won't scale."
-
-*What a weak answer looks like:* "At some point there'll be too many rows
-and it'll be slow" — not wrong, but doesn't identify a mechanism, and
-would prompt an interviewer to keep digging.
-
-*What a strong answer covers:* the practical limit isn't a specific row
-count in the abstract — it's whatever this process's available memory can
-hold as both the raw query result set and the in-memory pandas DataFrame
-simultaneously (pandas typically uses several times the raw on-disk size
-once you account for Python object overhead on non-numeric columns).
-Before that, though, the `SELECT *` itself holds a long-running read
-against the OLTP database — on a real production `clicks` table, that
-scan competing with live write traffic is often the first practical
-problem, ahead of the client process actually running out of memory. The
-fix precedes the memory limit: chunked, bounded extraction (see the
-POC-simplification note in `extract_full.py`'s docstring).
-
-*Concepts:* memory-bounded processing, long-running scans vs. OLTP write
-concurrency.
-
-*Expected follow-up:* "Why not just add `.limit()` in a loop?" — That's
-exactly chunked extraction; the follow-up worth raising unprompted is how
-to keep each chunk's boundary stable while the table is being concurrently
-written to, which is precisely the watermark problem Section 15 exists to
-solve properly for the incremental case.
-
-*Common mistake:* answering purely in terms of "at N million rows it gets
-slow" without naming *what* becomes slow or fails first.
-
----
+Full load = read everything, every run. Correct precondition: table is small, or mutable with no reliable change signal, or can be hard-deleted.
+Idempotency here comes from the key, not from logic: same table + same date = same S3 key = safe overwrite. No dedup step required.
+running → success/failed is a hard invariant. A run that dies must never stay running — that's what makes watermark/checkpoint reads trustworthy later.
+Full load's cost is O(table size) every run, forever — that's the exact cost incremental load exists to eliminate, not a stylistic alternative to it.
 
 ## 15. Incremental Load & Watermarks ✅✅
 
-### 15.1 Concept
+### 1. CONCEPT
 
-An **incremental load** extracts only the rows that are *new* since the
-last successful run, instead of re-reading the entire table every time. It
-needs a **watermark**: a saved value (here, the highest `id` already
-ingested) that tells the next run where to resume — `WHERE id > watermark`
-instead of `SELECT *`.
+Incremental load reads only the rows that are new since the last successful run, instead of re-reading the whole table. It needs one saved piece of state — a watermark — that tells the next run where to resume from.
 
-### Why does this exist?
+It exists because full load's cost is O(table size) on every single run, forever. That's fine for a 500-row urls table; it's ruinous for clicks, a table designed to grow without bound. A watermark turns "read everything" into "read what's new," so the cost of a run is proportional to how much changed, not how big the table has gotten.
 
-Full load (Section 14) re-reads everything, every run — fine for `urls`
-and `users` (hundreds of rows), ruinous for `clicks`, which is designed to
-grow without bound as an append-heavy event table. At even a modest
-million rows, re-scanning the whole table on every run wastes I/O on the
-OLTP database, wastes time, and wastes Bronze storage on the same
-already-ingested rows written out again. Incremental load makes the cost
-of each run proportional to *new* data, not *total* data — the same
-argument that motivates almost every real streaming or CDC system, just
-applied here at the simplest level that can work: a single saved integer.
+### 2. URL SHORTENER EXAMPLE
 
-### Simple Example (generic, pre-URL-Shortener)
+clicks is the one table this applies to in your schema — urls/users stay on full load because they're small and (as you already know from Section 14) urls is mutable, which incremental load can't handle anyway. clicks is the opposite: append-only, immutable, and has a BIGSERIAL id — exactly the shape incremental load wants. First run: watermark starts at 0, reads everything that exists. Every run after that: WHERE id > <last watermark>, gets back only what's new since then, and remembers the new highest id.
 
-Imagine syncing your email client's inbox. The very first sync has to
-download every message — there's nothing to compare against yet. But every
-sync after that only needs to ask the mail server "anything with a UID
-higher than the last one I saw?" The client remembers one number (the
-highest UID it has already downloaded) and uses it as the starting point
-for the next request. It never re-downloads message #1 through #9,000
-just to check for message #9,001 — that's the whole idea of a watermark:
-one small piece of saved state turns "read everything" into "read what's
-new."
+### 3. DESIGN
 
-### URL Shortener Example
+Flow: cli.py's run command (not full-load) → per table, checks pipelines.yaml's load_type → for clicks, calls run_incremental_load(engine, s3_client, bucket, pipeline_name, table_name) → inside: start_run → get_last_watermark (reads only status='success' rows) → extract_incremental → if empty, finish successfully without writing anything → otherwise write_bronze_incremental then finish_run_success with the new watermark.
 
-`clicks` is exactly this inbox. Every redirect that happens (hypothetically
-— see ADR-008) inserts one new row with an auto-incrementing `id`. The
-first incremental run for `clicks` reads every row that exists so far
-(watermark starts at 0) and remembers the highest `id` it saw. The next
-run — minutes, hours, or a day later — asks Postgres for only
-`id > <that remembered value>`, gets back just the clicks that happened in
-between, writes those to a new Bronze object, and remembers the new
-highest `id`. `urls` and `users` stay on full load (Section 14) because
-they're small and don't grow the same way; `clicks` is the one table in
-this project's schema that this section's watermark logic actually
-applies to.
+Two decisions worth being deliberate about:
 
-### 15.2 Architecture
+**Decision 1** — the watermark is id, not a timestamp. WHERE id > :watermark, not WHERE occurred_at > :watermark. A BIGSERIAL is assigned by Postgres itself, strictly in insertion order — no two rows can share a value, and it can't go backwards. A timestamp column, by contrast, is set by whatever produced the row, and under enough concurrent writes two rows genuinely can land on the same timestamp at typical precision, or even appear "out of order" if a writer's clock is skewed. An id-based watermark is immune to both problems by construction. The real cost: it only works because clicks is insert-only. It could never see an UPDATE or a DELETE — a row that changes after insertion just silently stays at whatever it was when first read. That's a genuine, accepted limitation, not an oversight.
 
-```mermaid
-sequenceDiagram
-    participant CLI as cli.py (run)
-    participant MD as metadata.py
-    participant EX as extract_incremental.py
-    participant PG as Postgres (clicks)
-    participant OS as object_store.py
-    participant S3 as MinIO
+**Decision 2** — the incremental Bronze key includes the watermark range, not just the date. Full load's date-only key is safe to reuse only if the pipeline runs at most once a day. Incremental load doesn't — it can run many times a day, and each run covers a different id range that must not collide with the previous run's batch. So the key is bronze/{table}/incremental/watermark_start={n}/watermark_end={m}/{table}.parquet — different range, different key, nothing gets silently overwritten by a different batch.
 
-    CLI->>MD: start_run(pipeline, "clicks", "incremental")
-    MD-->>CLI: run_id (status=running)
-    CLI->>EX: run_incremental_load(...)
-    EX->>MD: get_last_watermark(pipeline, "clicks")
-    MD-->>EX: watermark (0 on first run; status='success' rows only)
-    EX->>PG: SELECT * FROM clicks WHERE id > :watermark ORDER BY id
-    PG-->>EX: DataFrame (possibly empty)
-    alt DataFrame is empty
-        EX->>MD: finish_run_success(rows=0, watermark_end=watermark unchanged)
-    else DataFrame has rows
-        EX->>OS: write_bronze_incremental(df, "clicks", watermark, new_watermark)
-        OS->>S3: put_object (key includes watermark_start/watermark_end)
-        S3-->>OS: 200 OK
-        OS-->>EX: bronze key
-        EX->>MD: finish_run_success(rows, watermark_end=new_watermark)
-    end
-```
+Alternative rejected: full CDC via Postgres logical replication — would capture every insert/update/delete with no polling gap at all, but is a much bigger infrastructure lift (replication slot, consumer process), and there's no operational need for it yet at this project's stage. That's deferred, not dismissed.
 
-Same failure shape as full load: any exception between `start_run` and
-`finish_run_success` is caught by `run_incremental_load`, recorded via
-`finish_run_failure`, and re-raised — see [15.7](#157-failure-scenario)
-for exactly what "recorded" does and doesn't protect against here.
+### 4. IMPLEMENTATION
 
-### 15.3 Design Decision
-
-Two separate decisions had to be made for this component, and both are
-worth stating explicitly rather than leaving implicit in the code.
-
-**Decision 1 — how the watermark itself is compared: ID-based, not
-timestamp-based.** The watermark is `clicks.id` (a `BIGSERIAL`), compared
-with `WHERE id > :watermark`, not `occurred_at` compared with
-`WHERE occurred_at > :watermark`. `BIGSERIAL` values are assigned by
-Postgres itself, in strict insertion order, with no possibility of two
-rows sharing a value and no dependency on any client's clock. A
-`TIMESTAMPTZ` column, by contrast, is set by whatever produced the row
-(here, `DEFAULT now()` — but in a real system, potentially a
-client-supplied timestamp), and two rows genuinely can share the same
-timestamp at typical database timestamp precision under enough concurrent
-write load, or even go *backwards* relative to insertion order if a
-writer's clock is skewed. See [15.9](#159-principal-engineer-interview-questions)
-for the full comparison and a worked failure example.
-
-**Decision 2 — how the Bronze key is built for an incremental batch:
-`(table_name, watermark_start, watermark_end)`, not `(table_name, date)`.**
-Full load's key is safe to reuse verbatim for incremental load *only* if
-an incremental pipeline runs at most once per calendar day — it doesn't;
-it's designed to run many times a day, and each run's batch covers a
-*different* `id` range that must not collide with (overwrite) a previous
-run's batch the way same-day full-load reruns intentionally do. See
-`build_bronze_incremental_key`'s docstring in `object_store.py` for the
-exact format, and [15.7](#157-failure-scenario) for the one case where
-this key scheme's idempotency guarantee does *not* fully hold.
-
-### Alternatives
-
-1. **Timestamp-based watermark (rejected).** Simpler to read as a human
-   ("give me everything after 2pm"), and works acceptably when there's no
-   concurrent write pressure and every writer's clock is trustworthy.
-   Rejected here because neither of those conditions is something this
-   pipeline can guarantee about `clicks`' write path, and the failure mode
-   when they don't hold — silently skipped rows — is worse than the
-   failure mode of the chosen approach.
-2. **Full CDC via Postgres logical replication (rejected for Phase 1).**
-   Would eliminate polling entirely and capture every write, including
-   deletes and updates, which id-based polling cannot see at all (this
-   pipeline's watermark approach is insert-only by construction — see
-   [15.8](#158-production-considerations)). Rejected for Phase 1 per
-   ADR-004: no operational need yet, and it introduces an entirely
-   different infrastructure component (a replication slot, a consumer
-   process) before batch has been given a real chance to be sufficient.
-3. **ID-based watermark (chosen).** Immune to clock skew and duplicate
-   timestamps by construction, at the cost of only working when rows are
-   append-only, sequentially inserted, and never deleted or updated after
-   insertion — an assumption that happens to hold exactly for how
-   `clicks` is modeled in this project.
-
-### Trade-offs
-
-| | ID-based watermark (chosen) | Timestamp-based watermark (rejected) |
-|---|---|---|
-| Clock skew | Immune — Postgres assigns the sequence, not a client | Vulnerable — a writer with a skewed clock can insert a row with an `occurred_at` earlier than rows already ingested, and it will never be picked up |
-| Concurrent duplicate values | Impossible — `BIGSERIAL` values are unique by construction | Possible at typical timestamp precision under concurrent writes — an ambiguous cutoff row could be double-read or skipped |
-| Captures updates/deletes | No — only ever sees rows by insertion order, never re-reads a row that was later changed | Also no, in general, unless there's a separate `updated_at` also being watermarked |
-| Human-readability of "resume point" | Low — a bare integer, not obviously a point in time | High — "resume after 2026-09-19 14:00" reads naturally |
-| Requires on the source table | An indexed, monotonically-increasing integer/bigint key | An indexed, reliably-set timestamp column |
-
-### 15.4 Implementation
-
-This component touches four files. One is new and taught here in full
-depth; the other three were already introduced in Section 14 and get a
-shorter "what changed" treatment, since the underlying pattern (extract →
-write → checkpoint) doesn't change — only what gets extracted and how the
-Bronze key is built does.
-
----
-
-**CREATE:** `ingestion/src/url_shortener_analytics/extract_incremental.py`
-
-**PURPOSE:** Read only the rows added since the last successful run,
-write them to Bronze under a watermark-scoped key, and advance the
-watermark — while treating "no new rows" as a normal, successful, no-op
-outcome rather than an edge case bolted on afterward.
-
-**DEPENDENCIES:** `pandas`, a SQLAlchemy `Engine`, this package's
-`metadata` module (for `get_last_watermark` and the same
-`start_run`/`finish_run_success`/`finish_run_failure` checkpoint calls
-`extract_full.py` uses) and `object_store.write_bronze_incremental`.
-
-**IMPLEMENTATION GUIDE (write it yourself):** start from
-`extract_full.py`'s shape — you're building the same two-function pattern
-(a pure extract function, and an orchestration function) — and change
-exactly what needs to change. `extract_incremental(table_name, engine,
-watermark)` should run a parameterized query,
-`SELECT * FROM <table_name> WHERE id > :watermark ORDER BY id` (use
-SQLAlchemy's `text()` with a bound parameter — never f-string the
-watermark value directly into SQL), and return the result as a DataFrame,
-wrapped in the same `try/except -> ExtractionError` pattern as
-`extract_full`. Order by `id` explicitly — you need `df["id"].max()` to be
-unambiguous, and relying on unspecified row order to happen to already be
-sorted is exactly the kind of implicit assumption that breaks quietly
-later. `run_incremental_load(engine, s3_client, bucket, pipeline_name,
-table_name)` is the orchestration, and this is where the real design
-decision lives: call `metadata.start_run(...)`, then
-`metadata.get_last_watermark(...)` to find where to resume, then your
-`extract_incremental`. **Before** doing anything else, check
-`df.empty` — if it's empty, call
-`metadata.finish_run_success(rows_read=0, rows_written=0,
-watermark_end=<the watermark you just read, unchanged>)` and return early,
-**without** calling `write_bronze_incremental` at all. (Ask yourself: what
-would a zero-row Parquet object at a `watermark_start == watermark_end`
-key actually represent, and who would it confuse later? That's the reason
-to skip the write, not just "why bother.") If `df` is non-empty, compute
-`new_watermark = int(df["id"].max())`, call
-`object_store.write_bronze_incremental(df, table_name, watermark,
-new_watermark, s3_client, bucket)`, then
-`metadata.finish_run_success(rows_read=len(df), rows_written=len(df),
-watermark_end=new_watermark)`. Wrap the extract-through-write portion in
-`try/except Exception` that calls `metadata.finish_run_failure(...)` and
-**re-raises**, exactly like `run_full_load` — this orchestration function
-should look like `run_full_load`'s twin with one extra branch, not a
-rewrite from scratch.
-
-**REFERENCE IMPLEMENTATION:**
+Already built and running — here's the real code to trace against what you have:
 
 ```python
-# ingestion/src/url_shortener_analytics/extract_incremental.py (excerpt —
-# full file is already committed at this path)
+# ingestion/src/url_shortener_analytics/extract_incremental.py
 
 def extract_incremental(table_name: str, engine: Engine, watermark: int) -> pd.DataFrame:
     query = text(f"SELECT * FROM {table_name} WHERE id > :watermark ORDER BY id")
-    return pd.read_sql_query(query, engine, params={"watermark": watermark})
+    df = pd.read_sql_query(query, engine, params={"watermark": watermark})
+    return df
 
 
-def run_incremental_load(engine, s3_client, bucket, pipeline_name, table_name) -> dict:
+def run_incremental_load(engine, s3_client, bucket, pipeline_name, table_name) -> dict[str, object]:
     run_id = metadata.start_run(engine, pipeline_name, table_name, load_type="incremental")
     try:
         watermark = metadata.get_last_watermark(engine, pipeline_name, table_name)
         df = extract_incremental(table_name, engine, watermark)
 
         if df.empty:
-            metadata.finish_run_success(engine, run_id, rows_read=0, rows_written=0, watermark_end=watermark)
-            return {"run_id": run_id, "rows": 0, "key": None, "watermark_end": watermark}
+            metadata.finish_run_success(
+                engine, run_id, rows_read=0, rows_written=0,
+                watermark_start=watermark, watermark_end=watermark,
+            )
+            return {"run_id": run_id, "table": table_name, "rows": 0, "key": None,
+                    "watermark_start": watermark, "watermark_end": watermark}
 
         new_watermark = int(df["id"].max())
         key = write_bronze_incremental(df, table_name, watermark, new_watermark, s3_client, bucket)
-        metadata.finish_run_success(engine, run_id, rows_read=len(df), rows_written=len(df), watermark_end=new_watermark)
+        metadata.finish_run_success(
+            engine, run_id, rows_read=len(df), rows_written=len(df),
+            watermark_start=watermark, watermark_end=new_watermark, bronze_key=key,
+        )
     except Exception as err:
         metadata.finish_run_failure(engine, run_id, str(err))
         raise
-    return {"run_id": run_id, "rows": len(df), "key": key, "watermark_end": new_watermark}
+
+    return {"run_id": run_id, "table": table_name, "rows": len(df), "key": key,
+            "watermark_start": watermark, "watermark_end": new_watermark}
+
+# object_store.py
+def build_bronze_incremental_key(table_name: str, watermark_start: int, watermark_end: int) -> str:
+    return (
+        f"bronze/{table_name}/incremental/"
+        f"watermark_start={watermark_start:012d}/watermark_end={watermark_end:012d}/{table_name}.parquet"
+    )
 ```
 
-Full file: [`ingestion/src/url_shortener_analytics/extract_incremental.py`](../ingestion/src/url_shortener_analytics/extract_incremental.py).
+### 5. CODE WALKTHROUGH
 
-**RUN:** `make ingest` (dispatches `clicks` here, `urls`/`users` to full
-load — see the CLI change below). There's no standalone CLI for this file
-alone, same reasoning as `object_store.py` in Section 14.
+The df.empty branch is the most important line in this function, not a minor edge case. Read the comment on it in your own code: writing a zero-row Parquet object at a watermark_start == watermark_end key would represent nothing useful and would just clutter Bronze — every no-op run (and there will be many, since a real schedule polls far more often than clicks actually arrive) would otherwise produce a useless empty file. Treating "no new rows" as a normal successful outcome, not a special case bolted on, is what keeps the object count in Bronze meaningful.
 
-**VERIFY:** open `http://localhost:9001` (MinIO console), browse to
-`bronze/clicks/incremental/`; confirm one object per run, keyed by that
-run's `watermark_start=.../watermark_end=...` range, and that a second
-`make ingest` run with no new source rows produces **no** new object
-(compare `list_objects_v2` counts before/after — exactly what
-`test_run_incremental_load_with_no_new_rows_skips_the_write_but_still_succeeds`
-asserts under mocks, and what LAB 3 below proves against real MinIO).
+Notice get_last_watermark (in metadata.py, which you can see is unchanged from Section 14) only ever reads status='success' rows. That's the same invariant from full load, doing more work here: a run that crashed mid-flight must never become the basis for where the next run resumes from — otherwise a crash could corrupt the entire pipeline's notion of "what's already been read."
 
-**EXPECTED:** the number of objects under `bronze/clicks/incremental/`
-equals the number of runs that found at least one new row — never one
-more than that, regardless of how many total runs (including no-op ones)
-have happened.
+ORDER BY id in the query isn't cosmetic — new_watermark = int(df["id"].max()) needs the max to be unambiguous, and depending on unspecified row order happening to already be sorted is exactly the kind of silent assumption that breaks later without warning.
 
-**TEST:** `ingestion/tests/unit/test_extract_incremental.py` — 8 tests,
-covering watermark-scoped reads (including the watermark-at-max-id "reads
-nothing" boundary), the first-run-reads-everything case
-(`watermark=0`), the no-new-rows no-op path (asserting the checkpoint
-still records `status='success', rows_written=0` and that no Bronze write
-was attempted), and the failure-doesn't-advance-the-watermark case.
-`ingestion/tests/integration/test_incremental_load_integration.py` proves
-the same behavior against real Postgres + MinIO (not yet executed in this
-sandbox — see [15.6](#156-how-to-test)).
+### 6. RUN
+```
+make ingest
 
-**PRODUCTION CONSIDERATIONS:** see [15.8](#158-production-considerations).
+First run (watermark starts at 0, reads everything that exists so far):
 
-**INTERVIEW QUESTIONS:** see [15.9](#159-principal-engineer-interview-questions).
+extracting table (incremental load), table=clicks, watermark=0
+extraction complete, table=clicks, rows=<N>, watermark=0
+wrote bronze object, key=bronze/clicks/incremental/watermark_start=000000000000/watermark_end=000000000<N>/clicks.parquet
 
----
+Insert a couple of rows directly, then run again — watermark is now <N>, and only the new rows are read:
 
-**Changed files** (already covered in depth in Section 14 — this is what
-changed about them for incremental load, not a repeat of their full
-teaching):
+extracting table (incremental load), table=clicks, watermark=<N>
+extraction complete, table=clicks, rows=2, watermark=<N>
+wrote bronze object, key=bronze/clicks/incremental/watermark_start=000000000<N>/watermark_end=000000000<N+2>/clicks.parquet
 
-| File | What changed | Why |
-|---|---|---|
-| [`object_store.py`](../ingestion/src/url_shortener_analytics/object_store.py) | Added `build_bronze_incremental_key` and `write_bronze_incremental`; extracted the shared retry/serialize logic both `write_bronze` and `write_bronze_incremental` need into a private `_put_parquet_with_retry` helper | One retry policy, one Parquet-serialization code path, for both load types — not two copies that could drift apart |
-| [`cli.py`](../ingestion/src/url_shortener_analytics/cli.py) | Added a `run` subcommand that dispatches each table to full or incremental load based on `pipelines.yaml`'s `load_type` field; kept `full-load` as an explicit override for backfills | `run` is what a real schedule would call; `full-load` stays available because forcing a full reload is a legitimate operator action (e.g. rebuilding Bronze from scratch after a schema change), not something that should require editing config |
-| [`pipelines.yaml`](../ingestion/configs/pipelines.yaml) | `clicks`' `load_type` changed from `full` to `incremental` | This is the one line that actually turns incremental load "on" for `clicks` — everything else in this section exists to make that one config value meaningful |
-| [`Makefile`](../Makefile) | Added `make ingest` (calls `cli.py run`); kept `make ingest-full` (calls `cli.py full-load`) | Matches the CLI's two entry points 1:1 |
-
-### Hands-on Challenge (implement-yourself)
-
-Before reading LAB 2 below, try this: **without looking at
-`extract_incremental.py`, write down (in plain English or pseudocode) what
-would go wrong if `run_incremental_load` called
-`metadata.finish_run_success(...)` *before* calling
-`write_bronze_incremental(...)` instead of after.** Then check your answer
-against [15.7](#157-failure-scenario): a process killed in that window
-would leave the watermark advanced in `ingestion_metadata` even though the
-corresponding Bronze object was never actually written — the *opposite* of
-the safe failure mode this section's ordering produces, and a genuinely
-worse bug than a stuck `running` row, because it's a **silent data gap**:
-`get_last_watermark` would report success, the next run would start from
-the advanced watermark, and the rows in between would never be extracted
-by anything, ever, without manual intervention.
-
-### 15.5 Hands-on Exercise
-
-**LAB 2 — Run an incremental load twice, prove it only reads what's new.**
-
-Prerequisites: `make up`, `make seed` have been run; `make ingest` (or
-`make ingest-full`) has populated an initial baseline.
-
-```bash
-make ingest    # first run: clicks watermark starts at 0, reads everything so far
+This is DESIGN EXPECTATION for the exact row counts — depends on your current clicks count, which you should confirm for yourself with SELECT COUNT(*) FROM clicks; before running.
 ```
 
-Expected output (structured log lines):
+### 7. EXPERIMENT
 
-```
-ts=... level=INFO logger=url_shortener_analytics.extract_incremental msg="extracting table (incremental load)" table='clicks' watermark=0
-ts=... level=INFO logger=url_shortener_analytics.extract_incremental msg="extraction complete" table='clicks' rows=1000 watermark=0
-ts=... level=INFO logger=url_shortener_analytics.object_store msg="wrote bronze object" key='bronze/clicks/incremental/watermark_start=000000000000/watermark_end=000000001000/clicks.parquet' bytes=... rows=1000 attempt=1
-```
+Run make ingest a third time with no new rows inserted. Expected: rows=0 in the log, no "wrote bronze object" line at all, and a new ingestion_metadata row with status='success', rows_written=0, watermark_end unchanged from the previous run. Confirm with:
 
-*(Row counts above are a DESIGN EXPECTATION based on
-`scripts/seed_sample_data.py`'s fixed seed for however many `clicks` rows
-it generates — run the command yourself to see the ACTUAL OBSERVED value;
-nothing above was fabricated as a claimed real run.)*
-
-Now insert a few new rows directly (simulating new redirects happening),
-and run again:
-
-```bash
-docker compose exec postgres psql -U urlshortener -d urlshortener \
-  -c "INSERT INTO clicks (short_code) VALUES ('test01'), ('test02');"
-make ingest    # second run: watermark is now 1000, reads only the 2 new rows
+```sql
+SELECT status, rows_written, watermark_start, watermark_end
+FROM ingestion_metadata WHERE source_table='clicks' ORDER BY started_at DESC LIMIT 3;
 ```
 
-What to observe: the second run's log line reads
-`watermark=1000` (not `0`), reports `rows=2` (not 1002), and writes a
-**new**, separate Bronze object at
-`bronze/clicks/incremental/watermark_start=000000001000/watermark_end=000000001002/clicks.parquet`
-— the first run's object at `watermark_start=000000000000/...` is left
-untouched. Two objects now exist under `bronze/clicks/incremental/`,
-together covering every row exactly once.
+Now the more interesting failure scenario — do this as a thought experiment first, then verify it's what the code actually does: what would go wrong if finish_run_success were called before write_bronze_incremental instead of after? Answer: a process killed in that window would leave the watermark advanced in ingestion_metadata even though the Bronze object was never written — a silent data gap. The next run would trust the advanced watermark and start reading after rows that were never actually captured anywhere. That's strictly worse than a stuck running row (which is at least visible and detectable) — it's invisible corruption. Check run_incremental_load's actual ordering: write happens, then finish_run_success. That ordering is the whole defense.
 
-**LAB 3 — Prove a no-op run writes nothing.**
+### 8. PRODUCTION VIEW
 
-```bash
-make ingest    # third run: no new rows inserted since LAB 2's second run
-```
+The real gap this design accepts: it's insert-only by construction. It can never see an UPDATE or a DELETE on clicks — if a row changed after being read once, incremental load has no way to know. That's fine here because your contract says clicks are never updated/deleted after insert; it would be a real bug if that stopped being true and nobody revisited this design. At real scale, the id-based watermark also assumes a single writer sequence — if clicks were ever sharded across multiple databases (say, per-region), "the highest id" stops being a single meaningful number, and you'd need a different scheme (per-shard watermarks, or move to timestamp/CDC-based capture despite its trade-offs).
 
-What to observe: the log shows `rows=0`, no `"wrote bronze object"` line
-appears at all, and `ingestion_metadata` gets a new row with
-`status='success', rows_written=0, watermark_end` equal to the previous
-run's `watermark_end` (verify with
-`docker compose exec postgres psql ... -c "SELECT status, rows_written, watermark_end FROM ingestion_metadata WHERE source_table='clicks' ORDER BY started_at DESC LIMIT 3;"`).
-Confirmed under mocks by
-`test_run_incremental_load_with_no_new_rows_skips_the_write_but_still_succeeds`,
-and, against real infrastructure, by
-`test_incremental_load_with_no_new_rows_writes_nothing`.
+### 9. PRINCIPAL ENGINEER VIEW
 
-### 15.6 How to test
+The id-vs-timestamp watermark choice is a favorite interview probe because it looks like a minor implementation detail but is actually testing whether you understand why clock-dependent state is dangerous in distributed writes — "two events can share a timestamp, or even appear out of order, under concurrent writes or clock skew" is the kind of insight that separates someone who's internalized distributed systems failure modes from someone reciting definitions.
 
-```bash
-make test                # unit tests: SQLite + mocked S3, no Docker needed
-make up
-make test-integration     # real Postgres + MinIO
-```
+The ordering bug in the EXPERIMENT section (checkpoint-before-write vs write-before-checkpoint) is a real, general pattern worth having ready: whenever a "commit" or "checkpoint" step and a "write the data" step are two separate operations, the two possible failure windows have asymmetric severity — one produces a visible, detectable stuck state; the other produces an invisible data gap that nobody notices until someone asks "why is this data missing" much later. Good production systems always order the checkpoint after the write, never before.
 
-The full unit suite (27 tests — 15 from Section 14 plus 12 new: 4 for
-`build_bronze_incremental_key`/`write_bronze_incremental` in
-`test_object_store.py`, 8 in `test_extract_incremental.py`) was run in
-this environment while writing this section (Python 3.11,
-`PYTHONPATH=ingestion/src python3 -m pytest ingestion/tests/unit -q`) and
-genuinely passed — this is an ACTUAL OBSERVED result, not a projection:
+### 10. REMEMBER
 
-```
-27 passed in 12.78s
-```
-
-`ingestion/tests/integration/test_incremental_load_integration.py` (3
-tests: reads-only-new-rows, no-op-writes-nothing, retry-overwrites-not-
-duplicates) is written and `ruff check`-clean, but **not yet executed** —
-there is no Docker daemon available in this sandbox (`docker info` fails
-here). Run it yourself with `make up && make test-integration` and this
-section will be updated with the actual observed result once that's done
-in an environment with Docker.
-
-### 15.7 Failure Scenario
-
-**What happens if the process is killed after `write_bronze_incremental`
-succeeds but before `finish_run_success` records the new watermark?**
-
-This is the incremental-load analogue of Section 14.7's full-load failure
-scenario, and it matters more here because a watermark, unlike a full
-load's date-scoped key, controls *what the next run even attempts to
-read*. The Bronze object for this run's batch now exists in MinIO, but
-`ingestion_metadata` still shows `status='running'` for it —
-`get_last_watermark` only reads `status='success'` rows, so the next run
-resumes from the *old* watermark, not the one this run computed. Recovery:
-re-running is safe, but not for free — it re-extracts the same rows a
-second time and, because the `id > watermark` starting point is unchanged,
-computes the **same** `(watermark_start, watermark_end)` pair, which
-`build_bronze_incremental_key` turns into the **same** key — so the retry
-overwrites the first (orphaned, `running`) run's object with identical
-bytes. This is exactly the scenario
-`test_retrying_the_same_failed_watermark_range_overwrites_not_duplicates`
-proves.
-
-**The one case where this guarantee does NOT fully hold, stated honestly:**
-if new rows are inserted into `clicks` *between* the failed run and its
-retry, the retry's `extract_incremental` call reads a *larger* range than
-the failed run did (same `watermark_start`, but a higher `watermark_end`,
-because `df["id"].max()` is now bigger). `build_bronze_incremental_key`
-then computes a **different** key — so the retry writes a **second**,
-non-overlapping-but-superset object next to the orphaned first one,
-instead of cleanly overwriting it. The orphaned object isn't wrong (every
-row in it is correct data), but it *is* redundant — some rows now exist in
-two Bronze objects. **Production implication:** this is precisely the kind
-of edge case a real orchestrator's retry policy and a periodic
-Bronze-compaction/cleanup job need to account for; Phase 1 documents it
-rather than hides it, consistent with this project's stated principle of
-being honest about POC limitations (see ADR-007's note on retention) —
-fully closing this gap would mean either detecting and deleting orphaned
-`running` objects on startup, or moving to a run-id-scoped key with
-separate deduplication downstream, both explicitly out of scope here.
-
-### 15.8 Production Considerations
-
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Watermark source | `clicks.id`, a `BIGSERIAL` — assumes an ever-increasing integer PK on every incrementally-loaded table | Same idea, but often a dedicated monotonic sequence or `updated_at` handled via CDC, since not every production table has an integer PK suited to this |
-| Captures updates/deletes | No — insert-only; a row that's later updated in place is never re-read | CDC (Debezium/logical replication) captures every write type; polling-based incremental load fundamentally cannot |
-| Scheduling | Manual (`make ingest`) | Orchestrator-driven (Airflow, etc. — Phase 3), on a fixed interval, with alerting on missed/late runs |
-| Orphaned-object cleanup | None — see 15.7's residual edge case | A periodic reconciliation job comparing `ingestion_metadata` against actual Bronze object listings |
-| Watermark column requirement | Must be indexed (`ix_clicks_...` — not yet added; see the Hands-on Challenge two sections up about partition/index design) | Same requirement, enforced by data-contract review before a new table is onboarded to incremental load |
-
-### Principal Data Engineer Perspective
-
-The decision worth being able to defend in review here isn't "should this
-use a watermark" — it's *which* watermark, and principal-level judgment
-shows up in naming the assumption an id-based watermark makes explicit:
-this approach only works because `clicks` is, by this project's own
-design, insert-only and never updated after the fact. The moment a real
-requirement appears — "let us edit or soft-delete a click record for
-fraud correction," say — this entire mechanism silently stops being
-correct, because an updated row's `id` doesn't change, so it will never be
-picked up by `WHERE id > watermark` again. A weaker engineer ships the
-id-based watermark and moves on; a principal engineer writes down, at
-design time, the exact condition under which it breaks — which is what
-this section's Trade-offs table and ADR-005 are for — so that whoever
-adds update/delete support later inherits a known, documented constraint
-instead of discovering it by debugging a data-quality incident. The second
-thing worth flagging: this section's failure-scenario writeup admits a
-real, if narrow, idempotency gap (15.7) rather than claiming a stronger
-guarantee than the code actually provides. That's a deliberate modeling
-choice about what to prioritize in a portfolio project — an interviewer
-evaluating this repo should come away trusting every claim it makes,
-which is worth more than a repo that quietly overstates its own
-correctness.
-
-### 15.9 Principal Engineer Interview Questions
-
-**Q: "Why an id-based watermark instead of a timestamp-based one? Walk me
-through a concrete scenario where the timestamp-based version breaks."**
-
-*What's tested:* whether the candidate understands watermarking as a
-correctness mechanism with a specific failure mode, not just a
-stylistic choice.
-
-*What a weak answer looks like:* "Timestamps can have clock skew issues" —
-true, but vague enough to sound memorized rather than understood.
-
-*What a strong answer covers:* concretely, suppose two application
-servers both insert a `clicks` row in the same second, and an incremental
-run's watermark is set to `occurred_at = 14:00:00`. If a third row with
-`occurred_at = 14:00:00` from a *different* server arrives one second
-later (its clock was one second slow, or its write was simply delayed by
-normal network/lock contention), the next run's `WHERE occurred_at >
-'14:00:00'` **silently excludes it forever** — it's not late, it's gone.
-An id-based watermark cannot have this failure: Postgres assigns
-`BIGSERIAL` values from a single sequence, in the literal order rows
-commit, with no dependency on any client's clock or on network delay.
-
-*Concepts:* watermark correctness, clock skew, "equal-to-cutoff" boundary
-ambiguity in timestamp comparisons.
-
-*Expected follow-up:* "What does the id-based approach give up in
-exchange?" — It can't detect that an existing row was updated or deleted,
-only that new rows were inserted (see the next question).
-
-*Common mistake:* describing clock skew only in terms of literal wall-clock
-drift between servers, without connecting it to the actual mechanism (a
-row landing with a timestamp *earlier* than the watermark's current
-cutoff, purely because of when it was written relative to other writes).
-
-**Q: "This incremental load only ever sees new rows. What happens if a
-`clicks` row is updated after it's already been ingested — say, a
-fraud-review process changes `device_type` on a row that was ingested
-yesterday? Will this pipeline ever see that change?"**
-
-*What's tested:* whether the candidate recognizes the boundary of what an
-id-based, insert-scoped watermark can and can't capture — a very common
-gap between "the demo works" and "this is production-correct for the
-actual write pattern."
-
-*What a weak answer looks like:* "It'll pick it up next run" — incorrect;
-this is the single most important limitation of this design and needs to
-be named as one.
-
-*What a strong answer covers:* no — `WHERE id > watermark` only ever
-matches rows whose `id` wasn't ingested yet; an update to an
-already-ingested row doesn't change its `id`, so it will never satisfy
-that condition again, ever, under this mechanism. Bronze silently becomes
-stale relative to OLTP for that row. Real options: add and watermark on an
-`updated_at` column too (catches updates, still has the timestamp
-caveats from the previous question); move to CDC, which captures every
-write type at the WAL level regardless of what changed; or, for this
-project's actual `clicks` design specifically, treat click records as
-genuinely immutable (never updated after insert) as a stated data
-contract, which sidesteps the problem by design rather than by mechanism.
-
-*Concepts:* insert-only vs. mutable source tables, the difference between
-"my watermark logic is correct" and "my watermark logic matches this
-table's actual write pattern."
-
-*Expected follow-up:* "How would you even detect this gap in production,
-before a stakeholder notices stale numbers?" — Row-count and checksum
-reconciliation between OLTP and Bronze on a schedule, which is exactly
-what Section 25 (Failure Scenarios) and a future data-quality section
-would formalize.
-
-*Common mistake:* conflating "the pipeline ran successfully" with "the
-data is correct" — a successful `status='success'` checkpoint says nothing
-about whether an update to already-ingested data was captured, because
-this mechanism was never designed to look for that in the first place.
-
----
+Watermark = one saved number that turns "read everything" into "read what's new." That's the whole trick.
+ID-based watermarks beat timestamp-based ones specifically because they're immune to clock skew and duplicate values — at the cost of only working for insert-only tables.
+"No new rows" is a success, not an edge case — don't write empty files just to have something to point at.
+Checkpoint (mark success) must always happen after the write it's checkpointing, never before — reversed order turns a visible failure into a silent data gap.
 
 ## 16. Checkpointing ✅✅
 
-### 16.1 Concept
+### 1. CONCEPT
 
-A **checkpoint** is a durable record of whether one specific run of a
-pipeline completed, currently in progress, or failed — independent of
-watermarks, and independent of what the run actually produced. This repo's
-checkpoint is the `status` column on `ingestion_metadata`
-(`'running'` → `'success'` or `'failed'`), one row per run, written
-*before* extraction starts (`status='running'`) and updated exactly once
-more when the run ends. Sections 14 and 15 already used this mechanism —
-every `run_full_load` and `run_incremental_load` call is checkpointed —
-but always in service of watermarking or idempotency, never as the subject
-itself. This section is that dedicated treatment: what a checkpoint is
-*for*, on its own; what "stale" means for one; and the gap named as far
-back as Section 15.8's Production Considerations table
-("`ingestion_metadata` has no automated stale-`running`-row alerting") —
-closed in this increment by `metadata.find_stale_running_runs` and the new
-`check-stale-runs` CLI command.
+A checkpoint is a durable record of whether one specific run finished, is still in progress, or failed — separate from watermarks, separate from what data the run actually produced. You've already been using it without naming it: every start_run/finish_run_success/finish_run_failure call in metadata.py, since Section 14, has been writing checkpoints. This concept is the dedicated look at why that pattern exists on its own merits, independent of the idempotency/watermark stories built on top of it.
 
-### Why does this exist?
+It matters because "did this job finish?" has no reliable answer once you can no longer ask the process itself — and you can't, the moment it's been killed (OOM, spot eviction, kubectl delete pod, a laptop losing power). A checkpoint answers the question a different way: write the intent down before doing the work, then update the record on definite success or definite failure. Anyone reading the table later — a human, an orchestrator, a monitor — reconstructs exactly what happened from the row alone, with zero dependency on the crashed process still being around to explain itself.
 
-Without a checkpoint, "did this run finish?" has no answer that survives a
-crash. A batch job's own process exiting non-zero is a fine signal *while
-the process is still running and something is watching it* — but the
-moment the process itself is killed (OOM, a spot-instance eviction, a
-`kubectl delete pod`, a laptop losing power mid-run), there's no process
-left to report anything. A checkpoint answers the question a different
-way: **write down the intent before doing the work, and update the record
-only on definite success or definite failure.** Anyone querying
-`ingestion_metadata` later — a human debugging, an orchestrator deciding
-whether to retry, a monitoring job — reconstructs exactly what happened
-from the row itself, with no dependency on the crashed process still being
-around to explain itself.
+### 2. URL SHORTENER EXAMPLE
 
-### Simple Example (generic, pre-URL-Shortener)
+metadata.start_run(...) inserts status='running' before extract_full/extract_incremental ever touches Postgres. If the process gets OOM-killed mid-scan on a large clicks full load, that row is frozen exactly as written: status='running', completed_at still NULL — forever, because nothing is left running to update it. You already produced a real, tame version of this: your full row for urls/users at 11:10:39 and 11:23:54 both show status='success' with real completed_at timestamps — that's the checkpoint doing its job correctly. What this section adds is the machinery to notice when a row is stuck, instead of leaving that to a human eyeballing the table.
 
-Imagine a nightly job that copies files from server A to server B. With no
-checkpoint: the job runs, copies file 3 of 10, and the machine loses power.
-Tomorrow, nobody — not a human, not a script — can tell from server B alone
-whether last night's job completed, partially completed, or never started;
-inspecting file counts on B is a guess, not a fact, since a legitimately
-completed prior run and a half-finished one can look identical from the
-destination's point of view. With a checkpoint: a `runs` table gets a row
-the instant the job starts (`status='running'`), and a second update the
-instant it finishes (`status='done'`) or fails. A row still `status='running'`
-the next morning is now a *fact*, not a guess — the job crashed mid-flight,
-full stop, and whoever finds that row knows to investigate rather than
-assume.
+### 3. DESIGN
 
-### URL Shortener Example
+New piece: metadata.find_stale_running_runs(engine, max_runtime_minutes=60, pipeline_name=None), wired into a new CLI command check-stale-runs. It's a single read-only query: any status='running' row whose started_at is older than the threshold gets reported. Exit code 1 if any are found — that's the entire monitoring interface, meant to be wrapped by a cron or an Airflow sensor later.
 
-Concretely, in this repo: `metadata.start_run(engine, pipeline_name,
-table_name, load_type)` inserts a row with `status='running'` and a real
-`started_at` timestamp *before* `extract_full`/`extract_incremental` ever
-touches the database. If the ingestion process is killed by, say, an OOM
-kill while `pd.read_sql_table` is mid-scan on a large `clicks` table, that
-row is left exactly as it was written: `status='running'`, `completed_at`
-still `NULL`. Nothing updates it, because nothing is left running to update
-it. Section 14.7 and 15.7 already walked through what this means for the
-*specific* run that crashed (its watermark/Bronze object never gets
-promoted); this section is about the row itself, sitting there
-indefinitely, until something notices it.
+Key decision — detect staleness by elapsed time, not a heartbeat. A status='running' row is ambiguous on its own: still legitimately in progress, or crashed? Two ways to disambiguate were on the table:
 
-### 16.2 Architecture
+Heartbeat — a long-running process updates its own row every N seconds to prove it's alive; a row is stale only once its heartbeat also goes quiet. Precise, but requires touching every run_*_load function to add the heartbeat write, plus something to actually schedule those periodic writes.
+Lock/lease — e.g. a Postgres advisory lock held for the run's duration; stale means "lock is free but row still says running." Also precise, but introduces lock-lifecycle bugs of its own (a lock that never gets released is a new failure mode you didn't have before).
+Elapsed-time threshold (chosen) — "if started_at is more than 60 minutes ago and still running, call it stale." One query, no changes to any existing run function, no new infrastructure. The real cost: it's a guess, not a fact — a run that's legitimately still executing past the threshold gets misclassified as crashed.
 
-```
-                    ┌─────────────────────────────────────────┐
-                    │            ingestion_metadata            │
-                    │                                           │
-  start_run() ─────▶│  INSERT status='running', started_at=now │
-                    │                                           │
-                    │        (extraction + Bronze write         │
-                    │         happen HERE, outside the table)   │
-                    │                                           │
-finish_run_success()│  UPDATE status='success', bronze_key,     │
-      ─────────────▶│         watermark_end, completed_at       │
-                    │                                           │
- finish_run_failure()│ UPDATE status='failed', error_message,   │
-      ─────────────▶│         completed_at                      │
-                    └─────────────────────────────────────────┘
-                                       │
-                                       │  a crash between start_run()
-                                       │  and either finish_run_*()
-                                       ▼
-                    ┌─────────────────────────────────────────┐
-                    │  row permanently stuck at status='running'│
-                    │  (nothing left to update it)               │
-                    └─────────────────────────────────────────┘
-                                       │
-                     find_stale_running_runs(engine,
-                       max_runtime_minutes=60)
-                                       │
-                                       ▼
-                    ┌─────────────────────────────────────────┐
-                    │  check-stale-runs CLI: logs each one,      │
-                    │  exits 1 — wire into a monitoring cron     │
-                    └─────────────────────────────────────────┘
-```
+That trade-off is exactly right for this project's current scale (Section 13.1's stated scope: no orchestrator, no concurrent distributed workers yet). It would stop being the right choice the moment job durations become highly variable or genuinely long-running.
 
-The checkpoint write is deliberately *outside* the extraction/write
-transaction — `start_run` commits and returns before `extract_full` or
-`extract_incremental` ever runs. This is what makes the `status='running'`
-row observable *while the run is still in progress*, not just after it
-ends; a checkpoint that only got written at the end wouldn't distinguish
-"still running, legitimately" from "crashed," which is the entire point
-of having one.
+The other real decision, smaller but worth internalizing: the cutoff timestamp is computed in Python (datetime.now(UTC) - timedelta(minutes=max_runtime_minutes)) and passed as a bound parameter — not now() - interval '60 minutes' written directly in SQL. Reason: this function is unit-tested against SQLite (no interval syntax at all) and run against Postgres in production. A plain bound timestamp parameter works identically against both; the same cross-dialect reasoning you'd have seen in contracts.py, applied here a second time.
 
-### 16.3 Design Decision: detect staleness by elapsed time, not by a heartbeat
+### 4. IMPLEMENTATION
 
-**Context:** a `status='running'` row could mean two very different
-things — a run that's still legitimately in progress (a large `clicks`
-full load can take real wall-clock time), or a run that crashed. Something
-needs to tell these apart without a human eyeballing timestamps by hand.
-**Decision:** `find_stale_running_runs(engine, max_runtime_minutes=60)`
-treats any `'running'` row whose `started_at` is older than
-`max_runtime_minutes` ago as stale — a single, simple threshold, no
-heartbeat mechanism. **Alternatives considered:** (1) a periodic
-heartbeat, where a long-running process updates its own row every N
-seconds to prove it's still alive, and a row is stale only if its
-heartbeat has also gone quiet; (2) a distributed lock / lease (e.g. a
-Postgres advisory lock held for the run's duration), where staleness is
-"the lock is free but the row says running" instead of elapsed time at
-all. **Trade-offs:** a heartbeat correctly distinguishes "still running,
-slowly" from "crashed" even for a run that legitimately takes longer than
-`max_runtime_minutes` — this threshold approach cannot make that
-distinction and will misclassify a genuinely slow-but-healthy run as
-stale. In exchange, the threshold approach needs no changes to the running
-process itself (`start_run`/`finish_run_success`/`finish_run_failure`
-already existed, unchanged, from Sections 14-15) and no extra
-infrastructure (no lock manager, no separate heartbeat writer thread) —
-it's a single read-only query over data this table already has.
-**Consequences:** `max_runtime_minutes` must be set to something
-meaningfully larger than this pipeline's slowest *legitimate* run (a full
-load of the largest configured table, under realistic load) — set it too
-low and `check-stale-runs` produces false positives; the guide's Section
-16.7 Production Considerations table names this directly as an operational
-tuning parameter, not a fixed constant.
-
-### Alternatives
-
-Covered above as part of the Design Decision — repeated here per this
-guide's template: heartbeat-based liveness, and lock/lease-based liveness,
-both rejected in favor of the simpler elapsed-time threshold for this
-project's current scale and operational maturity (no orchestrator, no
-distributed workers yet — see Section 13.1's explicit scope boundary).
-
-### Trade-offs
-
-| | Elapsed-time threshold (chosen) | Heartbeat | Lock/lease |
-|---|---|---|---|
-| Distinguishes "slow but healthy" from "crashed" | No — a threshold is a guess, tuned by hand | Yes, precisely | Yes, precisely |
-| Infra required | None — one query | A writer thread/process per run, updating its own row | A lock manager (Postgres advisory locks work; needs care around connection lifetime) |
-| Implementation cost (this repo) | One function, ~15 lines | Would touch every `run_*_load` function | Would touch every `run_*_load` function and add a new failure mode (lock never released) |
-| Right fit for this project's current scale | Yes | Overkill — no long-running or highly-variable-duration jobs yet | Overkill — no concurrent workers to arbitrate between yet |
-
-### 16.4 Implementation
-
-**Implementation Guide vs. Reference Implementation:** as in Sections 14-15,
-read the *Implementation Guide* paragraph, close the guide, write the
-function yourself against the stated signature, then compare.
-
----
-
-**CREATE:** (edit) `ingestion/src/url_shortener_analytics/metadata.py` —
-`find_stale_running_runs`
-
-**PURPOSE:** Query for every checkpoint row that's almost certainly a
-crashed run, so an operator or a monitoring job can find out without
-manually inspecting `ingestion_metadata`.
-
-**DEPENDENCIES:** nothing new — the same `Engine`/`text()` pattern every
-other function in this module already uses.
-
-**IMPLEMENTATION GUIDE (write it yourself):** the query itself is simple —
-`SELECT ... FROM ingestion_metadata WHERE status = 'running' AND started_at
-< :cutoff`, optionally `AND pipeline_name = :pipeline_name`. The one
-genuine design decision is *where* `:cutoff` gets computed. Two options:
-`started_at < now() - interval '60 minutes'` entirely in SQL, or `cutoff =
-datetime.now(UTC) - timedelta(minutes=60)` in Python, passed as a bound
-parameter. Pick the second — and before reading further, work out why.
-(Answer: this function is unit-tested against SQLite, whose SQL dialect
-has no `interval` syntax at all, and used against Postgres in production.
-Computing the cutoff in Python and binding it as a plain timestamp works
-identically against both dialects; this is the exact same
-cross-dialect-portability reasoning `contracts.py`'s `_categorize_type`
-used in Section 12.2 for comparing reflected column types instead of raw
-SQL type strings — the same lesson, applied a second time, in a different
-part of the codebase.)
-
-**REFERENCE IMPLEMENTATION:**
+Already in your metadata.py — you read the whole file earlier this session:
 
 ```python
-# ingestion/src/url_shortener_analytics/metadata.py (excerpt)
-
 def find_stale_running_runs(
     engine: Engine, *, max_runtime_minutes: int = 60, pipeline_name: str | None = None
 ) -> list[dict[str, Any]]:
@@ -3951,623 +3015,95 @@ def find_stale_running_runs(
         for r in rows
     ]
 ```
+cli.py's check_stale_runs_command wraps this: prints a warning per stale row, exits 1 if any exist, exits 0 ("no stale running runs found") otherwise.
 
-Full file (with the existing `start_run`/`finish_run_success`/
-`finish_run_failure`/`get_last_watermark` this section builds on):
-[`ingestion/src/url_shortener_analytics/metadata.py`](../ingestion/src/url_shortener_analytics/metadata.py).
+### 5. CODE WALKTHROUGH
 
-**RUN:** `make check-stale-runs` (wraps `python -m
-url_shortener_analytics.cli check-stale-runs --max-runtime-minutes 60`)
+Nothing about start_run/finish_run_success/finish_run_failure changed for this section — that's the point being made explicitly in your guide: because the checkpoint mechanism was already correct and complete from Section 14 onward, closing this real operational gap ("no stale-run alerting") cost exactly one small read-only function, not a rewrite of anything. That's the payoff of building the metadata table correctly on day one instead of patching fields into it as each new need shows up.
 
-**VERIFY:** `PGPASSWORD=analytics psql -h localhost -U analytics -d
-analytics -c "SELECT run_id, source_table, started_at FROM
-ingestion_metadata WHERE status='running';"` — compare against what
-`check-stale-runs` reports.
+The WHERE status = 'running' filter is doing real work: find_stale_running_runs deliberately excludes success and failed rows — a completed run, whatever its outcome, is not "stale" by definition. Staleness is specifically about a run whose true final state is unknown.
 
-**EXPECTED:** with no crashed runs, `check-stale-runs` logs "no stale
-running runs found" and exits 0. With a genuinely stuck row (LAB 12
-below), it logs one `"stale running run"` warning per row and exits 1.
-
-**TEST:** `ingestion/tests/unit/test_metadata.py` — five new tests:
-finds-a-genuinely-stale-run, excludes-a-run-within-the-cutoff,
-excludes-success-and-failed-rows (only `status='running'` counts —
-completed rows of either outcome are not "stale," by definition),
-pipeline-name filtering, plus the pre-existing suite this section didn't
-touch.
-
-**PRODUCTION CONSIDERATIONS:** see Section 16.7.
-
-**INTERVIEW QUESTIONS:** see Section 16.9.
-
----
-
-**CREATE:** (edit) `ingestion/src/url_shortener_analytics/cli.py` —
-`check_stale_runs_command` / `check-stale-runs` subcommand
-
-**PURPOSE:** Surface `find_stale_running_runs` as something a cron job or
-an orchestrator step can actually call and alert on.
-
-**IMPLEMENTATION GUIDE (write it yourself):** follow this file's
-established pattern exactly (see `validate_contracts_command` for the
-closest precedent): build `settings`/`engine`, call
-`metadata.find_stale_running_runs(...)`, log a warning per stale run
-found, and return `1` if any were found, `0` otherwise — the exit code is
-what makes this wireable into automated alerting (a non-zero exit from a
-cron step is the universal "something's wrong" signal).
-
-**REFERENCE IMPLEMENTATION:**
-
-```python
-# ingestion/src/url_shortener_analytics/cli.py (excerpt)
-
-def check_stale_runs_command(max_runtime_minutes: int = 60) -> int:
-    settings = get_settings()
-    configure_logging(settings.log_level)
-    engine = engine_from_settings(settings)
-
-    stale = metadata.find_stale_running_runs(engine, max_runtime_minutes=max_runtime_minutes)
-    if not stale:
-        logger.info("no stale running runs found", extra={"max_runtime_minutes": max_runtime_minutes})
-        return 0
-    for run in stale:
-        logger.warning("stale running run", extra={**run, "started_at": str(run["started_at"])})
-    logger.error("stale running runs found", extra={"count": len(stale)})
-    return 1
-```
-
-Full file: [`ingestion/src/url_shortener_analytics/cli.py`](../ingestion/src/url_shortener_analytics/cli.py).
-
-**RUN / VERIFY / EXPECTED:** see the block above — identical, since this
-*is* the CLI wrapper around it.
-
-**TEST:** exercised indirectly by `test_metadata.py`'s coverage of the
-underlying function; `cli.py`'s command functions themselves are thin
-enough (settings → engine → one function call → log/exit) that this repo
-does not unit-test the CLI layer separately, consistent with how
-`run_command`/`run_full_load_command`/`validate_contracts_command` are
-already treated in Sections 14-15 — see Section 16.7's Production
-Considerations table for what a production monitoring setup adds on top
-of this.
-
-**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections 16.7/16.9.
-
----
-
-### Hands-on Challenge (implement-yourself)
-
-Before LAB 12 below, try this without looking at `metadata.py`: write a
-SQL query (not Python — raw SQL) that does what `find_stale_running_runs`
-does, using Postgres's own `now() - interval '60 minutes'` instead of a
-bound parameter. Run it directly with `psql`. Then answer: why does this
-guide's actual implementation deliberately avoid the syntax you just used?
-(You already have the answer from 16.4's Implementation Guide — this
-exercise is about *feeling* the portability cost firsthand: try running
-your `interval`-based query against the SQLite `sqlite_engine` fixture in
-`ingestion/tests/unit/conftest.py` and watch it fail outright, since
-SQLite has no `interval` syntax at all.)
-
-### 16.5 Hands-on Exercise
-
-**LAB 12 — Manufacture a stale run and detect it.**
-
-Prerequisites: a running Postgres reachable at `DATABASE_URL` (real
-`docker compose`, or the local Postgres 16 this guide has used directly in
-this sandbox — see Section 16.6 below for exactly which one this lab was
-run against).
+### 6. RUN
 
 ```bash
-# 1. Start a run's checkpoint (simulating a process that's about to crash)
+make check-stale-runs
+```
+
+With no crashed runs, expect one line: "no stale running runs found", exit 0. To actually see it catch something, manufacture a stale run:
+
+```bash
 python3 -c "
 from url_shortener_analytics.config import get_settings
 from url_shortener_analytics.db import engine_from_settings
 from url_shortener_analytics import metadata
 engine = engine_from_settings(get_settings())
 run_id = metadata.start_run(engine, 'lab12_pipeline', 'clicks', load_type='full')
-print('started', run_id)
-"
-
-# 2. Confirm check-stale-runs does NOT flag it yet (started seconds ago)
-make check-stale-runs   # exits 0 -- "no stale running runs found"
-
-# 3. Backdate it to simulate a crash 90 minutes ago
-psql "$DATABASE_URL" -c "
-  UPDATE ingestion_metadata
-  SET started_at = now() - interval '90 minutes'
-  WHERE pipeline_name = 'lab12_pipeline'
-"
-
-# 4. Now check-stale-runs finds it
-make check-stale-runs   # exits 1 -- one "stale running run" warning logged
-echo $?                 # 1
+print('started', run_id)"
 ```
 
-What to observe: `check-stale-runs`'s exit code flips from 0 to 1 purely
-because of the backdated `started_at` — nothing else about the row
-changed. This is the exact mechanism a production alerting rule would
-watch (`echo $? != 0` in a cron wrapper, or a dedicated Airflow sensor task
-in Phase 3+).
+Run make check-stale-runs right after — it should still report clean (started seconds ago, not stale yet). Then backdate it to simulate a crash 90 minutes in the past:
 
-### 16.6 How to test
-
-```bash
-make test                # unit: SQLite, no Docker needed
+```sql
+UPDATE ingestion_metadata
+SET started_at = now() - interval '90 minutes'
+WHERE pipeline_name = 'lab12_pipeline';
 ```
 
-The full unit suite (59 tests — up from 38 at the end of the Section 7-12
-increment, 21 new: 8 for `find_stale_running_runs`/bronze-key persistence
-in `test_metadata.py`, 5 for `head_object`/`list_bronze_keys` in
-`test_object_store.py`, 9 in the new `test_reconciliation.py` covering
-Section 17 below) was run in this environment while writing this section
-and genuinely passed — ACTUAL OBSERVED, not a projection:
+Run make check-stale-runs again — now it should log one "stale running run" warning and exit 1 (echo $? to confirm). Nothing else about the row changed except started_at — that's the entire mechanism, made concrete.
 
-```
-59 passed in 6.96s
-```
+### 7. EXPERIMENT
 
-`find_stale_running_runs` and `list_successful_bronze_keys` were also
-genuinely exercised against this sandbox's real (non-Docker) local
-Postgres 16 — not just SQLite — directly with SQLAlchemy against
-`postgresql+psycopg2://analytics:analytics@localhost:5432/analytics`: a
-run's `bronze_key` really does persist and round-trip through
-`list_successful_bronze_keys`; a row's `started_at` backdated 90 minutes
-really is picked up by `find_stale_running_runs(max_runtime_minutes=60)`
-and a fresh row genuinely is excluded; deleting the verification rows
-afterward left the table exactly as it was before. One genuine,
-previously-undiscovered cross-dialect wrinkle surfaced doing this: a
-Postgres `uuid` column round-trips as a Python `uuid.UUID` object through
-a raw `SELECT`, while this same table's SQLite unit-test fixture (`run_id
-TEXT PRIMARY KEY`) round-trips it as a plain `str` — comparing a
-`find_stale_running_runs` result's `run_id` against the `str` returned by
-`start_run` needs an explicit `str(...)` cast when reading it back from
-real Postgres, even though the SQLite-backed unit tests never need one.
-This is exactly the kind of dialect difference `contracts.py`'s coarse
-type categories (Section 12.2) exist to paper over at the *schema* level —
-this is the same class of issue showing up one level down, at the
-*driver's Python type mapping* level, which no amount of coarse-category
-schema comparison would have caught, because it isn't a schema mismatch at
-all.
+This is the experiment that actually matters more than the lab above: think through the false-positive case before checking your intuition against it. Suppose clicks' full load genuinely takes 75 minutes once the table grows large (remember — Section 14's extract_full has no chunking, it's one memory-bound query). check-stale-runs runs on the default 60-minute threshold. At minute 61 of a perfectly healthy, still-executing run, it gets reported as stale. If that's wired into paging, someone gets woken up for nothing — and worse than the wasted page, they start trusting the alert less the next time it fires, which is a much harder cost to undo. Now the inverse: what happens if max_runtime_minutes is set too high instead? (Answer: a genuinely crashed run sits undetected longer, and anything downstream depending on freshness — a dashboard, later in Phase 2 — stays silently stale that much longer too.) There's no value that's simply "correct" here, only one tuned to this specific pipeline's actual p99 run duration.
 
-**Not yet executed:** an integration test exercising `check-stale-runs`
-against real Docker infrastructure end-to-end (CLI process → real
-Postgres) — there is no Docker daemon in this sandbox; the function-level
-logic above was verified against real Postgres directly, but the full
-`make check-stale-runs` CLI invocation itself remains a DESIGN
-EXPECTATION for the reader to confirm with `make up`.
+### 8. PRODUCTION VIEW
 
-### 16.7 Failure Scenario
+Right now check-stale-runs's exit code is the entire monitoring interface — nothing calls it automatically, nothing pages anyone. Production wires it into a scheduled invocation (a cron, or an Airflow sensor once you're past Kafka) that pages on-call on a non-zero exit. Some shops go further and auto-mark a sufficiently stale running row as failed once alerting has fired, so a retry can be scheduled without a human in the loop. The threshold itself should ideally be derived per-pipeline from observed p99 duration, not left at one guessed global default — that's a real, ongoing operational tuning job, not a one-time setting.
 
-**What happens if `max_runtime_minutes` is set too low relative to this
-pipeline's actual slowest legitimate run?**
+### 9. PRINCIPAL ENGINEER VIEW
 
-Concretely: suppose a full load of `clicks` genuinely takes 75 minutes
-once its row count grows large enough (Section 14's POC-simplified
-single-query extraction, per its own Production Considerations table, has
-no chunking — a big enough table means a long, memory-bound, single scan),
-and `check-stale-runs` runs on a 60-minute threshold. At minute 61 of a
-perfectly healthy, still-executing run, `check-stale-runs` reports it as
-stale — a false positive. If this is wired into paging (Section 16's
-"Production Considerations" below), an on-call engineer gets woken up for
-nothing, investigates, finds the run is fine, and — the real cost — starts
-trusting this alert less the next time it fires. This is precisely why
-16.3's Design Decision names the threshold as a tuned operational
-parameter, not a fixed constant: it must be set above the pipeline's
-actual p99 run duration under realistic load, with margin, and revisited
-as data volume grows. The heartbeat/lock alternatives from 16.3 don't have
-this specific failure mode (they detect "still alive" directly, rather
-than inferring it from elapsed time) — this is the sharpest, most concrete
-way to state what this design decision actually costs.
+The interview-ready version of this section isn't "I built stale-run detection" — it's naming the exact condition under which your chosen mechanism gives a wrong answer, in the same breath as defending the choice. "I used an elapsed-time threshold because it needed zero new infrastructure at this project's current scale, and I know exactly when it breaks: once job duration becomes highly variable, a threshold starts producing false positives, and the fix at that point is a heartbeat, not a bigger threshold." That combination — the right choice for the current stage, plus a clear-eyed statement of its failure boundary — is what distinguishes "shipped something" from "understands the trade-off they shipped."
 
-**The inverse also matters:** a threshold set too *high* delays detecting
-a genuinely crashed run — the stale row sits unnoticed for longer, and
-whatever depended on this table's freshness (a downstream dashboard, in
-Phase 2+) stays silently stale for that much longer too. There's no value
-of `max_runtime_minutes` that's simply "correct" — only a value that's
-appropriately tuned to this specific pipeline's actual behavior, which is
-exactly the kind of judgment call a principal engineer is expected to make
-explicitly rather than leave at a framework's default.
+The second thing worth having ready: a real, previously-undiscovered dialect wrinkle showed up testing this against real Postgres versus SQLite — a Postgres uuid column round-trips as a Python uuid.UUID object through a raw SELECT, while the SQLite test fixture (run_id TEXT PRIMARY KEY) round-trips it as a plain str, so comparing run_ids read back from real Postgres needs an explicit str(...) cast that the SQLite-backed unit tests never needed. It's a good concrete example of "your unit tests passing against SQLite doesn't guarantee correctness against the real database" — a distinction interviewers like probing directly.
 
-### 16.8 Production Considerations
+### 10. REMEMBER
 
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Staleness detection | Elapsed-time threshold, one manual `check-stale-runs` invocation | Same threshold *and* a heartbeat for long-running jobs, to eliminate the false-positive failure mode above |
-| Alerting | None wired up — `check-stale-runs`'s exit code is the entire interface | A monitoring cron (or Airflow sensor) runs `check-stale-runs` on a schedule and pages on-call on a non-zero exit |
-| Auto-remediation | None — a stale row sits until a human runs `check-stale-runs` and investigates | Some shops auto-mark a sufficiently-stale `running` row as `failed` after alerting fires, so a retry can be scheduled automatically without waiting on a human |
-| Threshold tuning | A single global default (60 minutes), overridable per invocation via `--max-runtime-minutes` | Tuned per pipeline/table, ideally derived from observed p99 run duration rather than a guessed constant |
-| Scope | This repo's own `ingestion_metadata` only | A real platform often centralizes checkpoint/run-state across many pipelines in one place (e.g. Airflow's own metadata database, or a dedicated observability platform) rather than one table per pipeline |
-
-### Principal Data Engineer Perspective
-
-The judgment call worth being able to defend here is naming the exact
-condition under which the chosen detection mechanism gives a wrong answer
-— not claiming it never does. Section 16.7's false-positive scenario is
-the single most likely way this exact code, deployed as-is, would produce
-a bad on-call experience in a real environment; a principal engineer
-ships the elapsed-time threshold (it's the right choice for this project's
-current scale, per 16.3's trade-off table) *and* writes down, in the same
-breath, what would have to be true for it to misfire and what the fix
-would look like when that day comes (a heartbeat, or at minimum a
-per-pipeline threshold instead of one global default). The second thing
-worth flagging: this is a genuinely small function — one query, no new
-infrastructure — precisely because the checkpoint mechanism it builds on
-(`start_run`/`finish_run_success`/`finish_run_failure`) was already
-correct from Section 14 onward. Closing an operational gap ("no
-stale-run alerting") cheaply, by adding a query over data that was already
-being durably recorded for other reasons, rather than by retrofitting new
-instrumentation everywhere, is exactly the payoff of building the
-metadata layer correctly and completely on day one (Section 13.3's stated
-reasoning) instead of adding fields to it piecemeal as each new need
-arises.
-
-### 16.9 Principal Engineer Interview Questions
-
-**Q: "Your staleness check uses a fixed time threshold. What's the
-specific failure mode of that approach, and how would you detect it in
-production before it causes a false alert?"**
-
-*What's tested:* whether the candidate can reason about a monitoring
-mechanism's own failure modes, not just describe what it detects when
-working correctly.
-
-*What a weak answer looks like:* "It might not be perfectly accurate" —
-true but not specific enough to show real understanding.
-
-*What a strong answer covers:* a threshold-based check cannot distinguish
-a genuinely slow-but-healthy run from a crashed one — if the threshold is
-set below the pipeline's actual worst-case legitimate duration, every
-sufficiently slow run gets misreported as stale. Detecting this in
-production: track actual run durations for `status='success'` rows over
-time (this repo's `ingestion_metadata` already has `started_at` and
-`completed_at` for exactly this), alert if the threshold is within some
-margin of the observed p99, and prefer a heartbeat mechanism once a
-pipeline's duration variance gets large enough that no single fixed
-threshold cleanly separates "slow" from "crashed."
-
-*Concepts:* liveness detection, false positives vs. false negatives in
-monitoring, threshold tuning from observed data rather than a guess.
-
-*Expected follow-up:* "Why not just use a heartbeat from the start?" —
-Because it's real added complexity (every long-running process needs to
-write its own liveness signal) that this project's current scale doesn't
-yet justify; see 16.3's full trade-off reasoning.
-
-*Common mistake:* answering only "make the threshold bigger" without
-naming the corresponding cost (slower detection of a genuinely crashed
-run) — treating this as a knob with no trade-off, rather than a real
-one.
-
-**Q: "Why is the checkpoint row written *before* extraction starts,
-rather than only once at the end with the final status?"**
-
-*What's tested:* whether the candidate understands what a checkpoint
-mechanism is actually for — specifically, why "was this ever attempted"
-needs to be observable independently of "did it succeed."
-
-*What a weak answer looks like:* "So you can log that it started" — not
-wrong, but misses the actual point.
-
-*What a strong answer covers:* if the row were only written at the end, a
-process crashing mid-run would leave **no record at all** that anything
-was attempted — not even a `'failed'` row, since nothing survives to write
-one. Writing `status='running'` before any real work begins turns "no
-information" into "a fact, even in the crash case": a row that never
-transitions out of `'running'` *is itself* the evidence of a crash. This
-is precisely what makes `find_stale_running_runs` possible at all — it has
-nothing to query if the checkpoint's initial write never happened.
-
-*Concepts:* observability of failure, not just success; the specific
-value of writing intent durably before doing risky work.
-
-*Expected follow-up:* "What if the `start_run` INSERT itself fails or the
-process crashes between opening a connection and committing it?" — Then
-there's genuinely no record, which is an acceptable, narrower gap than the
-one this design closes: it requires the crash to happen in a much smaller
-window (before a single `INSERT` commits) than "anywhere during the
-entire extraction and write").
-
-*Common mistake:* conflating "the checkpoint mechanism" with "logging" —
-a log line printed at the start of a run is not durable evidence the same
-way a committed database row is; a log line and its process can both
-disappear together in a real crash.
-
----
+A checkpoint answers "did this finish?" durably, independent of whether the process that ran it still exists to explain itself.
+Write the running row before doing the work, update it only on definite success or failure — that ordering is what makes a stuck row a fact, not a guess.
+An elapsed-time threshold is cheap and sufficient at small scale, but it's a guess: it will misclassify a slow-but-healthy run as stale if the threshold isn't tuned above your actual p99 duration.
+Closing an operational gap by querying data you're already durably recording (because the metadata table was designed completely up front) is cheaper than retrofitting new instrumentation later — this section cost one function precisely because Section 14 built the table right the first time.
 
 ## 17. Idempotency ✅✅
 
-### 17.1 Concept
+### 1. CONCEPT
 
-An operation is **idempotent** if running it more than once, with the same
-inputs, produces the same result as running it exactly once — no
-duplicates, no double-counting, nothing left in a different state than a
-single successful run would have left it in. Sections 14 and 15 already
-built this: `build_bronze_key`/`build_bronze_incremental_key` compute a
-*deterministic* Bronze object key from a run's own inputs, so a rerun
-overwrites the same object rather than writing a new one. This section is
-the dedicated treatment of what idempotency is actually protecting against
-and, critically, two things it does *not* automatically guarantee on its
-own: (1) that the control plane's own record of what was written
-(`ingestion_metadata`) stays in sync with what's actually in Bronze, and
-(2) full coverage of every retry scenario — Section 15.7 already documents
-one residual edge case where idempotency's guarantee narrows. This
-section adds the `bronze_key` column and `reconciliation.py`, which
-together close the "does the record match reality" half of the gap.
+An operation is idempotent if running it more than once, with the same inputs, leaves things in exactly the same state as running it once. You already have this: build_bronze_key/build_bronze_incremental_key are deterministic, so a retry's put_object overwrites cleanly instead of duplicating. That's the "writes are safe to retry" half.
 
-### Why does this exist?
+What's new: idempotent writes alone don't guarantee the system as a whole never drifts. A manually uploaded object, an object deleted by something outside the pipeline, or a retried run whose key genuinely doesn't collide with the original (a real residual edge case from Section 15.7) — none of these are caught by "the write itself is safe to repeat." You need a separate check that compares what the control plane (ingestion_metadata) believes it wrote against what's actually sitting in the bucket. That check is reconciliation, and it's the actual new content in this concept.
 
-Retries are unavoidable in any real pipeline — a network blip, a
-transient MinIO error, an orchestrator retrying a failed task
-automatically. Without idempotency, every retry risks corrupting the
-result it's supposed to be fixing: a non-idempotent write on retry either
-duplicates data (two Bronze objects for what should be one run's output)
-or, worse, silently does the wrong thing depending on what state the
-first, failed attempt left behind. Idempotency turns "is it safe to just
-retry this?" from a case-by-case judgment call into a property that's true
-by construction, for every retry, without an operator needing to reason
-about exactly where the previous attempt failed.
+### 2. URL SHORTENER EXAMPLE
 
-But idempotent *writes* alone don't guarantee the *system as a whole*
-never drifts — a manually uploaded object, a retried run that (per Section
-15.7) lands a non-overlapping duplicate, or an object deleted by something
-outside this pipeline entirely, can each cause `ingestion_metadata` and
-the real contents of the Bronze bucket to disagree with each other, even
-though every individual write was idempotent. Reconciliation — this
-section's second new piece — is the check that catches *that* kind of
-drift, which idempotent writes alone were never designed to catch.
+build_bronze_key("clicks", run_date) returns the same string every time today — you've already verified this by hand. What you haven't seen: since this increment, finish_run_success also records that exact key on the ingestion_metadata row itself (bronze_key column). So the control plane doesn't just idempotently write the object — it durably remembers what it wrote. That memory is the input reconciliation needs.
 
-### Simple Example (generic, pre-URL-Shortener)
+### 3. DESIGN
 
-A generic "safe retry" example: an API endpoint that creates an order.
-`POST /orders` with no idempotency key: retrying a request that actually
-succeeded, but whose response was lost to a network error, creates a
-*second* order — a real, costly bug (the customer gets charged twice).
-The fix: the client sends a client-generated `idempotency_key` with every
-request; the server checks "have I already processed this exact key?"
-before creating anything, and if so, returns the *original* result instead
-of creating a duplicate. The deterministic Bronze key in this repo plays
-exactly the `idempotency_key`'s role — except here, the key is derived
-from the request's own content (`table_name`, date or watermark range)
-rather than being a separately generated token, because this pipeline's
-retries are always exact reruns of the same logical unit of work, not
-independent client requests that happen to repeat.
+Two independent mechanisms, checked at different times, for different failure classes:
 
-### URL Shortener Example
+Idempotent writes (already built) — make a single run's own retry safe.
+Reconciliation (new) — detects drift from anything else: a manual upload, an out-of-band deletion, a non-overlapping duplicate from a retry.
 
-`build_bronze_key("clicks", run_date)` returns
-`bronze/clicks/ingestion_date=2026-09-19/clicks.parquet` — the exact same
-string no matter how many times `make ingest-full` runs today. A retry
-after a transient MinIO error, or a deliberate manual rerun, calls
-`put_object` with that same key again; S3-compatible object storage
-treats a `PUT` to an existing key as a plain overwrite, so the *object
-itself* is exactly as if only the last successful write had ever
-happened. What's new in *this* section: since this increment,
-`finish_run_success` also records that exact key on the `ingestion_metadata`
-row (`bronze_key` column, `sql/source/003_ingestion_metadata.sql`) — so
-the control plane doesn't just idempotently *write* the object, it also
-durably *remembers* what it wrote, which is the piece reconciliation
-depends on.
+reconcile_bronze(engine, s3_client, bucket, pipeline_name) does two set comparisons:
 
-### 17.2 Architecture
+list_bronze_keys (what's really in the bucket) minus list_successful_bronze_keys (what ingestion_metadata says was written) = orphaned — data nobody accounted for.
+list_successful_bronze_keys minus what actually head_objects successfully = missing — a promise that wasn't kept.
 
-```
- run_full_load() / run_incremental_load()
-        │
-        ├─▶ key = build_bronze_key(...) / build_bronze_incremental_key(...)
-        │        (deterministic -- same inputs, same key, every time)
-        │
-        ├─▶ s3_client.put_object(Key=key, ...)     ──▶  Bronze (MinIO/S3)
-        │        (overwrite-safe: a retry with the same key clobbers
-        │         cleanly instead of duplicating)
-        │
-        └─▶ metadata.finish_run_success(..., bronze_key=key)
-                 (NEW this increment -- durably records the key on the
-                  ingestion_metadata row itself, not just written to
-                  Bronze and then "trusted" to have happened)
+Key decision: store bronze_key explicitly on the row, don't recompute it later. The alternative — recompute the expected key on demand from source_table/started_at/watermarks, reusing build_bronze_key — needs no new column and looks cheaper. It breaks the moment the key-building logic itself ever changes (a different date format, say): every historical row would silently get the wrong expected key computed for it, and reconciliation would report false drift for data that's actually fine. Storing the key explicitly means "what actually happened" is what gets compared, always — a strictly more robust invariant for one new nullable column's cost. Nullable specifically because a no-op incremental run (Section 15's empty-batch case) succeeds but writes nothing — bronze_key is NULL for that row, and list_successful_bronze_keys filters WHERE bronze_key IS NOT NULL so a legitimate no-op is never mistaken for "should exist but doesn't."
 
- reconciliation.reconcile_bronze(engine, s3_client, bucket, pipeline_name)
-        │
-        ├─▶ actual  = object_store.list_bronze_keys(s3_client, bucket)
-        │              (what's REALLY in the bucket right now)
-        │
-        ├─▶ known   = metadata.list_successful_bronze_keys(engine, ...)
-        │              (what ingestion_metadata BELIEVES was written)
-        │
-        ├─▶ orphaned = actual - known   (exists, nobody recorded writing it)
-        └─▶ missing  = known - actual   (recorded as written, doesn't exist)
-```
+### 4. IMPLEMENTATION
 
-Idempotent writes (the top block) and reconciliation (the bottom block)
-are deliberately separate mechanisms, checked at different times, for
-different failure classes: the top block makes a *single run's own retry*
-safe; the bottom block detects drift that accumulates from *anything
-else* — a manual object upload, an out-of-band deletion, or the Section
-15.7 edge case where two runs' outputs legitimately don't collide but one
-of them still didn't get recorded correctly.
-
-### 17.3 Design Decision: store the Bronze key explicitly, don't recompute it
-
-**Context:** reconciliation needs to know, for every successful run, what
-key it wrote to Bronze — but `ingestion_metadata` never stored this before
-this increment. **Decision:** add a `bronze_key` column, set explicitly by
-`finish_run_success(..., bronze_key=key)` at the moment a run succeeds.
-**Alternatives considered:** recompute the expected key later, on demand,
-from `source_table`, `started_at` (for a full load — reusing
-`build_bronze_key`'s date-only granularity) and `watermark_start`/
-`watermark_end` (for an incremental load — reusing
-`build_bronze_incremental_key`). **Trade-offs:** recomputation needs no
-new column and would work *today* — but it depends on the exact key-building
-logic never changing behavior for historical rows (`build_bronze_key`
-already changing its date-formatting convention, for instance, would
-silently break reconciliation for every run recorded before the change),
-and would additionally require persisting `watermark_start` too, which
-`ingestion_metadata` also didn't store *at the time this decision was
-made* — so "cheaper, no new column" wasn't actually true once traced
-through fully. (`watermark_start` has since been fixed to persist
-correctly, as of Section 22 — but that came two increments later, and
-doesn't retroactively change which trade-off was correct to make *here*,
-at the time this decision was recorded.) Storing the key explicitly
-instead means "what actually
-happened" is what's compared, always, regardless of how the key-building
-functions evolve later — a strictly more robust invariant, at the cost of
-one new nullable column. **Consequences:** `bronze_key` is `NULL` for a
-run that succeeded but wrote nothing (the no-op incremental path — see
-Section 15's empty-batch handling) — `list_successful_bronze_keys`
-explicitly filters `WHERE bronze_key IS NOT NULL`, so a no-op success is
-correctly never treated as "should exist in Bronze but doesn't."
-
-### Alternatives
-
-Covered above. A third, more minor alternative also considered and
-rejected: making `bronze_key` a required (`NOT NULL`) column with a
-sentinel value for no-op runs, instead of a genuinely nullable one —
-rejected because a sentinel string is a magic value a future reader has to
-learn the meaning of, where SQL `NULL` already means exactly "no value" by
-construction, and `list_successful_bronze_keys`'s `IS NOT NULL` filter
-reads as self-explanatory.
-
-### Trade-offs
-
-| | Store explicitly (chosen) | Recompute on demand |
-|---|---|---|
-| Correctness if key-building logic changes later | Unaffected — every row remembers its own actual key | Silently wrong for every historical row once the logic changes |
-| Schema cost | One new nullable column | None |
-| Needs `watermark_start` persisted too | No | Yes, for incremental runs (also not previously stored) |
-| Conceptual model | "What actually happened" | "What should have happened, assuming today's logic always applied" |
-
-### 17.4 Implementation
-
----
-
-**CREATE:** (edit) `sql/source/003_ingestion_metadata.sql`,
-`ingestion/src/url_shortener_analytics/metadata.py` — `bronze_key` column
-and its plumbing
-
-**PURPOSE:** Durably record the exact object key a successful run wrote,
-so reconciliation has a real, per-run source of truth to compare storage
-against.
-
-**DEPENDENCIES:** none new.
-
-**IMPLEMENTATION GUIDE (write it yourself):** add `bronze_key VARCHAR(512)`
-to `ingestion_metadata`'s `CREATE TABLE` — and, since this table may
-already exist in a running dev database from an earlier increment (this
-sandbox's own local Postgres included), also add an idempotent-safe
-`ALTER TABLE ingestion_metadata ADD COLUMN IF NOT EXISTS bronze_key
-VARCHAR(512);` right after it (a fresh `docker compose up` picks up the
-`CREATE TABLE` version automatically; an already-running database needs
-the `ALTER TABLE` instead, since `docker-entrypoint-initdb.d` scripts only
-ever run once, on first container init). Then thread a new optional
-`bronze_key: str | None = None` keyword argument through
-`finish_run_success`, add it to the `UPDATE ... SET` statement, and update
-both `run_full_load` and `run_incremental_load`'s *successful, non-empty*
-call sites to pass `bronze_key=key`. Leave the no-op incremental path's
-call (`rows_read=0, rows_written=0`) unchanged — it must default to
-`None`, since nothing was written.
-
-**REFERENCE IMPLEMENTATION:**
+New file, real and already in your repo:
 
 ```python
-# ingestion/src/url_shortener_analytics/metadata.py (excerpt)
-
-def finish_run_success(
-    engine: Engine, run_id: str, *, rows_read: int, rows_written: int,
-    watermark_end: int | None = None, bronze_key: str | None = None,
-) -> None:
-    with engine.begin() as conn:
-        conn.execute(text("""
-            UPDATE ingestion_metadata
-            SET status = 'success', rows_read = :rows_read, rows_written = :rows_written,
-                watermark_end = :watermark_end, bronze_key = :bronze_key, completed_at = :completed_at
-            WHERE run_id = :run_id
-        """), {"run_id": run_id, "rows_read": rows_read, "rows_written": rows_written,
-                "watermark_end": watermark_end, "bronze_key": bronze_key,
-                "completed_at": datetime.now(UTC)})
-```
-
-```sql
--- sql/source/003_ingestion_metadata.sql (excerpt)
-ALTER TABLE ingestion_metadata ADD COLUMN IF NOT EXISTS bronze_key VARCHAR(512);
-```
-
-Full files: [`metadata.py`](../ingestion/src/url_shortener_analytics/metadata.py),
-[`003_ingestion_metadata.sql`](../sql/source/003_ingestion_metadata.sql),
-[`extract_full.py`](../ingestion/src/url_shortener_analytics/extract_full.py),
-[`extract_incremental.py`](../ingestion/src/url_shortener_analytics/extract_incremental.py).
-
-**RUN:** `make ingest-full` or `make ingest`, then inspect the row it
-created.
-
-**VERIFY:** `psql "$DATABASE_URL" -c "SELECT source_table, status,
-bronze_key FROM ingestion_metadata ORDER BY started_at DESC LIMIT 5;"`
-
-**EXPECTED:** every `status='success'` row for a *non-empty* run has a
-non-`NULL` `bronze_key` matching the object actually written; a no-op
-incremental success has `bronze_key IS NULL`.
-
-**TEST:** `test_metadata.py` (bronze-key persistence and its `NULL`
-default), `test_extract_full.py`/`test_extract_incremental.py` (bronze-key
-recorded end-to-end, including staying `NULL` on the no-op path).
-
----
-
-**CREATE:** (edit) `ingestion/src/url_shortener_analytics/object_store.py`
-— `list_bronze_keys`
-
-**PURPOSE:** The object store's own, independent view of what actually
-exists — the other half of what reconciliation compares.
-
-**IMPLEMENTATION GUIDE (write it yourself):** one call to
-`s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)`, returning
-`[obj["Key"] for obj in response.get("Contents", [])]` — use `.get(...,
-[])` rather than indexing `["Contents"]` directly, since an empty
-prefix/bucket omits the `"Contents"` key from the response entirely rather
-than returning it as an empty list.
-
-**REFERENCE IMPLEMENTATION:**
-
-```python
-# ingestion/src/url_shortener_analytics/object_store.py (excerpt)
-
-def list_bronze_keys(s3_client: BaseClient, bucket: str, prefix: str = "bronze/") -> list[str]:
-    """POC SIMPLIFICATION: a single list_objects_v2 call, capped at 1,000
-    keys (S3's per-call limit) -- no pagination. Production equivalent:
-    paginate with s3_client.get_paginator("list_objects_v2")."""
-    response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
-    return [obj["Key"] for obj in response.get("Contents", [])]
-```
-
-**TEST:** `test_object_store.py` — two new tests (keys returned correctly;
-empty-prefix case returns `[]` rather than raising a `KeyError`).
-
----
-
-**CREATE:** `ingestion/src/url_shortener_analytics/reconciliation.py`
-
-**PURPOSE:** Compare `ingestion_metadata`'s record of what this pipeline
-wrote against what actually exists in Bronze, surfacing exactly two kinds
-of drift.
-
-**DEPENDENCIES:** `metadata.list_successful_bronze_keys`,
-`object_store.list_bronze_keys`/`head_object`.
-
-**IMPLEMENTATION GUIDE (write it yourself):** two set-difference functions
-and one that combines them. `find_orphaned_bronze_objects`: `actual =
-set(list_bronze_keys(...))`, `known =
-set(metadata.list_successful_bronze_keys(...))`, return `sorted(actual -
-known)` — objects storage has that no successful run claims to have
-written. `find_missing_bronze_objects`: for every key
-`list_successful_bronze_keys` returns, call `head_object` and keep the
-ones where it returns `None` — keys the database believes exist but
-storage doesn't have. `reconcile_bronze`: call both, return them together
-in a small result object with a `clean` property (`True` only when both
-lists are empty). Resist the urge to make this one function that also
-*fixes* the drift it finds — detecting drift and deciding how to remediate
-it are different responsibilities; see Section 17.6's Failure Scenario for
-why automatic remediation here would be actively dangerous.
-
-**REFERENCE IMPLEMENTATION:**
-
-```python
-# ingestion/src/url_shortener_analytics/reconciliation.py (excerpt)
+# ingestion/src/url_shortener_analytics/reconciliation.py
 
 @dataclass
 class ReconciliationResult:
@@ -4596,220 +3132,41 @@ def reconcile_bronze(engine, s3_client, bucket, pipeline_name=None) -> Reconcili
         missing_objects=find_missing_bronze_objects(engine, s3_client, bucket, pipeline_name),
     )
 ```
+Wired into cli.py's reconcile-bronze command — exits 1 unless result.clean.
 
-Full file: [`reconciliation.py`](../ingestion/src/url_shortener_analytics/reconciliation.py).
+### 5. CODE WALKTHROUGH
 
-**TEST:** new `test_reconciliation.py` — nine tests: the result object's
-`clean` property in both states, orphan detection, missing detection, and
-`reconcile_bronze` combining both, all against a mocked S3 client and the
-`sqlite_engine` fixture.
+find_missing_bronze_objects reuses head_object (which you already read in object_store.py) rather than a bulk listing — it's a targeted existence check per known key, not "list everything and diff," because the question here is specifically "does this key I believe I wrote still exist," not "what's in the bucket generally" (that's find_orphaned_bronze_objects's job, which does need the bulk listing).
 
----
+Both functions are plain set arithmetic once you have the two lists — the actual engineering decision already happened, back in Section 17.3, in how known_keys gets populated (stored, not recomputed). The functions themselves are almost trivially simple, which is the intended shape: a small, cheap check built on top of data that was already being durably recorded for other reasons.
 
-**CREATE:** (edit) `ingestion/src/url_shortener_analytics/cli.py` —
-`reconcile_bronze_command` / `reconcile-bronze` subcommand
+### 6. RUN
 
-**PURPOSE:** Make reconciliation something an operator (or a scheduled
-job) can actually invoke.
+bash
+python -m url_shortener_analytics.cli reconcile-bronze
 
-**REFERENCE IMPLEMENTATION:**
+Clean state: "bronze reconciliation clean", exit 0. To manufacture drift, delete a real object directly from MinIO (or upload a stray one under bronze/) without going through the pipeline, then rerun — expect one "missing bronze object" (or "orphaned bronze object") warning line per drifted key, and exit 1.
 
-```python
-# ingestion/src/url_shortener_analytics/cli.py (excerpt)
+### 7. EXPERIMENT
 
-def reconcile_bronze_command(config_path: Path = DEFAULT_PIPELINE_CONFIG) -> int:
-    settings = get_settings()
-    configure_logging(settings.log_level)
-    config = _load_pipeline_config(config_path)
-    engine = engine_from_settings(settings)
-    s3_client = get_s3_client(settings)
+Think through this before running it: if you manually DELETE FROM ingestion_metadata WHERE run_id = '<some real successful clicks run>' — removing the row entirely, not just its bronze_key — what does reconciliation report? Walk it through: list_successful_bronze_keys no longer includes that key (the row is gone), but the real Parquet object is still sitting in MinIO. That object now shows up in actual_keys - known_keys — orphaned, even though nothing is actually wrong with the data itself. This is worth sitting with: reconciliation compares the record against reality, not "reality" against some independent ground truth — deleting the record itself, not the object, is enough to trigger a false-positive-looking orphan. It's not a bug in reconciliation; it's exactly what "the control plane's memory and the storage layer disagree" means, correctly detected, just triggered by an unusual cause (someone tampering with the metadata table itself, rather than the storage).
 
-    result = reconcile_bronze(engine, s3_client, settings.minio_bucket, config["pipeline_name"])
-    for key in result.orphaned_objects:
-        logger.warning("orphaned bronze object", extra={"key": key})
-    for key in result.missing_objects:
-        logger.warning("missing bronze object", extra={"key": key})
-    if not result.clean:
-        logger.error("bronze reconciliation found drift",
-                      extra={"orphaned": len(result.orphaned_objects), "missing": len(result.missing_objects)})
-        return 1
-    logger.info("bronze reconciliation clean")
-    return 0
-```
+### 8. PRODUCTION VIEW
 
-**RUN:** `make reconcile-bronze`
+Right now reconciliation is a manual, on-demand CLI invocation — nobody's watching for drift unless someone runs reconcile-bronze and reads the output. Production wires this into a scheduled check (nightly, say) with alerting on result.clean == False. At real scale, list_bronze_keys's single list_objects_v2 call (capped at 1,000 keys, no pagination — you already saw this POC simplification in object_store.py) stops being sufficient the moment a table's object count grows past that cap; production needs the paginator. Also worth naming: reconciliation only proves drift exists — it doesn't auto-fix anything. A missing object still needs a human (or an automated backfill trigger) to decide whether to re-run that historical load or accept the gap.
 
-**VERIFY:** manually upload a stray object to the bucket (`aws --endpoint
-... s3 cp` or the MinIO console) or delete one that `ingestion_metadata`
-recorded, then rerun `make reconcile-bronze`.
+### 9. PRINCIPAL ENGINEER VIEW
 
-**EXPECTED:** a stray, unrecorded object is reported under "orphaned
-bronze object"; a recorded-but-deleted object under "missing bronze
-object"; exit code 1 in either case, 0 when clean.
+The distinction between "this write is idempotent" and "this system never drifts" is a genuinely underappreciated one, and it's a strong thing to say clearly in an interview: idempotency is a local property of one operation retried in isolation; reconciliation is a global property of two independently-maintained sources of truth staying in agreement over time, under influences the idempotent operation itself has no control over (manual intervention, external deletion, partial failures that land in non-overlapping states). Conflating the two — believing "my writes are idempotent, therefore my system can't drift" — is exactly the kind of gap that looks fine in a demo and quietly rots in production.
 
-**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections
-17.7/17.9.
+The bronze_key-storage decision is also a clean example of a recurring principle: prefer storing "what actually happened" over recomputing "what should have happened, assuming today's logic always applied." The second option is always tempting because it needs no schema change — and it's exactly the option that silently breaks the moment your own logic evolves.
 
----
+### 10. REMEMBER
 
-### Hands-on Challenge (implement-yourself)
-
-Before LAB 13 below, try this without looking at `reconciliation.py`:
-using only `psql` and the MinIO console (or `aws s3 --endpoint-url ...
-ls`), *manually* find every orphaned and missing Bronze object for one
-table, by eye, comparing `SELECT bronze_key FROM ingestion_metadata WHERE
-status='success'` against the bucket listing. Time yourself. Then run
-`make reconcile-bronze` and compare. The point isn't that the manual
-version is hard for a handful of objects — it's that this exact by-hand
-comparison is what an operator would otherwise have to do, repeatedly,
-forever, without this section's code; automating a genuinely tedious,
-error-prone manual check is most of this feature's actual value.
-
-### 17.5 Hands-on Exercise
-
-**LAB 13 — Manufacture drift and detect it with `reconcile-bronze`.**
-
-Prerequisites: real MinIO reachable (`make up`), since this lab needs a
-real bucket to manually tamper with — this specific lab was **not**
-runnable in this sandbox (no MinIO here; see 17.6 below for what *was*
-genuinely verified instead).
-
-```bash
-make ingest-full                     # produces known, recorded Bronze objects
-make reconcile-bronze                # step 1: confirm clean -- exit 0
-
-# Manufacture an ORPHAN: upload a stray object nothing recorded
-aws --endpoint-url http://localhost:9000 s3 cp \
-  some_local_file.parquet s3://analytics-lake/bronze/clicks/manual-upload.parquet
-
-make reconcile-bronze                # step 2: reports the orphan, exit 1
-
-# Manufacture a MISSING object: delete a key ingestion_metadata still
-# believes exists
-aws --endpoint-url http://localhost:9000 s3 rm \
-  s3://analytics-lake/bronze/urls/ingestion_date=2026-09-19/urls.parquet
-
-make reconcile-bronze                # step 3: reports the orphan AND the
-                                      # missing object together, exit 1
-```
-
-*(DESIGN EXPECTATION for LAB 13's exact commands and output — run it
-yourself with real MinIO; see Section 17.6 for what this guide verified
-directly instead, against the underlying functions with a mocked S3
-client and real Postgres.)*
-
-### 17.6 How to test
-
-```bash
-make test                # unit: SQLite + mocked S3, no Docker needed
-```
-
-The full unit suite — 59 tests, genuinely run in this environment
-(`PYTHONPATH=ingestion/src python3 -m pytest ingestion/tests/unit -q`) —
-passed. ACTUAL OBSERVED:
-
-```
-59 passed in 6.96s
-```
-
-`test_reconciliation.py` specifically exercises `find_orphaned_bronze_objects`,
-`find_missing_bronze_objects`, and `reconcile_bronze` against a mocked S3
-client (scripted `list_objects_v2`/`head_object` responses) and the real
-`sqlite_engine` fixture — genuinely running the real reconciliation logic,
-just against a fake object store rather than real MinIO.
-
-`ruff check ingestion/` was also run against every file touched this
-increment (`metadata.py`, `object_store.py`, `reconciliation.py`,
-`cli.py`, plus every edited test file) and passed cleanly — ACTUAL
-OBSERVED: `All checks passed!`
-
-**What this sandbox could NOT verify (no MinIO/Docker here):** LAB 13's
-full end-to-end scenario against a real bucket. What it genuinely could,
-and did, verify against real infrastructure instead: `bronze_key`
-persistence and `find_stale_running_runs`/`list_successful_bronze_keys`
-against this sandbox's real, locally installed Postgres 16 (Section 16.6)
-— including applying the new `ALTER TABLE ... ADD COLUMN IF NOT EXISTS
-bronze_key` statement to that already-running database and confirming the
-column appears via `\d ingestion_metadata`. The S3-touching half of this
-section's code (`list_bronze_keys`, `head_object`, and therefore
-`reconciliation.py`'s two find-functions) is covered by genuine unit tests
-against a mocked `boto3` client, but has never executed against a real S3-
-compatible endpoint in this environment — that remains a DESIGN
-EXPECTATION, same as every other MinIO-touching path in this guide (Section
-14.6, 15.6's equivalent notes).
-
-### 17.7 Failure Scenario
-
-**What happens if `reconcile-bronze` finds an orphaned object — should it
-just delete it automatically?**
-
-This is worth answering explicitly rather than leaving implicit, because
-"automatically clean up what it finds" is the natural next feature to want
-— and it's the wrong default. An orphaned object (exists in storage, no
-successful run recorded writing it) has more than one honest
-explanation: it could genuinely be leftover garbage (a failed run's
-partial write that somehow still landed, or a stray manual upload) — safe
-to delete. But it could just as easily be a **legitimate** write this
-guide's own `ingestion_metadata` simply doesn't know about yet — a
-concurrent run still in flight whose `finish_run_success` hasn't committed
-yet at the exact moment `reconcile-bronze` ran, or (closer to home) exactly
-the Section 15.7 residual edge case: a retried incremental run that landed
-a second, non-overlapping-but-superset object, which is redundant but
-still contains real, correct data. Auto-deleting on the second case would
-be a genuine, silent data-loss bug introduced by a "cleanup" feature. This
-is why `reconcile_bronze` deliberately **only detects and reports** —
-remediation is left as a human decision, consistent with this repo's
-broader "don't overstate the guarantee" posture (Section 15.7's own
-honesty about its residual gap; ADR-007's stance on never deleting Bronze
-data automatically).
-
-**What about a missing object — is that recoverable?** Not by this
-pipeline alone: a `bronze_key` recorded as successfully written but no
-longer present in storage means the *only* record of that data was the
-object itself (Bronze's row-level content isn't duplicated anywhere else
-in this repo's Phase 1 design). Recovery means re-running the original
-extraction against OLTP — which is possible only if the source data still
-exists there unchanged, and re-derives the *current* state of the source
-table, not necessarily bit-for-bit what was originally captured if OLTP
-has since changed. This is exactly why ADR-007 treats Bronze as
-effectively the system of record for historical raw data, and why a real
-production deployment (Section 17.8, below) needs a retention/backup
-story for the bucket itself, not just for `ingestion_metadata`.
-
-### 17.8 Production Considerations
-
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Reconciliation cadence | Manual (`make reconcile-bronze`) | Scheduled (daily/hourly cron or orchestrator step), with the same non-zero-exit-code alerting pattern as `check-stale-runs` |
-| Remediation | None — detection only, by design (see 17.7) | A documented runbook per drift type; orphan cleanup requires explicit human sign-off, missing-object recovery triggers a backfill/re-extraction workflow |
-| Listing scale | `list_bronze_keys`: single `list_objects_v2` call, capped at 1,000 keys | Paginated listing (`get_paginator`) once any table's object count could plausibly exceed 1,000 |
-| Bucket durability | MinIO's own default settings, no explicit backup/versioning configured | S3 versioning and/or cross-region replication, so a missing-object drift is itself often preventable rather than only detectable after the fact |
-| Coverage | Bronze layer only | A mature platform reconciles at every layer (Bronze, Silver, Gold — Phase 2+), not just the ingestion boundary |
-
-### Principal Data Engineer Perspective
-
-The judgment call worth defending here is resisting the tempting shortcut
-of building reconciliation *and* auto-remediation as one feature. It would
-have been less code, in the moment, to have `reconcile_bronze` just delete
-every orphan it finds — and it would have been a real, if rare, latent
-data-loss bug, for exactly the reason named in Section 17.7 (a legitimate,
-recently-completed write that simply hasn't landed in `ingestion_metadata`
-yet, or Section 15.7's documented redundant-but-correct duplicate). A
-principal engineer separates "detect and report" from "decide what to do
-about it" as a matter of course when the two have meaningfully different
-risk profiles — not because remediation could never be automated safely,
-but because automating it safely requires more context (how fresh is
-"fresh enough to not be a false orphan," what's this specific object's
-provenance) than a reconciliation pass alone has available. The second
-thing worth flagging: this section's two new pieces — a persisted
-`bronze_key` and a reconciliation job — exist specifically because Section
-15.8's Production Considerations table already named "a periodic
-reconciliation job comparing `ingestion_metadata` against actual Bronze
-object listings" as a gap, two increments ago. Treating a documented gap
-in an earlier section as a concrete backlog item, and coming back to close
-it explicitly rather than letting it quietly age out of the guide, is
-itself a habit worth calling out — it's the same discipline a real
-platform team applies to its own tech-debt tracking.
+Idempotent write = safe to retry this one operation. It says nothing about whether the rest of the system stays in sync.
+Reconciliation compares two independently-maintained records of truth (the metadata table, the actual bucket contents) and reports where they disagree — it doesn't fix anything by itself.
+Store what actually happened (bronze_key on the row) rather than recomputing it later from logic that might change — recomputation quietly breaks every historical row the moment the key-building function's behavior changes.
+NULL for "nothing was written" beats a sentinel value — let SQL's own "no value" do the work instead of inventing a magic string someone has to learn.
 
 ### 17.9 Principal Engineer Interview Questions
 
@@ -4992,213 +3349,231 @@ flat key space, not a directory walk.
      (flat key space -- the tree above is a READING convenience,
       not a real filesystem MinIO maintains)
 ```
+### 1. CONCEPT
+First, what problem are we even solving?
 
-Disabling boto3's own retry logic (`retries={"max_attempts": 0}`) is worth
-calling out explicitly: `_put_parquet_with_retry` (Section 14.4) already
-implements a retry loop with its own backoff. Leaving boto3's built-in
-retrying *also* enabled would mean a transient error gets retried by two
-independent layers stacked on top of each other, with two different
-backoff schedules — harder to reason about and to tune, for no real
-benefit. One retry policy, owned by this codebase and fully visible in
-Section 14.4's code, beats two overlapping ones.
+Every computer program needs somewhere to put data so it survives after the program stops running. You already know two ways to do this.
 
-### 18.3 Design Decision: one bucket, prefix-separated layers
+The first way is a file on a hard disk. You've used this your whole life. open("notes.txt", "w"), write some text, close the file. The operating system keeps track of where that file lives, inside folders, inside other folders.
 
-**Context:** Bronze exists today; Silver and Gold (Phase 2+) will need
-somewhere to land too, and that somewhere needs deciding now, since it
-shapes key-naming conventions everywhere in this codebase.
-**Decision:** one bucket, `analytics-lake`, with each layer as a top-level
-key prefix (`bronze/`, and later `silver/`, `gold/`) — not a separate
-bucket per layer. **Alternatives considered:** a bucket per layer
-(`analytics-lake-bronze`, `analytics-lake-silver`, `analytics-lake-gold`);
-a bucket per table. **Trade-offs:** separate buckets give cleaner
-per-layer IAM policies in a real AWS deployment (a bucket policy is a
-natural unit of access control — "Bronze readers can't touch Gold") and
-make a full-bucket lifecycle policy trivial to scope per layer. A single
-bucket with prefixes is simpler to provision (one `mc mb` command, one
-thing to create and tear down locally) and keeps `MINIO_BUCKET`, this
-repo's one piece of bucket-related configuration, a single value instead
-of three — the right trade for a Phase 1 POC's actual operational
-complexity, at the cost of that per-layer access-control convenience.
-**Consequences:** `MINIO_BUCKET`/`settings.minio_bucket` stays a single
-config value through Phase 2's Silver/Gold work; if a future need for
-per-layer IAM boundaries becomes real, migrating from prefixes to
-separate buckets is a genuine, non-trivial data-movement exercise (every
-existing key would need to move, not just be renamed) — worth knowing
-upfront rather than discovering only once Phase 2 is already underway.
+The second way is a database, like Postgres, which you've already used a lot in this project. A database stores structured rows and lets you update one field of one row without touching anything else.
 
-### Alternatives
+Object storage is a third way. It's neither a filesystem nor a database. It's a much simpler idea: a giant warehouse of numbered boxes, where each box holds one blob of data, and you can only ever put a box in or take a box out whole. You can't reach into a box and change one item inside it.
 
-Covered above. A third, more minor alternative also considered: prefixing
-by *table* instead of by *layer* at the top level
-(`urls/bronze/...`, `clicks/bronze/...`) — rejected because most
-operational questions ("how big is Bronze right now," Section 18.4's
-`storage-stats`) are naturally scoped by layer, not by table, and
-layer-first prefixes make those the cheap, single-prefix queries while
-table-first prefixes would make them expensive, all-tables scans instead.
+The generic analogy: a self-storage warehouse
 
-### Trade-offs
+Picture a real self-storage facility, like the kind that rents out storage units.
 
-| | Single bucket, prefix layers (chosen) | Bucket per layer |
-|---|---|---|
-| Provisioning | One `mc mb` / one bucket to create | Three (or more) buckets to create and keep in sync |
-| Per-layer IAM boundary | Not directly possible — a bucket policy covers the whole bucket | Natural — a policy per bucket |
-| Config surface | One `MINIO_BUCKET` value | One bucket name per layer |
-| Migrating to per-layer boundaries later | Requires moving every object to a new bucket | N/A -- already separated |
-| Right fit for this project's current scale | Yes | Premature for a single-operator Phase 1 POC |
+Every unit has a unique label, like Unit-4471. That label is the only way to find your stuff. There's no "walking down the third aisle, second shelf" the way a filesystem folder structure works. You just say "give me Unit-4471" and the warehouse hands it to you.
+You can put a sealed box into Unit-4471. You can take that box back out. You can replace it with a completely different sealed box, still labeled Unit-4471.
+You cannot open the box, take out one item, and put a different item in its place. If you want to change anything inside, you take the whole box away and drop off a whole new box.
+If you rent a lot of units, and you name them cleverly, like photos/2024/vacation.zip and photos/2025/vacation.zip, it looks like you have folders called photos, 2024, 2025. But the warehouse doesn't actually have a folder called photos. It just has flat labels that happen to contain slash characters. The "folder look" is something you imaged onto the labels, not something the warehouse tracks.
 
-### 18.4 Implementation
+Hold onto this analogy. Every real object storage system, including the one in your project, works exactly like this warehouse.
 
----
+Now the real technical terms
 
-**CREATE:** (edit) `ingestion/src/url_shortener_analytics/object_store.py`
-— `get_bucket_stats`
+Let's define each term exactly once, in plain words, before using it again.
 
-**PURPOSE:** A cheap, always-available capacity/growth signal — how many
-objects, how many bytes, under a given prefix — without needing a real
-observability platform wired up yet.
+Object. A single blob of data. Could be a photo, a video, a Parquet file, anything. In our warehouse analogy, this is the sealed box.
 
-**IMPLEMENTATION GUIDE (write it yourself):** `list_objects_v2`'s response
-already includes a `Size` field per object in `Contents` — resist the
-urge to loop over `list_bronze_keys`'s output and call `head_object` on
-each one to get its size; that's one HTTP round-trip per object where one
-round-trip *total* already has everything needed. Sum `Size` across
-`Contents`, count the entries, return both as a small dict.
+Key. The unique label used to find one object. In our analogy, this is Unit-4471. In your project, a real key looks like bronze/clicks/ingestion_date=2026-09-24/clicks.parquet. It's just a string of text. Nothing more.
 
-**REFERENCE IMPLEMENTATION:**
+Bucket. The warehouse itself, the top-level container that holds every object. In your project, the bucket is named analytics-lake.
+
+Prefix. The part of a key before some marker, usually the last slash. If your key is bronze/clicks/ingestion_date=2026-09-24/clicks.parquet, then bronze/clicks/ is a prefix of it. Prefixes are how you search for a group of related objects, by asking "give me every key that starts with this exact text."
+
+HTTP verb. Object storage isn't accessed through normal file-opening code like open(). It's accessed over the network, using the same HTTP protocol your web browser uses to load a webpage. There are five operations you need to know:
+
+Verb	Plain meaning
+PUT	Upload an object at a given key. Replaces whatever was already there.
+GET	Download the full object at a given key.
+HEAD	Ask "does this key exist, and how big is it?" without downloading the actual data.
+LIST	Ask "give me every key that starts with this prefix."
+DELETE	Remove the object at a given key.
+
+That's the entire vocabulary of object storage. Five verbs, plus the idea of a bucket and a key.
+
+The two properties that trip people up, explained slowly
+
+Property 1: no partial edits, ever.
+
+With a normal file, you can open it, seek to byte 500, overwrite ten bytes, and close it. Object storage has no equivalent of this. The only write operation is PUT, and PUT always uploads the entire object, from scratch, replacing anything that was there before under that key. If you want to change even one byte of a 10-gigabyte file, you have to re-upload all 10 gigabytes again, under the same key.
+
+Why does an entire technology choose to work this way, when it sounds so much more limited than a filesystem? Because giving up partial edits removes a whole category of hard problems. Two different programs can't corrupt each other by writing to different parts of the same file at the same time, because "different parts of the same file" doesn't exist. There's no lock to acquire, no lock to forget to release, no half-written file if a program crashes mid-write, since a crash mid-PUT just means the old object under that key is still there, untouched, until the new PUT finishes successfully. That simplicity is what lets object storage scale to holding an effectively unlimited number of objects, spread across enormous numbers of physical machines, without needing to coordinate those machines the way a shared filesystem would.
+
+Property 2: there are no real folders, only labels that look like folders.
+
+In our warehouse analogy: the warehouse doesn't have a section called photos. It has flat unit labels, and some of those labels happen to contain the text photos/. When you ask "show me everything under photos/", the warehouse just scans every label and returns the ones that start with those exact characters. It's a text comparison, not a folder lookup.
+
+This matters in practice for two big reasons. First, "listing a folder" in object storage is always at least as expensive as scanning through however many keys share that prefix. Filesystems can jump straight to a folder's contents because the operating system maintains a real directory structure; object storage can't take that shortcut. Second, you can accidentally match things you didn't mean to. If you ask for everything under the prefix bronze/cli (missing the trailing slash), you'll get back bronze/clicks/... and also, hypothetically, bronze/client_events/... if that ever existed, purely because both strings happen to start with the same six letters. This is exactly why real code always builds prefixes with an explicit trailing slash.
+
+### 2. URL SHORTENER EXAMPLE (your project's real code)
+
+Now let's connect the warehouse analogy to your actual code.
+
+S3 and MinIO, defined. Amazon invented a specific object storage product called S3 ("Simple Storage Service"), and its HTTP API (the exact shape of the PUT/GET/HEAD/LIST/DELETE requests) became so widely used that it's now a de facto industry standard. MinIO is a separate, open-source piece of software that you can run yourself, on your own laptop or your own servers, which speaks that exact same S3 API. Your project runs MinIO locally instead of paying for real AWS S3, but the code you write doesn't know or care which one it's actually talking to, because both understand the identical HTTP requests.
+
+boto3, defined. boto3 is the official Python library AWS publishes for talking to S3 (and every other AWS service). It handles building the correct HTTP requests for you, so your code calls plain Python functions like s3_client.put_object(...) instead of constructing raw HTTP requests by hand.
+
+Here's the real function in your codebase that builds this connection:
 
 ```python
-# ingestion/src/url_shortener_analytics/object_store.py (excerpt)
+def get_s3_client(settings: Settings) -> BaseClient:
+    return boto3.client(
+        "s3",
+        endpoint_url=settings.minio_endpoint,
+        aws_access_key_id=settings.minio_access_key,
+        aws_secret_access_key=settings.minio_secret_key,
+        config=Config(signature_version="s3v4", retries={"max_attempts": 0}),
+    )
+```
+Walking through this line by line:
 
+boto3.client("s3", ...) says "build me a client that speaks the S3 API." This is the same call you'd make to talk to real AWS S3.
+endpoint_url=settings.minio_endpoint is the one line that changes everything. It tells boto3 "don't talk to Amazon's real servers, talk to this address instead" — which in your sandbox is http://localhost:9000, MinIO running on your own machine. If you deleted this one line, and had real AWS credentials, this exact same code would talk to real AWS S3 instead. Nothing else in your entire ingestion pipeline would need to change.
+aws_access_key_id / aws_secret_access_key are a username/password pair, used to prove your code is allowed to read and write this bucket. This is a simplification worth naming honestly: real production systems use short-lived, automatically-rotating credentials instead of a fixed password sitting in a config file, because a leaked long-lived key is a serious security problem.
+retries={"max_attempts": 0} turns off boto3's own built-in automatic retrying. We'll come back to exactly why in the Design section below.
+
+And here's the function that builds a key, the "unit label" from our warehouse analogy:
+
+```python
+def build_bronze_key(table_name: str, run_date: datetime) -> str:
+    return f"bronze/{table_name}/ingestion_date={run_date:%Y-%m-%d}/{table_name}.parquet"
+
+For table_name="clicks" and today's date, this returns the plain text string bronze/clicks/ingestion_date=2026-09-24/clicks.parquet. That's it. It's just building a string. There is no folder being created anywhere. MinIO will simply remember "there is an object whose label is exactly this string."
+```
+### 3. DESIGN
+Architecture: how the pieces connect
+```
+ Your ingestion code (extract_full.py, extract_incremental.py)
+         │
+         │  calls object_store.write_bronze(...)
+         ▼
+ object_store.py
+         │
+         │  builds a boto3 S3 client, pointed at MinIO
+         │  sends a PUT request over HTTP
+         ▼
+ MinIO (running in Docker, on your machine)
+   listens on two different ports:
+     - port 9000: the actual S3 API (PUT/GET/HEAD/LIST/DELETE)
+     - port 9001: a separate web dashboard you can view in a browser
+         │
+         ▼
+ Inside MinIO: one bucket, "analytics-lake"
+   holding a flat list of objects, e.g.:
+     bronze/urls/ingestion_date=2026-09-24/urls.parquet
+     bronze/users/ingestion_date=2026-09-24/users.parquet
+     bronze/clicks/incremental/watermark_start=.../clicks.parquet
+```
+   (the indentation above is just for YOUR eyes -- MinIO stores
+    these as one flat list of strings, with no real tree structure)
+Why boto3's own retries are turned off
+
+You already learned, back in Full Load Ingestion, that _put_parquet_with_retry is a function in your own code that retries a failed write a few times, with a short pause between attempts. That's your own, custom retry logic.
+
+boto3 also ships with its own, separate, built-in retry logic, which is on by default. If you left both enabled at once, a single failed write could get retried by two different systems, each with its own timing, stacked on top of each other. That's genuinely confusing to debug: if a write takes an unexpectedly long time to fail, is that your retry loop, boto3's retry loop, or both firing at once? Setting retries={"max_attempts": 0} disables boto3's copy, so there's exactly one retry policy in this whole codebase, and it's the one you can actually read, in Section 14.4's _put_parquet_with_retry.
+
+The real design decision: one bucket, or many?
+
+Here's a genuine engineering choice your project had to make, and it's worth understanding both sides.
+
+As your project grows, it won't just have Bronze data. Section 2 of this learning plan already told you Silver and Gold layers are coming later. Where should those live?
+
+Option A, the one chosen: one bucket, analytics-lake, with the layer name baked into the key as a prefix. So Bronze objects start with bronze/, and later, Silver objects will start with silver/, all inside the exact same bucket.
+
+Option B, considered and rejected: a separate bucket per layer. So you'd have analytics-lake-bronze, analytics-lake-silver, analytics-lake-gold as three entirely separate buckets.
+
+To understand why Option B is tempting, you need one more term defined: IAM. IAM stands for Identity and Access Management. It's the system, in AWS and similar platforms, for controlling who is allowed to do what. An "IAM policy" is a rule like "this particular username is allowed to read from bucket X, but not bucket Y." A bucket is the natural unit these policies attach to; you write one policy per bucket.
+
+So Option B's real advantage is access control: with three separate buckets, you can write a rule like "the BI reporting team can only read from the Gold bucket, never Bronze," and that rule is simple and bulletproof, because it's enforced at the whole-bucket level. With Option A (one shared bucket), you can't write that same rule as easily. You'd need a more complicated kind of rule that looks inside the bucket at the key itself, which AWS supports but which is harder to write and easier to get wrong.
+
+So why did this project still choose Option A? Because right now, in Phase 1, there's exactly one person (you) operating this whole pipeline, with no separate teams needing separate access. Setting up three buckets, three sets of permissions, and three things to keep in sync is real, unnecessary work at this stage, for a security boundary nobody currently needs. One bucket keeps the code simpler too: there's exactly one config value, MINIO_BUCKET, instead of three.
+
+The honest trade-off, stated upfront rather than hidden: if a future need for that Bronze/Silver/Gold access boundary becomes real, someone will have to physically move every single object into new buckets. You can't just rename a bucket the way you can rename a folder. That's a real, non-trivial migration, and it's worth knowing this cost exists now, rather than discovering it by surprise later.
+
+	One bucket, prefix-separated (chosen)	Bucket per layer
+How many buckets to set up	1	3 or more
+Can restrict "this team can only see Gold"	Not easily	Yes, naturally
+Config values needed	1 (MINIO_BUCKET)	1 per bucket
+Cost of switching to the other option later	Must physically move every object	N/A, already separated
+Right choice for a single-person Phase 1 project	Yes	Not yet, too much setup for no current benefit
+4. IMPLEMENTATION
+
+The one genuinely new function in this section, already written and sitting in your object_store.py:
+
+```python
 def get_bucket_stats(s3_client: BaseClient, bucket: str, prefix: str = "bronze/") -> dict[str, int]:
     response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
     contents = response.get("Contents", [])
     return {"object_count": len(contents), "total_bytes": sum(obj["Size"] for obj in contents)}
 ```
+### 5. CODE WALKTHROUGH
 
-Full file: [`object_store.py`](../ingestion/src/url_shortener_analytics/object_store.py).
+Let's go through every line.
 
-**RUN:** `make storage-stats` (wraps `python -m url_shortener_analytics.cli
-storage-stats --prefix bronze/`)
+s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix). This sends the LIST request from our vocabulary table. It says "search the warehouse for every unit label that starts with this prefix text." In your project, that's every key starting with bronze/.
 
-**VERIFY:** run `make ingest-full`, then `make storage-stats` twice in a
-row — the second run's `object_count`/`total_bytes` should match the
-first (full loads overwrite the same date-scoped keys — Section 14's
-idempotency guarantee — so re-running `ingest-full` without advancing to
-a new day must not grow these numbers).
+response.get("Contents", []). The response from list_objects_v2 comes back as a Python dictionary. If any objects matched, they're listed under the key "Contents". If nothing matched (say, the bucket is completely empty), that key might be missing entirely from the response, so .get("Contents", []) says "grab that list if it exists, otherwise just give me an empty list," instead of crashing with a KeyError.
 
-**EXPECTED:** `object_count` equal to the number of distinct
-`(table, ingestion_date)` and `(table, watermark_range)` combinations
-ever successfully written; `total_bytes` roughly tracking Section 19's
-per-format size numbers, times however many objects exist.
+{"object_count": len(contents), ...}. len(contents) just counts how many matching objects came back. This is the total number of "boxes" currently sitting in the warehouse under that prefix.
 
-**TEST:** `test_object_store.py` — two new tests (size/count summed
-correctly with no `head_object` calls; zero-object case).
+"total_bytes": sum(obj["Size"] for obj in contents). Here's the detail worth slowing down on. Each item inside contents isn't just a key string. It's a small dictionary that already includes metadata about that object, including its size in bytes, under the key "Size". This line adds up the "Size" field across every matching object.
 
-**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections
-18.8/18.9.
+Why this matters, and the mistake it avoids: a tempting-but-wrong way to write this function would be to first call list_bronze_keys to get just the key names, and then call head_object once per key to separately ask "how big is this one?" That would work, but it wastes network calls. Each head_object call is its own separate HTTP round-trip to MinIO. If you have 500 objects, that's 500 extra network requests, just to re-fetch information the single list_objects_v2 call already handed you for free, in one response. get_bucket_stats avoids this by reusing the size field that was already sitting in the LIST response.
 
----
+### 6. RUN
 
-### Hands-on Challenge (implement-yourself)
+Real command, real expected shape of the output:
 
-Before LAB 14 below, try this without looking at `object_store.py`: write
-a version of `get_bucket_stats` that *also* breaks the total down
-per-table (a dict of `{table_name: {"object_count": ..., "total_bytes":
-...}}`), using only `list_bronze_keys`'s existing output — no new S3 calls.
-Hint: the table name is the second path segment of every Bronze key
-(`bronze/{table}/...`) — you already have everything you need in the key
-strings themselves, entirely client-side, once you have the flat listing.
+bash
+make storage-stats
 
-### 18.5 Hands-on Exercise
+This wraps python -m url_shortener_analytics.cli storage-stats --prefix bronze/ under the hood.
 
-**LAB 14 — Watch Bronze storage grow, then confirm idempotent reruns
-don't grow it further.**
-
-Prerequisites: `make up`, `make seed`.
+Try this exact sequence yourself, checking the output after each step:
 
 ```bash
-make storage-stats          # before anything: object_count=0, total_bytes=0
-make ingest-full            # writes urls.parquet, users.parquet
-make storage-stats          # object_count=2, total_bytes=<real total>
-
-make ingest                 # clicks: first incremental run, one more object
-make storage-stats          # object_count=3
-
-make ingest-full            # SAME day -- overwrites urls.parquet/users.parquet
-                             # in place (Section 14's idempotency guarantee)
-make storage-stats          # object_count STILL 3 -- not 5
+make storage-stats          # expect: object_count=0, total_bytes=0 (nothing ingested yet)
+make ingest-full             # writes urls.parquet and users.parquet
+make storage-stats          # expect: object_count=2
+make ingest                  # clicks, first incremental run, one more object
+make storage-stats          # expect: object_count=3
+make ingest-full             # SAME calendar day -- overwrites urls.parquet/users.parquet in place
+make storage-stats          # expect: object_count STILL 3, not 5
 ```
+### 7. EXPERIMENT (hands-on, including a "why did it not change" check)
 
-What to observe: the last `storage-stats` call is the real proof this lab
-is after — a second `make ingest-full` on the same day does not grow
-`object_count`, because `build_bronze_key`'s deterministic, date-scoped
-keys mean the rerun overwrote the exact same two objects rather than
-creating new ones. *(DESIGN EXPECTATION for the exact numbers — run it
-yourself with real MinIO; this sandbox has none.)*
+The last make storage-stats call above is the actual proof this exercise is testing. If you run make ingest-full a second time on the same day, and object_count jumps to 5 instead of staying at 3, something is wrong with build_bronze_key's determinism from Section 14. It should never grow, because the second ingest-full overwrites the exact same two keys instead of creating new ones. Run this yourself and confirm the number really does stay at 3.
 
-### 18.6 How to test
+Now a break-it exercise, to build real intuition about the "no real folders" property. Open a Python shell (or a one-off script) and, using the same s3_client, deliberately call:
 
-```bash
-make test
+```python
+s3_client.list_objects_v2(Bucket="analytics-lake", Prefix="bronze/cli")
 ```
+Notice the missing trailing slash: bronze/cli, not bronze/clicks/. Predict what comes back before you run it. Because this is a plain string-prefix match, not a folder lookup, it will return every key starting with those exact six characters, bronze/cli, which happens to include your real bronze/clicks/... objects. If your project ever had a table named something like client_events, its Bronze keys would also match this same broken prefix, purely by coincidence of spelling, and you'd get back a mixed, wrong result with no error or warning at all. Now go check list_bronze_keys_for_date_range and get_file_layout_report in your real object_store.py, and confirm every prefix they build always ends in a trailing /. That trailing slash is not a style choice; it's the fix for exactly this bug.
 
-The full unit suite — 63 tests, up from 59 at the end of the Section
-16-17 increment (4 new: `get_bucket_stats` x2, `list_bronze_keys_for_date_range`
-x2 — the latter belongs to Section 20 below) — was genuinely run in this
-environment and passed. ACTUAL OBSERVED:
+### 8. PRODUCTION VIEW
 
-```
-63 passed in 7.09s
-```
+Two real limits worth knowing before you hit them.
 
-`ruff check ingestion/ benchmarks/` was also run against every file this
-increment touched and passed cleanly — ACTUAL OBSERVED: `All checks
-passed!`
+The 1,000-key cap. list_objects_v2, by default, only returns up to 1,000 keys per call, even if a prefix actually matches more than that. Your current code (list_bronze_keys, get_bucket_stats) makes exactly one list_objects_v2 call and trusts that it got everything. At your project's current scale, a few dozen objects per table at most, this is completely safe. Once a real production table accumulates more than 1,000 objects under one prefix, get_bucket_stats would silently under-report the true total_bytes, because it would only ever see the first 1,000 keys. The real fix is pagination: boto3 provides a paginator object specifically for this, which automatically makes as many follow-up LIST calls as needed and stitches the results together.
 
-One further, genuine check specifically for this section's Failure
-Scenario below: calling `get_bucket_stats` with a mocked S3 client whose
-`list_objects_v2` raises a `NoSuchBucket` `ClientError` was run directly
-in this sandbox (no real MinIO needed for this specific check, since it
-tests this function's own lack of error handling, not S3's real
-behavior) — confirmed the `ClientError` propagates completely uncaught.
-This is what Section 18.7 is about.
+The access-control limit. As covered in the Design section, one shared bucket makes it genuinely harder to restrict "team A can only read Gold data" the way separate buckets would. This becomes a real requirement the moment more than one team, with different trust levels, needs to read from this data lake.
 
-### 18.7 Failure Scenario
+### 9. PRINCIPAL ENGINEER VIEW
 
-**What happens if `storage-stats` runs against a bucket that doesn't
-exist yet — say, before `docker compose`'s `createbuckets` service has
-finished, or after a typo'd `--prefix` pointed at an entirely different,
-nonexistent bucket via a misconfigured `MINIO_BUCKET`?**
+If an interviewer asks "why doesn't object storage support in-place edits," the strong answer isn't "it just doesn't." It's connecting that limitation back to what it buys in return: no locking needed between concurrent writers, no half-written file if a write crashes partway through, and the ability to scale to effectively unlimited objects across many physical machines without needing those machines to coordinate closely with each other. That trade, giving up partial edits in exchange for massive, simple horizontal scale, is the single idea that explains almost every other object storage design choice you'll ever run into.
 
-This is a real, currently-unaddressed gap in the code just written, found
-by reading it rather than assumed: unlike `run_full_load_command`/
-`run_command` (which wrap each table's work in `try/except Exception` and
-log a clean failure) or `validate_contracts_command` (which catches
-`ContractError` specifically), `storage_stats_command` — and, for that
-matter, `check_stale_runs_command` and `reconcile_bronze_command` from
-Section 16/17 — have **no** exception handling around their S3/database
-calls at all. A `list_objects_v2` call against a bucket that genuinely
-doesn't exist raises a `ClientError` with code `NoSuchBucket`, which this
-sandbox genuinely confirmed (Section 18.6) propagates straight out of
-`get_bucket_stats`, uncaught, all the way to a raw Python traceback on
-the operator's terminal instead of a clean logged error and a `1` exit
-code — a materially worse operator experience than every other command
-in this file provides, and inconsistent with this file's own established
-pattern. **This is a genuine, honestly-named gap, not a hypothetical
-one** — see Section 18.8's Production Considerations for what closing it
-would take, deliberately left undone here rather than silently patched
-in without calling it out as new scope.
+A second strong thing to be able to say: "prefixes are not real folders, they're string matching," and be ready to give the concrete failure example from the Experiment section above, a missing trailing slash accidentally matching an unrelated key. That's the kind of specific, first-hand detail that separates "I've read about this" from "I've actually used this."
 
-### 18.8 Production Considerations
-
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Bucket/layer separation | One bucket, prefix-separated layers (18.3) | Same, or bucket-per-layer once per-layer IAM boundaries are a real requirement |
-| Capacity monitoring | Manual (`make storage-stats`) | Scraped on a schedule into a real metrics platform (Prometheus/CloudWatch), graphed over time, alerted on unexpected growth or a stall |
-| Error handling on the reporting/monitoring commands | None — see 18.7's named gap, uncaught `ClientError` on a missing bucket | Every operator-facing command wraps its own calls and returns a clean exit code, the same standard `run_command`/`validate_contracts_command` already meet |
-| Retry policy | This repo's own loop in `_put_parquet_with_retry`; boto3's built-in retries explicitly disabled to avoid two stacked policies (18.2) | Same principle, typically with jitter added to backoff and a circuit breaker once request volume is high enough for thundering-herd retries to matter |
-| Consistency model | Relies on S3/MinIO's modern strong read-after-write consistency (not the older "eventual consistency" S3 had years ago) | Same — but worth explicitly verifying for any non-AWS, non-MinIO S3-compatible store before depending on it, since "S3-compatible" doesn't always mean "S3-consistent" |
+### 10. REMEMBER
+Object storage is a warehouse of labeled, whole boxes. You put a whole box in, or take a whole box out. You never reach inside one.
+A "key" is just a text label. A "bucket" is the whole warehouse. There is no real folder tree underneath, only labels that happen to contain slashes.
+PUT always replaces the entire object. There is no operation for editing part of one.
+MinIO and real AWS S3 speak the exact same HTTP API, which is why the same boto3 code works against both, unchanged.
+One shared bucket with prefixes is simpler to run; separate buckets per layer give cleaner access control. Pick based on how many people/teams actually need different permissions right now, not hypothetically.
 
 ### Principal Data Engineer Perspective
 
@@ -5222,8 +3597,6 @@ decision (18.3) is a real, if modest, piece of technical debt being taken
 on deliberately — it trades away clean per-layer IAM boundaries for
 Phase 1's actual, current operational simplicity, and says so plainly
 rather than presenting "one bucket" as obviously, permanently correct.
-
-### 18.9 Principal Engineer Interview Questions
 
 **Q: "Someone asks you why S3 (or MinIO) can't just support editing ten
 bytes in the middle of a large object the way a local filesystem can.
@@ -5302,165 +3675,90 @@ not exposing a real filesystem feature underneath.
 
 ## 19. Parquet ✅✅
 
-### 19.1 Concept
+### 1. CONCEPT
+The problem first
 
-**Parquet** is a columnar, self-describing binary file format: instead of
-storing data row-by-row (`row1: id,code,url` then `row2: id,code,url`...),
-it stores each *column* contiguously (`id: [1,2,3,...]`, then
-`code: [...]`, then `url: [...]`), with a footer that embeds the schema
-and per-column statistics. This repo has written every Bronze object as
-Parquet since Section 14 (`_dataframe_to_parquet_bytes`,
-snappy-compressed via PyArrow) — always as an assertion (ADR-003 calls it
-"efficient for analytical, column-selective reads"), never measured. This
-section closes that: a real benchmark script, genuinely run in this
-sandbox, comparing Parquet against CSV and JSON-lines on this project's
-own data, at two different scales.
+Every Bronze object you've written so far has been a Parquet file. You've seen the code call pq.write_table(...), but we've never stopped to ask: what actually is Parquet, and why not just write plain CSV files instead? CSV is simpler. Anyone can open it in a text editor. Let's build up to the real answer slowly.
 
-### Why does this exist?
+Row-oriented vs. column-oriented, defined from scratch
 
-Row-oriented formats (CSV, JSON-lines) are simple and human-readable, but
-force every reader to parse an entire row just to access one column — a
-query that only needs `device_type` still has to read and skip past
-`id`, `short_code`, `occurred_at`, `hashed_ip`, and `user_id` for every
-single row. A columnar format lets a reader skip straight to the bytes
-for exactly the column(s) it needs, and lets compression work far better,
-too — a column of a few dozen repeating `device_type` values compresses
-much more effectively sitting next to millions of other `device_type`
-values than interleaved between five other, unrelated columns. Both
-properties matter enormously for analytical workloads, which very
-commonly touch a handful of columns out of many, across a lot of rows —
-exactly the query shape Section 2 (OLTP vs. OLAP) named as this whole
-platform's reason for existing in the first place.
+Imagine a table of data, like a spreadsheet of employees. It has three columns: id, name, salary. It has three rows, for Alice, Bob, and Carol.
 
-### Simple Example (generic, pre-URL-Shortener)
+There are two fundamentally different ways to physically lay this data out in a file.
 
-A CSV with a million rows and twenty columns, where a query only needs
-one column's average: a row-oriented reader has no choice but to read
-every byte of every row, parse all twenty fields per row, and discard
-nineteen of them per row, a million times over. A columnar reader with
-the same file in Parquet form reads *only* that one column's contiguous
-byte range off disk — the other nineteen columns' bytes are never even
-touched. The difference isn't "columnar happens to be faster" as a vague
-claim — it's a structural one: the amount of data actually read from disk
-scales with *columns needed*, not *columns that exist*.
-
-### URL Shortener Example
-
-`build_bronze_key`/`write_bronze` already write every table as Parquet.
-What this section adds: `benchmarks/parquet_vs_csv_vs_json.py`, a script
-that takes this repo's own real `clicks` table (or a larger synthetic
-version with the same shape) and writes it to disk in all three formats,
-then measures file size, write time, full-table read time, and
-single-column (`device_type`) read time for each — genuinely run, twice,
-in this sandbox.
-
-### 19.2 Architecture
-
+Row-oriented layout. Store one complete row, then the next complete row, then the next. This is exactly how CSV works.
 ```
- clicks (Postgres, real seeded data OR synthetic-generated DataFrame)
-        │
-        ├──▶ df.to_csv(...)      ──▶ clicks.csv      ──▶ pd.read_csv(...)
-        │                                              ──▶ pd.read_csv(usecols=["device_type"])
-        │                                                   (still scans every row; only SKIPS
-        │                                                    building the other columns)
-        │
-        ├──▶ df.to_json(lines=True) ──▶ clicks.jsonl  ──▶ pd.read_json(...)
-        │                                              ──▶ pd.read_json(...)[["device_type"]]
-        │                                                   (no columnar shortcut exists at all --
-        │                                                    every line is fully parsed regardless)
-        │
-        └──▶ df.to_parquet(compression="snappy") ──▶ clicks.parquet ──▶ pd.read_parquet(...)
-                                                                       ──▶ pd.read_parquet(columns=["device_type"])
-                                                                            (TRUE columnar pushdown --
-                                                                             other 5 columns' bytes
-                                                                             never read off disk)
+1,Alice,50000
+2,Bob,60000
+3,Carol,70000
 ```
+Column-oriented layout. Store every value from one column together, then every value from the next column together.
+```
+[1, 2, 3]
+[Alice, Bob, Carol]
+[50000, 60000, 70000]
+```
+Now ask yourself: you need the average salary. You don't care about id or name at all. How much of the file does each layout force you to read?
 
-Three formats, four measurements each (size, write time, full read, one-
-column read), run twice — once against this project's real 5,000-row
-`clicks` table, once against a synthetic 200,000-row version of the same
-shape — because, as 19.6 shows, the *real* dataset is small enough that
-the trends aren't yet obvious at that scale.
+In the row-oriented file, there is no way to skip straight to the salaries. The salaries are scattered, one per row, mixed in between the other columns. You have to read every single row, in full, and only then discard the id and name you didn't need.
 
-### 19.3 Design Decision: benchmark at two scales, not one
+In the column-oriented file, the salaries are one contiguous block. You jump straight to that block and read only that. The id and name blocks are never even touched.
 
-**Context:** this repo's own seeded data is small (5,000 `clicks` rows by
-`make seed`'s own `N_CLICKS` constant) — small enough, it turns out, that
-Parquet's advantages are not all visible yet. **Decision:** run the
-benchmark twice — once against the real, small seeded table, once against
-a synthetic 200,000-row table of the same shape — and report both
-honestly, rather than picking whichever scale makes the intended point
-more cleanly. **Alternatives considered:** benchmark only the real seeded
-data (simpler, fully "real," but understates Parquet's actual advantage
-at realistic production scale); benchmark only a large synthetic dataset
-(shows the advantage clearly, but never touches this repo's own actual
-data at all). **Trade-offs:** two scales costs more script complexity and
-roughly twice the runtime, in exchange for a materially more honest
-result — the small-scale run is a genuine, if initially surprising,
-finding in its own right (19.6), not a number to bury because it
-complicates the intended narrative. **Consequences:** any claim in this
-guide about Parquet's advantage now has to specify *at what scale* it
-holds — "Parquet is smaller and faster" is true, but incompletely true,
-without that qualifier, and this guide's own standing rule against
-overstating results (Section 15.7, 17.7's honesty about narrower
-guarantees than initially claimed) applies here too.
+This is the entire idea behind Parquet. Parquet is a column-oriented file format. It groups the data column by column instead of row by row.
 
-### Alternatives
+Two more properties, defined plainly
 
-Covered above. A further alternative considered and rejected: running
-each format/scale combination many times and reporting a mean/median with
-variance, the way a rigorous benchmark suite would — rejected for this
-section specifically because a single-run wall-clock measurement, taken
-honestly and labeled as such, is enough to demonstrate the *structural*
-effect this section is teaching (columnar vs. row-oriented I/O) without
-overstating precision this sandbox's shared, variable-load environment
-can't actually deliver; see 19.6 and 19.8 for that caveat stated
-explicitly.
+Parquet is binary, not text. CSV is plain text. You can open it in Notepad and read it with your own eyes. Parquet stores its data in a compact, specially-encoded binary format, the way a .jpg image or a .zip file is binary. This makes Parquet files smaller and faster for a computer to process, but it means a human can't just open one and read it directly. You need a Parquet-aware tool.
 
-### Trade-offs
+Parquet is self-describing. A CSV file is just raw text; nothing in the file itself tells you that the second column is supposed to be a whole number. Whatever program reads it has to guess, or has to be told separately. Every Parquet file, by contrast, ends with a small section called a footer, which stores the exact schema (every column's name and data type) and some statistics about the data. Any program reading the file can look at the footer first and know exactly what it's dealing with, with no guessing and no separate documentation needed.
 
-| | Row-oriented (CSV/JSON) | Columnar (Parquet) |
-|---|---|---|
-| Full-table read | Reads and parses every byte of every row, always | Same total data volume, but decodes per-column, compressed |
-| Single-column read | CSV: still scans every row (`usecols` only skips building unused columns); JSON: no shortcut at all | True columnar pushdown -- only the needed column's bytes are read |
-| File size | No native compression (CSV); verbose text encoding, especially JSON's repeated keys per row | Compressed (snappy here) and compactly, binary-encoded |
-| Human-readable | Yes, directly | No -- needs a Parquet-aware tool |
-| Schema | Not self-describing -- inferred or assumed by the reader | Self-describing -- embedded in the file's own footer |
-| Small-scale overhead | Effectively none | Real, fixed per-file overhead (footer, schema encoding) that has to be amortized across enough rows to pay for itself -- see 19.6 |
+Why does any of this matter for a real pipeline?
 
-### 19.4 Implementation
+Go back to Section 2 of this whole learning plan, where you first learned the difference between OLTP and OLAP. Analytical queries, the kind this entire platform exists to answer, very commonly touch only a handful of columns out of many, across a huge number of rows. "What's the average time-to-click, broken down by device_type, across five million rows" only needs two of your clicks table's six columns. A row-oriented format forces you to pay the cost of all six columns anyway, for every single row. A column-oriented format only makes you pay for the two you actually asked for. That difference gets larger, not smaller, as your data grows, which is exactly the shape of workload this whole project is built around.
 
----
+### 2. URL SHORTENER EXAMPLE
 
-**CREATE:** `benchmarks/parquet_vs_csv_vs_json.py`
-
-**PURPOSE:** Produce real, reproducible file-size and read/write-time
-numbers comparing Parquet against CSV and JSON-lines — the benchmark
-ADR-003 named as "planned" two increments ago.
-
-**DEPENDENCIES:** `pandas`, `pyarrow` (already dependencies of the main
-package); this project's own `config`/`db` modules, to read the real
-`clicks` table when run with no `--rows` argument.
-
-**IMPLEMENTATION GUIDE (write it yourself):** load a DataFrame (real, from
-`clicks`, or synthetic via a `--rows N` flag generating the same six
-columns purely in Python — no database round-trip needed for the
-synthetic path, so it scales far beyond what a small local Postgres
-comfortably holds). For each of the three formats, time a write to a
-temp directory, record the resulting file's size on disk
-(`Path.stat().st_size`), time a full read back into a DataFrame, and time
-a read of just the `device_type` column — using each format's *fairest*
-available API for that (`usecols=` for CSV, plain read-then-select for
-JSON since it has no columnar shortcut, `columns=` for Parquet). Print a
-table; don't round-trip through the database for the synthetic case at
-all, since the entire point of that path is testing at a scale the local
-Postgres wasn't seeded for.
-
-**REFERENCE IMPLEMENTATION (excerpt — full script already committed):**
+You've already been writing Parquet since Section 14, without a dedicated look at how. Here's the actual function, already sitting in your object_store.py:
 
 ```python
-# benchmarks/parquet_vs_csv_vs_json.py (excerpt)
+def _dataframe_to_parquet_bytes(df: pd.DataFrame) -> bytes:
+    buffer = io.BytesIO()
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    pq.write_table(table, buffer, compression="snappy")
+    return buffer.getvalue()
+```
+Walking through each line:
 
+io.BytesIO() creates an empty, in-memory buffer. Think of it as a temporary file that lives only in RAM, never touching the disk. This is used instead of a real temp file because the result needs to go straight into an S3 PUT request, not sit on disk first.
+
+pa.Table.from_pandas(df, preserve_index=False). pa is PyArrow, a library built specifically for working with columnar data in memory, and it's the engine that actually knows how to write the Parquet format. This line converts your pandas DataFrame into PyArrow's own columnar Table structure, which is the format PyArrow's Parquet writer expects. preserve_index=False tells it to drop pandas' automatic row-numbering index, so it doesn't get written into the file as an extra, unwanted column.
+
+pq.write_table(table, buffer, compression="snappy"). This is the actual write. pq is PyArrow's Parquet-specific module. This line encodes the table into the real Parquet binary format and writes those bytes into the in-memory buffer from step one. compression="snappy" names the compression algorithm to use. Compression codec, defined: an algorithm that shrinks data by finding and removing repetition, at the cost of some CPU time to compress and later decompress it. Snappy is chosen here specifically because it's fast to compress and decompress, at a moderate compression ratio, a good default when write/read speed matters more than squeezing out every possible byte.
+
+### 3. DESIGN
+The design decision: benchmark at two different sizes, not one
+
+Your project made a genuine, deliberate choice here, worth understanding in full. ADR-003, an earlier design decision record in your project, had already asserted that Parquet would be "efficient for analytical, column-selective reads," two increments before anyone actually measured it. This section is where that assertion finally got tested against real numbers.
+
+Here's the decision: run the benchmark twice. Once against your project's real, small seeded clicks table, which only has 5,000 rows. Once against a synthetic table of the exact same shape, but with 200,000 rows.
+
+Why not just benchmark once, against the real data you already have? Because 5,000 rows turns out to be small enough that Parquet's advantage isn't fully visible yet, for a reason explained below. Benchmarking only at that scale would have quietly given a misleading picture.
+
+Why not just benchmark once, against a large synthetic dataset? Because then the benchmark never actually touches your project's own real data at all, and a reader can't be sure the result generalizes back to the thing they're actually building.
+
+Running both costs more script complexity and roughly double the runtime. In exchange, it produces an honest result instead of a convenient one. This matters enough that it's worth a general engineering habit, not just a one-off decision: measure a claim at the scale where it will actually apply, not at whatever scale happens to be easiest to test.
+
+Amortization, defined, since it explains the real numbers below
+
+Amortize means to spread a fixed, one-time cost across many uses, so its per-use impact shrinks the more you use it. Think of buying a $100 toolbox. If you use it once, that tool cost you $100. If you use it a thousand times, it effectively cost you 10 cents per use. The cost didn't change; how many times you divided it by did.
+
+Every Parquet file has a fixed cost: that footer we defined earlier (the embedded schema and statistics) has to be written when saving, and parsed when reading, no matter how many rows are in the file. For a file with only 5,000 rows, that fixed cost is a real, noticeable fraction of the total work. For a file with 200,000 rows, that exact same fixed cost gets divided across 40 times more rows, so it barely matters anymore. This is the amortization effect, and it's the reason a benchmark run at only one scale can be misleading.
+
+### 4. IMPLEMENTATION
+
+The benchmark script itself, real and already committed at benchmarks/parquet_vs_csv_vs_json.py. Here's the part of it that isolates the single-column read test, for each format, using each format's own fairest available approach:
+
+python
 def _read_csv_one_column(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, usecols=["device_type"])          # scans every row regardless
 
@@ -5469,165 +3767,77 @@ def _read_json_one_column(path: Path) -> pd.DataFrame:
 
 def _read_parquet_one_column(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path, engine="pyarrow", columns=["device_type"])   # true columnar pushdown
+5. CODE WALKTHROUGH
+
+_read_csv_one_column uses pandas' usecols parameter. This tells pandas which columns you actually want back. But it's important to understand what this does and doesn't save you. CSV has no columnar structure at all. Pandas still has to read every single row from start to finish, character by character, because there's no way to know where the device_type value is on a given line without first reading past everything before it. usecols only saves you the work of building unused Python objects for the other columns; it does not save you any disk reading at all.
+
+_read_json_one_column doesn't even get that partial benefit. It reads the entire file into a DataFrame with every column, and only afterward selects ["device_type"]] from the already-fully-loaded result. There is no columnar shortcut in JSON-lines whatsoever.
+
+_read_parquet_one_column passes columns=["device_type"] directly into pd.read_parquet. This is genuine columnar pushdown: the request for "just this column" gets pushed all the way down to the file-reading layer itself. PyArrow looks at the file's footer, finds exactly which byte ranges on disk hold the device_type column, and reads only those bytes. The other five columns' data is never read off disk at all, not even to be discarded.
+
+### 6. RUN
+
+Real commands:
+
+bash
+make benchmark-parquet                 # your real, seeded clicks table (~5,000 rows)
+make benchmark-parquet ROWS=200000     # a synthetic table of the same shape, 200,000 rows
+
+Your project's guide already recorded a genuine run of both, in this same sandbox. These are real, actually-observed numbers, not projections. Run the command yourself and expect the file-size columns to match exactly; the timing columns will vary a little, since wall-clock timing on a shared machine is never perfectly repeatable.
+
+At 5,000 real rows:
 ```
-
-Full file: [`parquet_vs_csv_vs_json.py`](../benchmarks/parquet_vs_csv_vs_json.py).
-
-**RUN:**
-```bash
-make benchmark-parquet                 # real seeded clicks table
-make benchmark-parquet ROWS=200000     # synthetic, larger scale
+format      size_bytes   write_s   full_read_s   one_col_read_s
+csv         597311       0.0405    0.0124         0.0063
+json        961259       0.0376    0.0288         0.0252
+parquet     417649       0.0164    0.0132         0.0024
 ```
-
-**VERIFY / EXPECTED:** see 19.6's actual output below — this is one of
-the few places in this guide where "expected" and "actually observed" are
-the same section, since the numbers below are real.
-
-**TEST:** this script isn't unit-tested (it's a one-off measurement tool,
-not pipeline code another module imports — the same category `scripts/
-seed_sample_data.py` already falls into); `ruff check benchmarks/` is
-run as part of this increment's lint pass.
-
-**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections
-19.8/19.9.
-
----
-
-### Hands-on Challenge (implement-yourself)
-
-Before LAB 15 below, try this without looking at the script: predict, in
-writing, whether you expect Parquet's *full-table* read to be faster or
-slower than CSV's at 5,000 rows, and why — before running anything. Then
-run `make benchmark-parquet` and compare your prediction against 19.6's
-real numbers. (Most people predict "Parquet wins on every metric,
-always" — the real, small-scale result is more interesting than that,
-and 19.6 explains exactly why.)
-
-### 19.5 Hands-on Exercise
-
-**LAB 15 — Run the benchmark yourself, at both scales.**
-
-```bash
-make benchmark-parquet                  # real clicks table (~5,000 rows)
-make benchmark-parquet ROWS=200000      # synthetic, 200,000 rows
+At 200,000 synthetic rows:
 ```
-
-What to observe: run it twice at the small scale and compare — wall-clock
-timings on a shared machine vary run to run (19.8 names this explicitly);
-the *size* numbers, by contrast, are deterministic and will match 19.6
-exactly. Then compare the small-scale and large-scale results side by
-side and notice which metrics *change trend* between the two (19.6 names
-exactly one that does).
-
-### 19.6 How to test
-
-The benchmark script above was genuinely run twice in this sandbox — once
-against the real, 5,000-row seeded `clicks` table, once against a
-synthetic 200,000-row version. **Both are ACTUAL OBSERVED results, not
-DESIGN EXPECTATIONS:**
-
+format      size_bytes   write_s   full_read_s   one_col_read_s
+csv         21626749     0.8884    0.4753         0.1645
+json        38586801     0.6567    1.0284         0.9612
+parquet     4329469      0.0912    0.0596         0.0082
 ```
-Loaded 5000 REAL rows from this project's own `clicks` table.
+###7. EXPERIMENT
 
-dataset              format      rows   size_bytes   write_s  full_read_s  one_col_read_s
------------------------------------------------------------------------------------------
-real_clicks          csv         5000       597311    0.0405       0.0124          0.0063
-real_clicks          json        5000       961259    0.0376       0.0288          0.0252
-real_clicks          parquet     5000       417649    0.0164       0.0132          0.0024
+Before reading further, make a written prediction. At only 5,000 rows, do you expect Parquet's full-table read to be faster or slower than CSV's? Most people confidently predict "Parquet wins on everything, always." Now look at the real numbers above: at 5,000 rows, Parquet's full read (0.0132s) is essentially tied with CSV's (0.0124s), if anything a touch slower. Only at 200,000 rows does Parquet's full read pull decisively ahead, at 0.0596s versus CSV's 0.4753s, roughly 8 times faster.
 
-real_clicks: csv is 1.43x the size of parquet
-real_clicks: json is 2.30x the size of parquet
-```
+This is the amortization effect from the Design section, made concrete. At small scale, the fixed footer/schema overhead isn't paid off yet by the columnar savings. At large scale, it is, overwhelmingly. Notice, though, what doesn't flip between the two scales: the single-column read time favors Parquet decisively at both sizes, already about 2.6 times faster than CSV even at just 5,000 rows. That's the number that actually matters most for this whole project, since selective, few-column reads are exactly the query shape this platform exists to serve.
 
-```
-Generated 200000 SYNTHETIC rows (same shape as `clicks`, not real data).
+A second, hands-on experiment, the failure case. Find one of your real Bronze Parquet files on disk, and try to open it directly:
 
-dataset              format      rows   size_bytes   write_s  full_read_s  one_col_read_s
------------------------------------------------------------------------------------------
-synthetic_200000     csv       200000     21626749    0.8884       0.4753          0.1645
-synthetic_200000     json      200000     38586801    0.6567       1.0284          0.9612
-synthetic_200000     parquet   200000      4329469    0.0912       0.0596          0.0082
+bash
+cat data/bronze/urls/ingestion_date=2026-09-24/urls.parquet
 
-synthetic_200000: csv is 5.00x the size of parquet
-synthetic_200000: json is 8.91x the size of parquet
-```
+You'll see unreadable binary garbage in your terminal. Now try the equivalent with a CSV file, if you have one lying around, or with data/bronze/urls/.../urls.parquet read properly instead:
 
-**What actually changed between the two scales, stated honestly:** file
-size and single-column read time favor Parquet decisively at *both*
-scales (at 5,000 rows, Parquet's one-column read is already ~2.6x faster
-than CSV's and ~10x faster than JSON's). But **full-table read time is
-the metric that flips**: at 5,000 rows, Parquet's full read (0.0132s) is
-essentially tied with — if anything, marginally slower than — CSV's
-(0.0124s); only at 200,000 rows does Parquet's full read pull decisively
-ahead (0.0596s vs. CSV's 0.4753s, ~8x faster). The reason is Parquet's
-own structure: every Parquet file carries fixed per-file overhead (a
-footer, embedded schema, column metadata) that a reader has to parse
-before touching any actual row data — at 5,000 rows that fixed cost isn't
-yet amortized away by the savings columnar storage provides; at 200,000
-rows it is, overwhelmingly. **The lesson, stated plainly: "Parquet is
-faster" is true, but only past a scale where its fixed overhead pays for
-itself — a claim this guide would have gotten wrong by only ever
-benchmarking this project's own small seeded dataset**, which is exactly
-why 19.3 chose to run both scales rather than one.
+bash
+python3 -c "import pandas; print(pandas.read_parquet('data/bronze/urls/ingestion_date=2026-09-24/urls.parquet').head())"
 
-**Caveat, stated honestly:** these are single-run wall-clock timings on a
-shared cloud sandbox, not a statistically rigorous multi-trial benchmark
-(no repeated runs, no variance reported) — the *size* numbers are exact
-and fully reproducible; the *timing* numbers should be read as
-directionally real, not as precise to the millisecond. Re-run
-`make benchmark-parquet` yourself and expect small run-to-run variance in
-the timing columns, none in the size columns.
+That second command works, because it uses a Parquet-aware tool. This is a genuine, if small, operational cost worth feeling once with your own hands: debugging "what's actually inside this Bronze object" always requires the right tool for Parquet, unlike CSV or JSON, which you can just open and read.
 
-### 19.7 Failure Scenario
+### 8. PRODUCTION VIEW
+Aspect	This project right now	Real production
+Compression codec	snappy, chosen for write/read speed	Same is common; some teams switch to zstd for better compression once storage cost matters more than compute cost
+Row-group sizing	PyArrow's own default, left unconfigured	Explicitly tuned, once files get large enough that this trade-off starts to matter
+Benchmark rigor	One run per scale, honestly labeled as such	Many repeated runs, with variance reported, on dedicated hardware
+Schema evolution	Not exercised yet — every write uses one fixed schema	Parquet does support adding/removing columns across files over time, but readers have to be written to expect that
+Reading files by hand	Needs a Parquet-aware tool	Same constraint, usually hidden behind a query engine like Spark, Athena, or DuckDB, so nobody inspects raw files directly
 
-**What happens if a Parquet file is read by a tool that doesn't
-understand it?**
+Row group, defined, since production tuning depends on it: internally, a Parquet file is split into chunks called row groups, each one holding a subset of the rows, stored in columnar form within that chunk. This lets a reader process different row groups in parallel, or skip a whole row group entirely if its statistics show it can't possibly contain a value you're filtering for. Tuning row-group size is a real trade-off between more parallelism (smaller row groups) and less per-row-group bookkeeping overhead (larger row groups), and it becomes worth touching only once files are large enough for it to matter, which your project's current file sizes are not.
 
-Concretely: a Bronze object opened with a plain text editor, or piped
-through `cat`, is unrecognizable binary — unlike a CSV or JSON-lines
-object, which is directly human-readable without any special tooling at
-all. This is a real, if minor, operational cost of the columnar/binary
-trade-off named in the Trade-offs table above: debugging "what's actually
-in this Bronze object" requires a Parquet-aware tool (`python -c "import
-pandas; print(pandas.read_parquet('...').head())"`, `parquet-tools`, or
-MinIO's own object browser, which can preview Parquet natively) rather
-than just opening the file. For a team without that tooling already in
-their muscle memory, this is a genuine, if small, onboarding friction
-point worth naming rather than glossing over as costless.
+### 9. PRINCIPAL ENGINEER VIEW
 
-### 19.8 Production Considerations
+The strongest thing to be able to say here isn't "Parquet is faster." It's this exact, more precise claim: "Parquet's advantage in full-table read time only shows up past a certain scale, because of fixed per-file overhead that has to be amortized, but its advantage in selective, few-column reads holds at every scale, including small ones, and that second number is the one that actually matters for this system's real query pattern." That's a materially stronger answer than a flat "Parquet is better," and it shows you actually looked at the numbers instead of repeating a claim you read somewhere.
 
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Compression codec | `snappy` (fast, moderate ratio) | Same default is common; some shops use `zstd` for a better ratio at some CPU cost once storage cost dominates over compute cost |
-| Row-group sizing | PyArrow's own default, unconfigured | Explicitly tuned row-group size, balancing read parallelism against per-row-group metadata overhead, once file sizes grow well past this repo's current scale |
-| Benchmark rigor | Single-run wall-clock timings, two scales, genuinely run once each (19.6) | Repeated trials, reported with variance, on dedicated (not shared/variable-load) hardware, at the actual production data scale rather than a synthetic stand-in |
-| Schema evolution | Not yet exercised — every write so far uses one, unchanging schema per table | Parquet supports schema evolution (adding/removing columns across files) but readers across an evolving dataset need to handle it explicitly; untested here |
-| Tooling accessibility | Requires a Parquet-aware tool to inspect (19.7) | Same constraint in production, typically mitigated by a query engine (Athena, Spark, DuckDB) sitting in front of raw files so nobody inspects them by hand regularly |
+A second point worth having ready: knowing which number in a table of benchmark results is actually load-bearing for your original design decision, rather than treating every column as equally important. This project chose object storage plus a columnar format specifically because of Section 2's OLAP query pattern, selective, few-column access. The single-column read numbers are the ones that actually justify that decision. The full-table read numbers are interesting, but they're not the reason Parquet was chosen in the first place.
 
-### Principal Data Engineer Perspective
-
-The judgment call worth defending here is reporting the small-scale
-result honestly even though it complicates the story ADR-003 originally
-told ("Parquet is efficient for analytical, column-selective reads," said
-with confidence, two increments before it was ever measured). A weaker
-approach to closing this benchmark gap would have been to run it once, at
-whatever scale made Parquet look unambiguously best, and call the
-"planned benchmark" item done. What actually happened — running it twice,
-finding a real result that doesn't uniformly favor Parquet at small
-scale, and explaining *why*, structurally — is a better outcome for a
-portfolio reviewer to see, not a worse one: it demonstrates the habit of
-verifying an assumption rather than just restating it more confidently
-after having measured it. The second thing worth flagging: the
-single-column read numbers are the more important ones for this
-project's actual eventual query shape (Section 2's whole reason object
-storage plus a columnar format was chosen at all), and those favor
-Parquet decisively at *every* scale tested, including the smallest —
-worth being able to say which of a benchmark's several numbers is
-actually load-bearing for the original design decision, rather than
-treating every column of a results table as equally important.
-
-### 19.9 Principal Engineer Interview Questions
+### 10. REMEMBER
+Row-oriented storage groups by row (CSV, JSON). Column-oriented storage groups by column (Parquet). A query needing few columns out of many is cheap in the second, expensive in the first.
+Parquet is binary and self-describing. Binary means you need a Parquet-aware tool to read it. Self-describing means the schema is embedded in the file's own footer, no external documentation needed.
+Amortization explains why Parquet's full-table-read advantage only appears at larger scale: a fixed per-file cost matters a lot when spread over few rows, and barely at all when spread over many.
+When several benchmark numbers exist, know which one actually justifies your original design decision. Here, it's single-column read time, not full-table read time.
 
 **Q: "Your own benchmark shows Parquet's full-table read time roughly
 tied with CSV's at 5,000 rows, only pulling ahead at 200,000. Does that
@@ -5715,185 +3925,44 @@ disk-I/O-level skipping, as though they were the same optimization.
 
 ## 20. Partitioning ✅✅
 
-### 20.1 Concept
+1. CONCEPT
+The problem first
 
-**Partitioning** splits a dataset's files across separate keys/paths by
-the value of one or more columns — typically ones a reader will commonly
-filter on — so that a query can skip entire files it doesn't need without
-opening them at all. This repo has been partitioning data since Section
-14 without ever calling it that: `build_bronze_key`'s
-`ingestion_date=2026-09-19/` and `build_bronze_incremental_key`'s
-`watermark_start=.../watermark_end=.../` are both **Hive-style
-partitioning** — a `key=value` convention embedded directly in the object
-key — already in production use in every Bronze write this pipeline
-performs. This section makes that explicit, explains *why* the convention
-looks the way it does, and adds the piece genuinely missing so far:
-**partition pruning** — actually using the partition structure to avoid
-listing objects a query doesn't need, rather than listing everything and
-filtering afterward, which is what `list_bronze_keys` (Section 17) does
-today.
+Imagine your urls table has been full-loaded every single day for the last two years. That's over 700 Bronze objects sitting in MinIO by now. Someone asks a simple question: "show me what Bronze had for urls on September 19th, 2026." How does your code find just that one object, without wading through the other 729?
 
-### Why does this exist?
+You already have the tool for "list everything": list_bronze_keys, from Section 17. It calls list_objects_v2 once, gets back every object under bronze/urls/, and hands you all 730 keys. To find just the one date you wanted, you'd then have to filter that list yourself, in Python, throwing away 729 results you never needed. That's real, wasted work: MinIO had to find, package, and send you metadata for 729 objects you were always going to discard.
 
-Without partitioning, "give me `clicks` data for 2026-09-19" means
-listing (and potentially reading) *every* object this table has ever had
-written, then filtering by date in application code — wasted work that
-grows without bound as history accumulates, for a query that only ever
-needed one day's worth of data. Partitioning by the columns queries
-actually filter on turns that into "list only the objects under this
-date's own prefix" — the filtering happens by *choosing which prefix to
-list at all*, not by discarding unwanted objects after they've already
-been listed (or, worse, read). This is exactly the same idea as an index
-on a database column, applied to an object store instead of a table: put
-the thing queries filter on into the key/path structure itself, so
-lookups can skip straight past what they don't need.
+Partitioning is the fix for exactly this. It means physically organizing where objects live based on the value of some column, usually a column people will commonly filter by, so a search can skip straight to what it needs without even looking at the rest.
 
-### Simple Example (generic, pre-URL-Shortener)
+The generic analogy: a library, organized two different ways
 
-An unpartitioned dataset: every day's export lands as
-`exports/export_2026_09_01.csv`, `exports/export_2026_09_02.csv`, ... all
-under one flat `exports/` prefix. Answering "what's in the September 19th
-export" means listing all of `exports/` (however many files exist,
-growing forever) and picking out the one matching filename by string
-comparison. A Hive-partitioned version instead uses
-`exports/date=2026-09-01/data.csv`, `exports/date=2026-09-02/data.csv`,
-... — "what's in the September 19th export" becomes `list(Prefix=
-"exports/date=2026-09-19/")`, a single, cheap call that only ever touches
-objects for that one day, regardless of how many other days' worth of
-data exists elsewhere in the bucket.
+Picture a library with two years of daily newspapers, one per day.
 
-### URL Shortener Example
+Unorganized library. Every single newspaper, all 730 of them, is stacked in one giant pile in the lobby, in no particular order. To find September 19th's paper, a librarian has to pick up and check the date on every single paper in the pile, until they find the right one, or confirm it isn't there.
 
-`bronze/clicks/incremental/watermark_start=000000005000/watermark_end=000000005103/clicks.parquet`
-is already exactly this pattern — a Hive-style partition on
-`watermark_start`/`watermark_end` for incremental loads;
-`bronze/urls/ingestion_date=2026-09-19/urls.parquet` the same, on
-`ingestion_date`, for full loads. What's new this section:
-`list_bronze_keys_for_date_range` (full-load tables only — see 20.3's
-Design Decision for why incremental tables are explicitly out of scope
-for this specific function), which issues one `list_objects_v2` call
-**per date**, each scoped to that date's own partition prefix, instead of
-one call over the table's entire `bronze/{table}/` prefix followed by
-client-side filtering (which is what `list_bronze_keys`, Section 17,
-still does today, and continues to do — it's the right tool for "list
-everything," just not for "list one date range").
+Organized library. The papers are sorted into 730 separate labeled shelf slots, one slot per date, like Sept-01, Sept-02, Sept-03, and so on. To find September 19th's paper, the librarian walks directly to the shelf labeled Sept-19 and picks it up. They never touch any of the other 729 papers at all.
 
-### 20.2 Architecture
+Both libraries hold the exact same papers. The only difference is where each paper physically sits, organized in a way that matches how people are actually going to search for it. That's the entire idea of partitioning.
 
-```
- Unpruned (list_bronze_keys, Section 17):
+A term you need first: Hive-style partitioning
 
-   list_objects_v2(Prefix="bronze/urls/")
-        │
-        ▼
-   returns EVERY urls object ever written, every ingestion_date
-        │
-        ▼
-   caller filters by date in Python, if it only wanted one range
-   (cost scales with TOTAL history, not the range actually needed)
+Hive-style partitioning is a specific naming convention for the "shelf labels" in our library analogy, when the library is really an object store instead of a real building. Instead of labeling a shelf just Sept-19, you encode both the column name and its value directly into the object's key, as columnname=value. So a key looks like:
 
+bronze/urls/ingestion_date=2026-09-19/urls.parquet
 
- Pruned (list_bronze_keys_for_date_range, Section 20 -- NEW):
+That ingestion_date=2026-09-19 segment is doing exactly the same job as the Sept-19 shelf label. It's not a real folder MinIO tracks specially, as you learned in the Object Storage section. It's just a text convention, but a very useful one, because it lets you predict the exact prefix to search for, before you ever ask MinIO anything.
 
-   for each date in [start_date, end_date]:
-       list_objects_v2(Prefix=f"bronze/urls/ingestion_date={date}/")
-                             │
-                             ▼
-                    returns ONLY that date's own object(s)
-        │
-        ▼
-   caller concatenates -- S3 itself never even considered objects
-   outside the requested range (cost scales with the RANGE requested,
-   not total history)
-```
+Partition pruning, the piece that's actually new this section
 
-The two functions coexist deliberately, not because one replaces the
-other: `list_bronze_keys` is still the right call for "give me
-everything" (reconciliation, Section 17, genuinely needs a full listing
-to detect orphans and cannot know in advance which dates to prune to);
-`list_bronze_keys_for_date_range` is the right call for "give me a known
-range" — exactly the access pattern a Phase 2 transform reading, say,
-"the last 7 days of `urls` snapshots" would have.
+Having a key=value structure in your keys is only half the story. You have to actually use that structure when searching, instead of listing everything and filtering afterward. Partition pruning means constructing the exact narrow prefix for what you want, and only ever asking the object store for that prefix, so objects outside your range are never even considered by MinIO, let alone returned to you.
 
-### 20.3 Design Decision: scope pruning to full-load's date partitions only
+You've actually been doing the labeling half of this since Section 14, without ever naming it. build_bronze_key's ingestion_date=2026-09-19/ and build_bronze_incremental_key's watermark_start=.../watermark_end=.../ are both real, already-in-production Hive-style partitioning. What's genuinely new this section is the pruning half: actually exploiting that structure on the read side, instead of just on the write side.
 
-**Context:** this repo has two different partitioning schemes in
-production already — full-load's `ingestion_date=` (a calendar date) and
-incremental-load's `watermark_start=`/`watermark_end=` (an integer
-range) — and pruning needs to actually construct valid prefixes to query,
-which means knowing the scheme in advance. **Decision:**
-`list_bronze_keys_for_date_range` handles the date-partitioned scheme
-only; no equivalent watermark-range-pruned function was built this
-increment for incremental tables. **Alternatives considered:** a single,
-more general pruning function that accepts either a date range or a
-watermark range, dispatching on `load_type`; deferring date-range pruning
-entirely until both schemes could be handled uniformly. **Trade-offs:** a
-unified function would present one interface for both cases, but a
-watermark range isn't queryable the same way a date range is — the whole
-point of a watermark is that it's an opaque, monotonically-increasing
-id boundary discovered from `ingestion_metadata` (Section 15), not a
-value a caller can enumerate in advance the way `date(2026, 9, 18)`
-through `date(2026, 9, 20)` can be listed one day at a time; building a
-"prune by watermark range" function honestly would need to first query
-`ingestion_metadata` for which specific `(watermark_start, watermark_end)`
-pairs actually exist in the requested range, which is a meaningfully
-different (and already-available, via `list_successful_bronze_keys`)
-code path, not a variant of prefix construction. **Consequences:** a
-Phase 2 reader wanting a pruned listing of *incremental* Bronze data
-should query `ingestion_metadata` directly (already possible today, via
-`list_successful_bronze_keys` with a date filter added to that query) —
-this is named as a real, current scope boundary, not silently treated as
-solved by a function that doesn't actually solve it for that case.
+2. URL SHORTENER EXAMPLE
 
-### Alternatives
+Here's the real function, already in your object_store.py, that does real partition pruning for full-load tables:
 
-Covered above. A further, smaller alternative considered for the
-date-partitioned case specifically: accepting a list of `S3 Select` or
-server-side filter expressions instead of iterating dates client-side —
-rejected as genuinely out of scope for a POC (S3 Select requires the
-object contents themselves to be scanned server-side per object, a
-different and more complex mechanism than prefix-based partition pruning,
-and MinIO's S3 Select support/performance characteristics differ from
-AWS's in ways this project hasn't evaluated).
-
-### Trade-offs
-
-| | `list_bronze_keys` (full listing) | `list_bronze_keys_for_date_range` (pruned) |
-|---|---|---|
-| Calls issued | One | One per date in range |
-| Objects S3 considers | Every object under the table's prefix | Only objects under the requested dates' prefixes |
-| Right tool for | "Give me everything" (reconciliation) | "Give me a known date range" |
-| Works for incremental tables | Yes (lists everything, any scheme) | No -- see 20.3's Design Decision |
-| Cost as history grows | Grows with total history | Stays constant for a fixed-size requested range |
-
-### 20.4 Implementation
-
----
-
-**CREATE:** (edit) `ingestion/src/url_shortener_analytics/object_store.py`
-— `list_bronze_keys_for_date_range`
-
-**PURPOSE:** Demonstrate, and make available, genuine partition pruning
-for full-load tables' date-partitioned Bronze keys — fewer S3 calls,
-fewer objects considered, for a caller that already knows the date range
-it needs.
-
-**IMPLEMENTATION GUIDE (write it yourself):** loop from `start_date` to
-`end_date` inclusive (one day at a time — `datetime.timedelta(days=1)`),
-and for each date, construct the *exact* prefix `build_bronze_key` itself
-would produce for that date (`bronze/{table}/ingestion_date={date}/`) and
-call `list_objects_v2` scoped to just that prefix. Concatenate the
-results. Resist the temptation to instead call `list_bronze_keys` once
-and filter the combined result by date in Python — that's exactly the
-*unpruned* pattern this function exists to avoid; the entire point is
-which prefix gets sent to S3, not how the result gets filtered
-afterward.
-
-**REFERENCE IMPLEMENTATION:**
-
-```python
-# ingestion/src/url_shortener_analytics/object_store.py (excerpt)
-
+python
 def list_bronze_keys_for_date_range(
     s3_client: BaseClient, bucket: str, table_name: str, start_date: date, end_date: date
 ) -> list[str]:
@@ -5905,134 +3974,83 @@ def list_bronze_keys_for_date_range(
         keys.extend(obj["Key"] for obj in response.get("Contents", []))
         current += timedelta(days=1)
     return keys
-```
+3. CODE WALKTHROUGH
 
-Full file: [`object_store.py`](../ingestion/src/url_shortener_analytics/object_store.py).
+Let's go through this one line at a time, since there's a subtlety here worth catching.
 
-**RUN:** exercised indirectly — there's no standalone CLI subcommand for
-this one (by design; it's a library function a Phase 2 reader would call
-programmatically with a known range, not an ad-hoc operator command the
-way `storage-stats` is).
+keys: list[str] = [] starts an empty list. This will collect every matching key across every date in the range.
 
-**VERIFY:** LAB 16 below, and `test_object_store.py`'s
-`test_list_bronze_keys_for_date_range_issues_one_call_per_date_scoped_to_that_dates_prefix`,
-which asserts the *exact* sequence of prefixes sent to a mocked S3
-client — not just the returned keys, but proof of which calls were
-actually issued.
+current = start_date begins a loop, starting from the first day you asked about.
 
-**EXPECTED:** for an N-day range, exactly N `list_objects_v2` calls, each
-`Prefix`-scoped to one date; a date with no object written that day
-contributes nothing (an empty `Contents`), not an error.
+while current <= end_date: keeps looping, one day at a time, until it passes the last day you asked about.
 
-**TEST:** `test_object_store.py` — two new tests: a 3-day range issuing
-exactly 3 calls, each with the exact expected prefix (using
-`unittest.mock.call` to assert the full call sequence, not just the
-count); a single-day range issuing exactly 1 call.
+date_prefix = f"bronze/{table_name}/ingestion_date={current:%Y-%m-%d}/". This is the important line. It builds the exact same prefix string that build_bronze_key would have used when writing that day's object. This has to match exactly, character for character, or the search would silently return nothing for that date.
 
-**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections
-20.8/20.9.
+response = s3_client.list_objects_v2(Bucket=bucket, Prefix=date_prefix). This is the actual LIST call from the Object Storage section, but notice it's scoped to just this one day's prefix, not the whole table's prefix. MinIO will only ever look at, and return, objects whose key starts with this narrow prefix.
 
----
+keys.extend(obj["Key"] for obj in response.get("Contents", [])). Adds whatever matched for this one day onto the running list. If nothing was written that day, Contents comes back empty, and nothing gets added; no error happens.
 
-### Hands-on Challenge (implement-yourself)
+current += timedelta(days=1). Moves forward exactly one calendar day, and the loop repeats.
 
-Before LAB 16 below, try this without looking at `object_store.py`: using
-a mocked S3 client (`unittest.mock.MagicMock`, the same pattern this
-repo's own tests use throughout), write a small script that calls
-`list_bronze_keys` once and `list_bronze_keys_for_date_range` once, both
-for a 30-day range, against a bucket that has one object per day going
-back 365 days. Print `s3_client.list_objects_v2.call_count` after each.
-Predict the two numbers before running it. (Answer: `list_bronze_keys`
-issues exactly 1 call, `list_bronze_keys_for_date_range` issues exactly
-30 — more calls, not fewer. Sit with why "more calls" is nonetheless the
-*better* choice here: `list_bronze_keys`'s single call still has to
-return, and the caller still has to transfer and hold in memory,
-metadata for all 365 objects even though only 30 days were wanted;
-`list_bronze_keys_for_date_range`'s 30 calls together transfer metadata
-for only the ~30 objects actually needed. Pruning trades call *count* for
-data *volume* — the right trade whenever total history is much larger
-than the range actually requested, and the wrong one when it isn't,
-which 20.7's Failure Scenario covers directly.)
+The subtlety worth catching: this function makes one separate LIST call per day in the range, not one call total. A 3-day range means 3 calls. This is deliberate, and it's the whole mechanism. The temptation to avoid is calling list_bronze_keys once for the whole table, and then filtering the combined result down to your date range in Python. That would technically give the same answer, but it would defeat the entire purpose: MinIO would still have had to find and return metadata for every object the table has ever had, including all the dates you didn't want, before your code got the chance to throw most of it away.
 
-### 20.5 Hands-on Exercise
+4. DESIGN
+The real design decision: why isn't there one pruning function for both partition schemes?
 
-**LAB 16 — Prove pruning issues fewer, more targeted calls than a full
-listing, against a mocked S3 client.**
+Here's something worth noticing: your project actually has two different partitioning schemes in production already. Full-load tables use ingestion_date=2026-09-19 (a calendar date). Incremental-load tables use watermark_start=.../watermark_end=... (an integer id range, from Section 15). You might expect one general "prune by whatever" function that handles both. Your project deliberately built only the date-range version this section, and it's worth understanding exactly why.
 
-```bash
+A calendar date range is something you can enumerate in advance. If you want September 1st through September 20th, you can list all 20 exact dates yourself, in Python, with nothing but a loop, before ever talking to the database or the object store. A watermark range is fundamentally different. A watermark is an opaque number, discovered by reading ingestion_metadata, and it's not something you can predict or enumerate ahead of time the way a calendar date is. You can't just guess "I want watermarks 5000 through 8000" and build 3,000 individual prefixes; you'd first have to query ingestion_metadata to find out which actual (watermark_start, watermark_end) pairs exist in that range at all, which is a genuinely different code path (and one you already have, list_successful_bronze_keys).
+
+So building one "unified" function that pretended to handle both would have been dishonest: it would either silently do the wrong thing for incremental tables, or need an entirely separate internal path anyway, hidden behind a misleadingly uniform-looking interface. Naming the boundary explicitly (this function handles date-partitioned, full-load tables only) is more trustworthy than a function that looks complete but secretly isn't.
+
+Two functions, kept deliberately separate, not one replacing the other
+	list_bronze_keys (Section 17, full listing)	list_bronze_keys_for_date_range (this section, pruned)
+Calls issued	One	One per date in the requested range
+What S3/MinIO considers	Every object under the table's whole prefix	Only objects under the requested dates' prefixes
+Right tool for	"Give me everything" — this is what reconciliation (Section 17) genuinely needs	"Give me a known, bounded range"
+Works for incremental tables	Yes	No, by design (see above)
+Cost as history grows	Grows forever, with total history	Stays constant, for a fixed-size range
+5. EXPERIMENT (the hands-on challenge, worked through before you run it)
+
+Here's a prediction exercise straight from your project's own guide, worth doing before you look at the answer.
+
+Imagine a bucket with one object per day, going back 365 days. You call list_bronze_keys once, and list_bronze_keys_for_date_range once, both asking for the same 30-day range. How many times does each one call list_objects_v2?
+
+Write your guess down before reading on.
+
+The real answer: list_bronze_keys issues exactly 1 call. list_bronze_keys_for_date_range issues exactly 30 calls. More calls, not fewer. If your instinct says "then pruning made things worse," sit with that for a second, because it's the whole point of this exercise.
+
+Here's why 30 calls is still the better choice in this scenario. list_bronze_keys's single call still has to find, package, and transfer metadata for all 365 objects, even though only 30 days were ever wanted. list_bronze_keys_for_date_range's 30 calls, together, only ever transfer metadata for the roughly 30 objects actually needed. Pruning trades call count for data volume. You make more, smaller, cheaper requests, in exchange for never touching data you didn't ask for. That's the right trade whenever the range you want is much smaller than the table's total history.
+
+This trade has a real breaking point, and it's worth knowing before it bites you. If someone asks list_bronze_keys_for_date_range for a 365-day range, on a table that has exactly 365 days of history, it issues 365 separate calls, for zero pruning benefit at all, since there was nothing left to prune. In that specific case, the plain, unpruned list_bronze_keys (one call) would actually have been faster. Nothing in list_bronze_keys_for_date_range's own code warns you about this; it will happily issue however many calls a huge range implies, with no upper limit. A caller reaching for the pruned function with a range that turns out to be someone's entire history has picked the wrong tool for the job.
+
+6. RUN
+
+This one is fully runnable right now, in this sandbox or on your own machine, with no MinIO or Docker needed at all, because it tests against a mocked S3 client rather than a real one:
+
+bash
 PYTHONPATH=ingestion/src python3 -m pytest ingestion/tests/unit/test_object_store.py -k date_range -v
-```
 
-What to observe: `test_list_bronze_keys_for_date_range_issues_one_call_per_date_scoped_to_that_dates_prefix`
-asserts the exact three `Prefix` values sent to the mocked client for a
-3-day range — this is the concrete, checkable proof that "partition
-pruning" here means specific, narrowly-scoped calls, not a vague
-performance claim. *(This LAB is fully runnable in this sandbox, unlike
-LAB 13's real-MinIO scenario — it tests this function's own call
-pattern against a mock, not real S3 network behavior, so no MinIO is
-needed. ACTUAL OBSERVED: this exact command was run while writing this
-section — 2 passed.)*
+Expected: 2 tests pass. One proves a 3-day range issues exactly 3 calls, with the exact three Prefix values checked directly, not just the count. One proves a single-day range issues exactly 1 call.
 
-### 20.6 How to test
+7. PRODUCTION VIEW
+Aspect	This project right now	Real production
+Partition granularity	One file per day (full load), or per watermark range (incremental)	Same Hive-style convention is standard; a real deployment also splits an unusually large day's data across multiple files, since your project's current files are actually too small, not too large
+Doing the pruning	Hand-written, per-date loop, in your own Python code	A real query engine (Spark, Athena, DuckDB, Trino) does this automatically, from something like WHERE date BETWEEN '...' AND '...', using its own internal catalog, no hand-written loop needed
+Protection against a huge range	None — as shown above, it issues as many calls as the range implies	A real system would warn, reject, or automatically fall back to a full listing past some sensible size threshold
+Pruning incremental tables	Not built, a named and deliberate gap	A real metastore (Hive Metastore, AWS Glue Catalog, Iceberg's metadata) tracks partition boundaries for every load type the same way, whether the partition key is a date or a watermark range
+Knowing which partitions exist at all	The caller has to already know the date range they want	A real catalog tracks which partitions actually exist, so a reader doesn't have to already know the answer before asking
+8. PRINCIPAL ENGINEER VIEW
 
-```bash
-make test
-```
+If asked "your function issues one API call per date, isn't that worse than a single call, for a large range?", the strong answer is the one you just worked through by hand: yes, in call count, for a large-enough range, but the whole benefit was never about call count. It's about how much data gets transferred and held in memory per call. Being able to state precisely when the trade-off flips, "pruning wins when the requested range is much smaller than total history, and loses when it approaches the full history," is a materially stronger answer than either "pruning is always better" or getting talked out of the design by the call-count objection alone.
 
-ACTUAL OBSERVED, genuinely run in this environment:
+A second point worth having ready: recognizing when not to unify two similar-looking things. It would have looked more impressive to ship one "generic partition pruning" function handling both date ranges and watermark ranges. It also would have been dishonest, since a watermark range isn't enumerable the way a date range is. Explicitly scoping a function to exactly the case it can do correctly, and naming the boundary rather than hiding it, is a real engineering judgment call, and it's one interviewers specifically probe for when they ask "what would you not build, and why."
 
-```
-63 passed in 7.09s
-```
-
-`ruff check ingestion/ benchmarks/` also passed cleanly on every file
-this increment touched.
-
-**What remains a DESIGN EXPECTATION:** whether pruning produces a real
-*wall-clock* speedup against genuine MinIO/S3 network latency, as opposed
-to fewer, more targeted calls in principle (proven above, against a
-mock) — there is no MinIO in this sandbox to measure real network-call
-savings against. The call-count/call-target proof above is real and
-sufficient to demonstrate the mechanism; a true latency benchmark (one
-call vs. thirty, over a real network, at meaningfully large history) is
-left for the reader with real infrastructure to run.
-
-### 20.7 Failure Scenario
-
-**When does requesting a date range with `list_bronze_keys_for_date_range`
-actually perform *worse* than just calling `list_bronze_keys` once and
-filtering client-side?**
-
-The Hands-on Challenge above already surfaces the mechanism: pruning
-issues **one call per date in the requested range**, regardless of how
-much or how little data exists for the whole table overall. Requesting a
-365-day range issues 365 calls — worse than `list_bronze_keys`'s single
-call, in call *count*, even though `list_bronze_keys`'s one call has to
-return (and the caller has to hold) metadata for every object under the
-prefix, including dates outside what's wanted. Concretely: if a caller
-wants "every date this table has ever had data for" (i.e. the range
-*is* the whole history), `list_bronze_keys_for_date_range` is strictly
-worse than `list_bronze_keys` — more calls, same total objects returned,
-no pruning benefit at all, since there's nothing left to prune. Pruning
-only pays for itself when the requested range is meaningfully smaller
-than total history — exactly the condition Section 20.3's Trade-offs
-table states but is worth restating as a concrete, checkable failure
-case: a caller reaching for `list_bronze_keys_for_date_range` with a
-range that turns out to cover this table's entire lifetime has picked
-the wrong function, and nothing in the function's own signature warns
-them of that — it will happily issue however many calls the range
-implies, with no upper bound check.
-
-### 20.8 Production Considerations
-
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Partition granularity | One partition per calendar day (full load) or per watermark range (incremental) — a single file per partition | Same convention (Hive-style) is standard in production lakes too; a real deployment additionally splits large partitions into multiple files (small-file compaction is the usual concern; this repo's files are small enough that under-splitting, not over-splitting, is the actual current risk — Section 33's named gap) |
-| Pruning | Client-side loop issuing one `list_objects_v2` call per date, in this repo's own code | A real query engine (Athena, Spark, DuckDB, Trino) does this automatically from a `WHERE date BETWEEN ...` clause via its own catalog/metastore, without hand-written per-date loops |
-| Unbounded range protection | None — `list_bronze_keys_for_date_range` issues as many calls as the range implies, with no cap (20.7) | A real implementation would reject or warn on a suspiciously large requested range, or transparently fall back to a full listing plus client-side filter past some threshold |
-| Cross-scheme pruning (incremental tables) | Not implemented — named scope boundary (20.3) | A real metastore tracks partition boundaries for every load type uniformly, regardless of whether the partition key is a date or a watermark range |
-| Partition discovery | Caller must already know the date range wanted | A real catalog (Hive Metastore, AWS Glue Catalog, Iceberg's own metadata) tracks which partitions exist, so a reader doesn't need to already know the answer before querying for it |
-
+9. REMEMBER
+Partitioning means organizing where data physically lives, by the value of a column people actually filter on, so a search can skip what it doesn't need.
+Hive-style partitioning is just a key=value naming convention baked into the object's key string. It's not a real folder; it's a predictable pattern your code can reconstruct.
+Pruning means constructing the narrow prefix yourself and asking only for that, instead of listing everything and filtering afterward in your own code.
+Pruning trades more, smaller calls for less transferred data. That's a win when your range is small relative to total history, and a loss when your range basically is the total history.
 ### Principal Data Engineer Perspective
 
 The judgment call worth defending here is scoping this section's new code
@@ -6146,186 +4164,42 @@ requirements driving genuinely different key structures.
 
 ## 21. File Layout ✅✅
 
-### 21.1 Concept
+1. CONCEPT
+First, how is this different from Partitioning, the thing we just covered?
 
-**File layout** is a distinct question from partitioning (Section 20):
-partitioning decides *which column values* split data into separate
-objects; file layout decides *how many files, and how big each one is*,
-within whatever partitioning scheme is already in place. This repo has
-had an answer to that second question since Section 14, without ever
-naming it explicitly: exactly **one file per partition** — one Parquet
-object per `(table, ingestion_date)` for full loads, one per
-`(table, watermark_start, watermark_end)` for incremental batches. This
-section makes that choice explicit, explains the failure mode it's
-avoiding on one side (too many small files) and the one it risks on the
-other (files that grow too large for a single partition to stay
-efficient), and adds a genuinely new piece of code —
-`get_file_layout_report` — to actually *measure* which side of that
-trade-off this repo's real data currently sits on.
+This trips people up, so let's separate it cleanly before going further.
 
-### Why does this exist?
+Partitioning answers: which column values split your data into separate objects? That's what put ingestion_date=2026-09-19 into your Bronze keys.
 
-Two failure modes sit on either side of "how many files should one
-partition have," and both are real, not hypothetical. **Too many small
-files**: Section 19.6 already measured this repo's own Parquet files
-paying a fixed per-file cost (footer, embedded schema, column metadata)
-that has to be parsed before any row data is touched — that exact fixed
-cost is paid again, in full, for every additional file a reader opens.
-A partition split into a thousand tiny files pays that fixed cost a
-thousand times over, for the same total data a single file would have
-paid it for once — this is "the small-file problem," a genuinely common
-failure mode in real data lakes, and it's the *same* underlying
-mechanism Section 19.6 already demonstrated, not a new concept. **Too
-few, overly large files**: the opposite failure — a single enormous file
-per partition limits how many parallel workers can read it at once (many
-engines split work by file, not by byte range, within a partition) and
-forces a reader wanting even a small slice of a partition to open and
-scan the entire object. This repo's current, tiny data volume (Section
-19's seeded 5,000-row `clicks` table) sits nowhere near either extreme
-today — but "today" is doing real work in that sentence, and this
-section's new code exists specifically to make that claim checkable
-rather than assumed.
+File layout answers a completely different question: once you know a piece of data belongs in one particular partition, how many separate files should hold it, and how big should each one be?
 
-### Simple Example (generic, pre-URL-Shortener)
+You could partition perfectly, and still get file layout wrong. Imagine a single day's worth of clicks data, correctly landing under ingestion_date=2026-09-19/. That's still just an address. Inside that address, you could put all of it in one file, or split it into a hundred tiny files, or one file so enormous nothing can read it efficiently. Partitioning decided the folder. File layout decides what's inside it.
 
-A day's worth of application logs, three layout choices for the same
-data: (1) one gigantic file containing the entire day — cheap to write,
-but a reader wanting just the 2pm hour has to scan the whole thing; (2)
-one file per log *line* — trivially parallel to read one line, but
-absurdly expensive in aggregate (millions of tiny files, each paying
-whatever fixed per-file overhead the storage format and the object store
-itself impose); (3) hourly-rotated files — a deliberate middle ground,
-sized so each file is large enough to amortize per-file overhead but
-small enough that a hour-scoped query only touches the files it actually
-needs. File layout, in general, is choosing where on this spectrum a
-dataset's actual read patterns and data volume land.
+Your project has actually had a real answer to this question since Section 14, without ever naming it: exactly one file per partition. One Parquet object per (table, date), for full loads. This section makes that choice explicit, and gives you a way to actually check whether it's still true.
 
-### URL Shortener Example
+Two failure modes, sitting on opposite sides of a healthy middle
 
-`get_file_layout_report(s3_client, bucket, "clicks")` reports, per
-table: object count, total/average/min/max object size, and how many
-objects fall below a configurable "small file" threshold (default 8 MiB
-— an arbitrary but commonly-cited rule-of-thumb cutoff, well below the
-multi-hundred-MB target object sizes a real lake typically aims for).
-Applied to this repo's own real data: Section 19.6 measured the real,
-5,000-row `clicks` table's single Parquet object at 417,649 bytes — a
-single file, `object_count = 1`, `small_file_count = 1` under the default
-threshold, which is expected and correct at this data volume: one small
-file isn't a *problem* yet, because there's only one file, period — the
-small-file problem is about *many* small files, not the mere existence of
-one.
+Too many small files. You already measured, in the Parquet section, that every Parquet file carries a fixed cost: a footer has to be written and parsed, no matter how many rows are inside. If one partition's data got split across a thousand tiny files instead of one, a reader would pay that exact fixed cost a thousand separate times, for the exact same total amount of data a single file would have paid it for once. This is called the small-file problem, and it's one of the most common, genuinely-encountered failure modes in real data lakes.
 
-### 21.2 Architecture
+Too few, overly large files. The opposite mistake. If one partition is a single, enormous file, two problems show up. First, many processing engines split their work by file, not by arbitrary byte ranges within a file, so one giant file can only ever be worked on by one worker at a time, wasting whatever parallel processing power is available. Second, a reader who only wants a small slice of that partition still has to open and scan the entire massive object to get it.
 
-```
- One partition, one file (this repo's current layout, Sections 14-15):
+The generic analogy: packing boxes for a house move
 
-   bronze/clicks/ingestion_date=2026-09-19/clicks.parquet
-        │
-        ▼
-   a reader wanting this partition's data opens exactly ONE file,
-   pays Parquet's fixed per-file overhead (footer/schema parse) ONCE
+Picture moving out of an apartment. You have one room's worth of belongings to pack, call it "the partition."
 
+If you pack every single item into its own individually-labeled box, one box per fork, one box per book, you'll have hundreds of boxes. Loading the truck means physically lifting hundreds of separate boxes, each one adding its own handling time, even though the total amount of stuff hasn't changed.
 
- The small-file failure mode (NOT this repo's current layout --
- illustrative only):
+If you pack everything from that entire room into one giant box, you'll need a forklift to move it, and if you need just one item out of it later, you have to unpack the entire box to find it.
 
-   bronze/clicks/ingestion_date=2026-09-19/part-00001.parquet
-   bronze/clicks/ingestion_date=2026-09-19/part-00002.parquet
-   ...
-   bronze/clicks/ingestion_date=2026-09-19/part-00847.parquet
-        │
-        ▼
-   a reader wanting this SAME partition's data opens 847 files,
-   pays that same fixed per-file overhead 847 TIMES over --
-   exactly the cost Section 19.6 measured per file, multiplied
+The sensible middle ground: a reasonable number of medium-sized boxes, each holding a sensible amount, labeled clearly. Big enough that you're not managing hundreds of tiny units, small enough that any one box is still manageable to lift, open, and search. File layout is choosing where, on that same spectrum, your actual data lands.
 
+2. URL SHORTENER EXAMPLE
 
- get_file_layout_report (Section 21 -- NEW):
+Your real clicks table, at its current seeded size, has exactly one Bronze object: bronze/clicks/ingestion_date=2026-09-19/clicks.parquet, measured back in the Parquet section at 417,649 bytes. object_count = 1. That's the healthy, current state of your one-file-per-partition layout. Nothing to fix, nothing degrading, because with only one file, there's no problem, just an unremarkable fact.
 
-   list_objects_v2(Prefix="bronze/clicks/")
-        │
-        ▼
-   per-object Size, reused directly (same no-extra-head_object-calls
-   approach as get_bucket_stats, Section 18) -- reduced to
-   {object_count, total_bytes, avg_bytes, min_bytes, max_bytes,
-    small_file_count}
-```
+But "healthy today" isn't something you should have to just assume forever. The real question is: how would you actually know, later, if that stopped being true? That's what this section's new function answers.
 
-### 21.3 Design Decision: detect small-file accumulation, never auto-compact
-
-**Context:** this repo's current one-file-per-partition layout could,
-in principle, degrade toward the small-file failure mode above if a
-future change (e.g. splitting a partition's write into multiple
-size-bounded files for parallelism) were made carelessly, or if
-partition granularity changed without file-count discipline.
-**Decision:** `get_file_layout_report` measures and reports layout
-health; it does not compact, merge, or rewrite any object. **Alternatives
-considered:** an automatic compaction job that detects a partition with
-too many small files and rewrites them into fewer, larger ones.
-**Trade-offs:** automatic compaction would actually *fix* a degrading
-layout rather than just reporting it — but compaction is a genuinely
-more dangerous operation than reconciliation's detection (Section 17.7):
-it means deleting original objects after rewriting their contents
-elsewhere, and any bug in that rewrite logic risks *real data loss*, not
-just a stale report. Detection-only costs a human having to act on what's
-found, in exchange for a categorically safer default. **Consequences:**
-this is the same detect-don't-remediate posture Section 17.7 already
-established for Bronze reconciliation, now applied a second time to a
-different failure class — a recurring, deliberate pattern across this
-project's operational tooling, not a one-off choice; see ADR-013 for the
-decision written up as its own record, since this is now the second
-independent section to make essentially this same call.
-
-### Alternatives
-
-Covered above. A further, smaller alternative considered: reporting only
-`object_count` and `total_bytes` (matching `get_bucket_stats`'s existing
-shape from Section 18) rather than the fuller `avg`/`min`/`max`/
-`small_file_count` breakdown — rejected because `object_count` and
-`total_bytes` alone cannot distinguish "one healthy 4 MB file" from "500
-unhealthy 8 KB files that happen to sum to the same total" — precisely
-the distinction this section's whole purpose is to make visible; see
-21.7's Failure Scenario for why even `avg_bytes` alone isn't quite
-enough either.
-
-### Trade-offs
-
-| | Detection only (chosen) | Automatic compaction |
-|---|---|---|
-| Risk of data loss from a bug | None -- read-only reporting | Real -- compaction means delete-after-rewrite |
-| Actually fixes a degrading layout | No -- a human has to act | Yes, automatically |
-| Implementation cost (this repo) | One function, one CLI command | A rewrite pipeline, plus a safe-deletion story for originals |
-| Consistent with this project's established posture | Yes -- matches Section 17.7's reconciliation stance | Would be the first auto-remediating operation in the whole codebase |
-
-### 21.4 Implementation
-
----
-
-**CREATE:** (edit) `ingestion/src/url_shortener_analytics/object_store.py`
-— `get_file_layout_report`
-
-**PURPOSE:** Per-table file-layout health: object count, size
-distribution, and small-file count — turning "is this table's Bronze
-layout degrading" from an assumption into a checkable, testable report.
-
-**IMPLEMENTATION GUIDE (write it yourself):** scope the listing to one
-table's own prefix (`bronze/{table_name}/`), not the whole `bronze/`
-prefix `get_bucket_stats` (Section 18) uses — file-layout health is
-naturally a per-table question, since different tables land at very
-different sizes and counts. Reuse `Size` from `list_objects_v2`'s
-response directly, the same no-extra-`head_object`-calls approach as
-`get_bucket_stats`. Compute count, sum, average (integer division is
-fine — this is a reporting number, not a precise statistic), min, and
-max; count objects below `small_file_threshold_bytes`. Handle the
-zero-object case explicitly — return all zeros, not a `ZeroDivisionError`
-from an empty-list average.
-
-**REFERENCE IMPLEMENTATION:**
-
-```python
-# ingestion/src/url_shortener_analytics/object_store.py (excerpt)
-
+python
 DEFAULT_SMALL_FILE_THRESHOLD_BYTES = 8 * 1024 * 1024  # 8 MiB
 
 def get_file_layout_report(
@@ -6340,125 +4214,81 @@ def get_file_layout_report(
         "min_bytes": min(sizes), "max_bytes": max(sizes),
         "small_file_count": sum(1 for s in sizes if s < small_file_threshold_bytes),
     }
-```
+3. CODE WALKTHROUGH
 
-Full file: [`object_store.py`](../ingestion/src/url_shortener_analytics/object_store.py).
+DEFAULT_SMALL_FILE_THRESHOLD_BYTES = 8 * 1024 * 1024. This defines "small" as under 8 MiB. MiB, defined: a mebibyte, exactly 1,048,576 bytes, the binary-computing equivalent of "megabyte." 8 MiB is not derived from any deep principle; it's a commonly-cited rule-of-thumb cutoff in the industry, well below the multi-hundred-megabyte object sizes a real, mature data lake typically aims for.
 
-**RUN:** `make layout-report TABLE=clicks` (wraps `python -m
-url_shortener_analytics.cli layout-report --table clicks`)
+s3_client.list_objects_v2(Bucket=bucket, Prefix=f"bronze/{table_name}/"). Notice this is scoped to one table's own prefix, not the whole bronze/ prefix the way get_bucket_stats (Object Storage section) was. That's deliberate: file layout health is naturally a per-table question, since different tables land at very different sizes and object counts, and averaging them together would hide exactly the thing you're trying to measure.
 
-**VERIFY:** compare against `make storage-stats`'s whole-Bronze totals —
-summing `layout-report`'s `total_bytes` across every table should equal
-`storage-stats`'s Bronze-wide `total_bytes`.
+sizes = [obj["Size"] for obj in response.get("Contents", [])]. Same trick you already learned in get_bucket_stats: reuse the Size field the LIST call already returned, instead of making a separate call per object to ask for its size.
 
-**EXPECTED:** at this repo's current seeded data volume, `object_count`
-in the low single digits per table, `small_file_count` equal to
-`object_count` (every current object is "small" under the default 8 MiB
-threshold, per 21.6's derived estimate below) — expected and healthy at
-this volume, not a warning sign.
+if not sizes: return {...all zeros...}. This handles the case where the table has no Bronze objects at all yet. Without this check, sum(sizes) // len(sizes) would try to divide by zero and crash. Handling this explicitly, with a clean all-zero result, is a small but real defensive habit: a brand-new table with nothing written yet is a completely normal state, not an error.
 
-**TEST:** `test_object_store.py` — three new tests: size stats computed
-correctly with a mixed small/large set, a custom threshold changing which
-objects count as small, and the all-zero empty-table case.
+"avg_bytes": sum(sizes) // len(sizes). Notice the double-slash, //, not a single /. This is integer division: dividing and throwing away any decimal remainder, so the result is always a whole number. This is fine here specifically because avg_bytes is a rough reporting number for a human to glance at, not a value anything downstream does precise math with.
 
-**PRODUCTION CONSIDERATIONS / INTERVIEW QUESTIONS:** see Sections
-21.8/21.9.
+"small_file_count": sum(1 for s in sizes if s < small_file_threshold_bytes). For every object, this adds 1 if its size is under the threshold, and adds nothing otherwise, then totals it up. This is the field the whole function exists to produce.
 
----
+4. DESIGN
+Why report small_file_count, min_bytes, and max_bytes, instead of just avg_bytes?
 
-### Hands-on Challenge (implement-yourself)
+Here's a real, checkable failure worth walking through carefully, because it's a general statistics lesson, not just a detail of this one function.
 
-Before LAB 17 below, try this without looking at `object_store.py`:
-using Section 19.6's real, already-measured number (5,000 rows → 417,649
-bytes of Parquet for the real `clicks` table), calculate by hand
-approximately how many rows this table would need before a single daily
-full-load object would cross the default 8 MiB small-file threshold.
-(Answer: ~83.5 bytes/row → roughly 100,000+ rows needed to cross 8 MiB —
-20x this repo's current seeded volume. This is a *derived estimate* from
-real measured data, not a fresh benchmark — the exercise is in the
-arithmetic, connecting Section 19's measurement to Section 21's
-threshold, not in running anything new.)
+Imagine a partition with exactly three objects: 1 MB, 50 MB, and 0.5 MB. Add those up and divide by three, and you get an average of roughly 17 MB, comfortably above the 8 MB threshold. If avg_bytes were the only number you reported, this would read as "totally healthy, nothing to see here."
 
-### 21.5 Hands-on Exercise
+But look again at the actual three files. Two of them, the 1 MB and the 0.5 MB, genuinely are small files by the threshold. That's two out of three, the majority of the objects. The average was almost entirely dragged upward by one single large outlier, the 50 MB file. An average is the wrong single-number summary whenever a distribution is skewed like this, most objects small, a few large ones pulling the mean up, and a real small-file problem very often looks exactly this way in practice: one process writing correctly-sized files, alongside a separate, buggy process quietly dropping in a pile of tiny ones.
 
-**LAB 17 — Run the file-layout tests and confirm the report's shape
-against a deliberately mixed size distribution.**
+This is exactly why get_file_layout_report returns small_file_count as its own explicit field, rather than making a caller try to infer file health from avg_bytes alone. And it's worth noting min_bytes/max_bytes alone don't fully fix this either. They tell you the range exists, from 0.5 MB up to 50 MB, but not how many objects actually sit at the unhealthy end of that range. small_file_count is the one field that directly answers the operationally useful question: "how many files here are actually too small," rather than something a human has to derive by squinting at a range.
 
-```bash
+Why measure only, and never automatically fix a bad layout?
+
+This is a real, deliberate design decision, and it's the second time your project has made essentially this same call. Back in the Idempotency section, reconcile_bronze detected drift between the metadata table and real storage, but never automatically fixed anything; a human had to act on what it found. This section makes the identical choice for a different problem.
+
+The alternative considered was building an automatic compaction job: a process that detects too many small files in a partition and rewrites them into fewer, larger ones on its own. That would actually fix a degrading layout, not just report it. So why not build it?
+
+Because compaction is a genuinely more dangerous operation than detection. Fixing a small-file problem means reading the small files' contents, writing new, larger combined files, and then deleting the original small files. Any bug in that rewrite logic risks real, permanent data loss, not just a stale report someone can rerun. Detection-only costs you a human having to notice the report and act on it manually, in exchange for a categorically safer default: nothing this function does can ever delete or corrupt a real object. This same posture, detect and report, never silently auto-remediate, is recorded in your project as its own standing design principle (ADR-013), specifically because it's now shown up twice independently, not as a one-off choice made in isolation.
+
+	Detection only (chosen)	Automatic compaction
+Risk of real data loss from a bug	None — this is read-only reporting	Real — compaction means deleting originals after rewriting them
+Actually fixes a degrading layout	No, a human has to act on the report	Yes, automatically
+Cost to build	One function, one CLI command	A full rewrite pipeline, plus a safe-deletion strategy
+Matches how this project already handles similar problems	Yes, same posture as reconciliation	Would be the first self-modifying operation in the whole codebase
+5. RUN
+bash
+make layout-report TABLE=clicks
+
+wraps python -m url_shortener_analytics.cli layout-report --table clicks.
+
+A real, already-verified consistency check worth trying yourself: sum layout-report's total_bytes across every one of your tables (urls, users, clicks), one command per table, and compare that sum against make storage-stats's single, whole-Bronze total_bytes. They should match exactly, since both are ultimately counting the same real bytes sitting in the same bucket, just grouped differently.
+
+6. EXPERIMENT
+
+A real arithmetic exercise, connecting back to the Parquet section's actual measured numbers. You already know, from a genuine measurement, that 5,000 real clicks rows produced a 417,649-byte Parquet file. That works out to roughly 83.5 bytes per row. Before reading further, calculate by hand: roughly how many rows would a single daily clicks file need before it crossed the 8 MiB small-file threshold?
+
+8 MiB is 8,388,608 bytes. Divide that by 83.5 bytes per row, and you get roughly 100,000 rows needed to cross the threshold, about 20 times your project's current seeded volume. This tells you something concrete and reassuring: at your project's actual current data volume, there is no small-file risk to worry about yet, not because you're assuming it's fine, but because you've derived it from a real measurement. That's a materially stronger position than "it's probably fine."
+
+A hands-on test run, fully runnable right now, no MinIO needed:
+
+bash
 PYTHONPATH=ingestion/src python3 -m pytest ingestion/tests/unit/test_object_store.py -k file_layout -v
-```
 
-ACTUAL OBSERVED, genuinely run while writing this section:
+Expected: 3 tests pass. The first one is the interesting one, and it's the actual, real proof of the average-hides-the-problem scenario from the Design section above: it constructs three mocked objects at 1 MB, 50 MB, and 0.5 MB, and asserts small_file_count == 2, while avg_bytes comes out around 17 MB. Read that test's source yourself, in test_object_store.py, and confirm the exact numbers match what was walked through above.
 
-```
-ingestion/tests/unit/test_object_store.py::test_get_file_layout_report_computes_size_stats_and_small_file_count PASSED
-ingestion/tests/unit/test_object_store.py::test_get_file_layout_report_respects_a_custom_threshold PASSED
-ingestion/tests/unit/test_object_store.py::test_get_file_layout_report_is_all_zero_for_a_table_with_no_objects PASSED
+7. PRODUCTION VIEW
+Aspect	This project right now	Real production
+Checking layout health	Manual, one table at a time (make layout-report TABLE=...)	Scraped on a schedule, across every table, graphed over time, with alerting on a rising trend in small_file_count, not just its current value
+Fixing a bad layout	Nothing — detection only, by deliberate design	A scheduled compaction job, often a Spark job, rewriting a partition's many small files into fewer, size-targeted ones, with careful atomic delete-after-verify handling so a crash mid-compaction can't lose data
+Small-file threshold	One fixed default, 8 MiB, for every table alike	Often tuned per table, since different tables have genuinely different healthy target sizes depending on their query patterns
+8. PRINCIPAL ENGINEER VIEW
 
-3 passed, 18 deselected in 0.61s
-```
+If an interviewer asks "how would you detect a small-file problem," the weak answer is "check the average file size." The strong answer is the one your project's own test proves directly: an average can be pulled entirely upward by one large outlier while the majority of files are genuinely unhealthy, and a real-world small-file problem is very often shaped exactly this way, one healthy writer alongside one buggy one. Being able to give the specific 1 MB / 50 MB / 0.5 MB example, and explain exactly why the mean lies in that case, is a much stronger answer than a generic "yeah, averages can be misleading."
 
-What to observe in the first test specifically: it constructs three
-objects (1 MB, 50 MB, 0.5 MB) against a mocked S3 client and asserts
-`small_file_count == 2` — the two under 8 MB — while `avg_bytes` comes
-out around 17 MB, a number that alone would suggest "no problem here" if
-it were the only statistic reported. This is exactly 21.7's Failure
-Scenario, proven directly by this test's own construction.
+A second strong point: recognizing "detect, don't auto-remediate" as a repeating, deliberate pattern in this codebase, not a coincidence. It showed up first for Bronze reconciliation, and again here for file layout, for the same underlying reason both times: the cost of a false negative (a problem sitting unnoticed a bit longer) is much smaller than the cost of a false positive triggering an automatic, irreversible action, like deleting real data based on a buggy rewrite. Naming that as a conscious, repeated engineering posture, rather than two unrelated decisions that happened to land the same way, is exactly the kind of pattern-recognition a senior engineer is expected to demonstrate.
 
-### 21.6 How to test
-
-```bash
-make test
-```
-
-ACTUAL OBSERVED, genuinely run in this environment:
-
-```
-73 passed in 7.04s
-```
-
-`ruff check ingestion/ benchmarks/` also passed cleanly on every file
-this increment touched.
-
-**What remains a DESIGN EXPECTATION:** `get_file_layout_report` against
-real MinIO/S3, at real production data volumes where the small-file
-problem could actually manifest — this sandbox has neither real MinIO
-nor anywhere near the row count (per the Hands-on Challenge's derived
-estimate) needed to observe it firsthand.
-
-### 21.7 Failure Scenario
-
-**Can `avg_bytes` alone hide a real small-file problem?**
-
-Yes, concretely, and LAB 17's own first test proves it: three objects
-sized 1 MB, 50 MB, and 0.5 MB average to roughly 17 MB — comfortably
-above the 8 MB "small file" threshold, which would read as "healthy" if
-`avg_bytes` were the only number reported. But two of those three
-objects — the majority — genuinely are small files by the threshold; the
-average is being pulled entirely upward by one large outlier. This is
-exactly why `get_file_layout_report` returns `small_file_count`
-explicitly, as its own field, rather than expecting a caller to infer
-file-layout health from `avg_bytes` alone — an arithmetic mean is
-genuinely the wrong single-number summary for a bimodal or skewed size
-distribution, and a real small-file problem is very often skewed exactly
-this way (most objects tiny, a few large ones from whatever process
-wrote correctly-sized files alongside a buggy process that didn't).
-**Even `min_bytes`/`max_bytes`, also reported, don't fully solve this**
-— they show the *range* exists but not *how many* objects sit at the
-unhealthy end of it; `small_file_count` is the field that actually
-answers the operationally relevant question directly, which is precisely
-why it's reported as its own number rather than left for a reader to
-derive.
-
-### 21.8 Production Considerations
-
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Layout monitoring | Manual (`make layout-report TABLE=...`), one table at a time | Scraped on a schedule across every table, graphed over time, alerted on a rising `small_file_count` trend |
-| Remediation | None -- detection only, by deliberate design (21.3, ADR-013) | A scheduled compaction job (e.g. a Spark job rewriting a partition's many small files into fewer, size-target ones), with careful atomic delete-after-verify semantics |
-| Size distribution reporting | avg/min/max/small-file-count -- a coarse four-number summary | A real percentile histogram (p50/p90/p99 object size) for a much more complete picture than four summary statistics can give |
-| Target file size | Not set -- this repo's layout is a byproduct of one-file-per-partition, not a deliberately chosen size target | An explicit target (often 128 MB-1 GB per file in mature lakes), with write-time logic that splits a partition into multiple files once it would exceed that target |
-| Scope | Bronze layer only | A mature platform tracks file layout at every layer (Bronze, Silver, Gold), since compaction needs differ by layer's write pattern |
+9. REMEMBER
+Partitioning decides which folder your data lands in. File layout decides how many files, and how big, sit inside that folder. Different questions.
+Too many small files means paying Parquet's fixed per-file overhead over and over, for the same total data. Too few, oversized files limits parallelism and forces full-object scans for small requests.
+An average alone can hide a real small-file problem, when the distribution is skewed by one or two large outliers. Report the actual count of unhealthy files directly.
+This project always detects and reports, never automatically deletes or rewrites data on its own. The same safety posture that governed reconciliation governs file-layout checking too, and it's a deliberate, repeated choice, not a limitation.
 
 ### Principal Data Engineer Perspective
 
@@ -7555,91 +5385,51 @@ a check nobody runs guarantees nothing.
 
 ---
 
-## 24. Testing (deep-dive) ✅✅
+## 24. Testing (deep dive) ✅✅
 
-### 24.1 Concept
+1. CONCEPT
+You've been testing since the beginning. This section asks what that actually proves.
 
-This project has been testing itself since Section 6. Every increment
-since then has run `make test` and reported the result honestly. What's
-never happened is a section that steps back and asks: what actually
-makes a good test suite, why does this project split its tests into two
-separate directories, and what does "80 tests passing" actually prove,
-versus what it doesn't prove at all? This section is that step back.
+Every section in this whole project has ended with make test, and you've watched the pass count climb: 27, then 38, then 59, then 73, now 80. What's never happened is a step back to ask two honest questions: what makes a test suite actually good, and what does "80 tests passing" prove, versus what it quietly doesn't prove at all?
 
-Two ideas anchor everything else here.
+Idea one: the test pyramid
 
-The first is the **test pyramid**. Picture three layers stacked on top of
-each other. At the bottom, a wide base of fast, small, isolated **unit
-tests** — each one checks one function or one class, in memory, with no
-real database, no real network call, no real file on disk. In the
-middle, a smaller layer of **integration tests** — each one checks that
-two or more real pieces (your code and a real database, or your code and
-a real object store) actually work together. At the top, a thin sliver
-of **end-to-end tests** — each one drives the whole system the way a real
-user or a real scheduled job would. The pyramid shape is the point: you
-want many unit tests, fewer integration tests, and very few end-to-end
-tests, because each layer up costs more to run and more to maintain, and
-catches a narrower, later class of bug.
+Picture three layers, stacked like a pyramid.
 
-The second idea is **test doubles**. A test double is a fake, controllable
-stand-in for something a unit test doesn't want to depend on for real —
-a real database connection, a real network call, a real clock. The most
-common kind, a **mock**, is an object that pretends to be the real thing,
-records how it was called, and lets the test tell it exactly what to
-return. This project's unit tests use `unittest.mock.MagicMock` as a
-stand-in for `boto3`'s real S3 client, and an in-memory SQLite database
-as a stand-in for real Postgres.
+At the bottom, a wide base of unit tests. Each one checks a single function or class, entirely in memory, with no real database, no real network call, no real file touching disk. Fast, cheap, and you can have thousands of them.
 
-### Why does this exist?
+In the middle, a smaller layer of integration tests. Each one checks that two or more real pieces actually work together: your code and a real database, or your code and a real object store. Slower, and you need genuinely fewer of them.
 
-A pipeline that reads from one real database and writes to one real
-object store has two genuinely different kinds of things that can go
-wrong. The first kind is a bug in your own logic: a watermark computed
-one row too early, a retry loop that doesn't actually retry, a
-classification function that silently accepts an invalid value. The
-second kind is a bug in how your code talks to the real world: a SQL
-dialect difference SQLite doesn't have but Postgres does, a real network
-timeout, an S3 API quirk a mock doesn't reproduce.
+At the top, a thin sliver of end-to-end tests. Each one drives the whole system, the way a real user or a real scheduled job actually would, start to finish.
 
-Unit tests are built to catch the first kind, fast, and in large volume —
-this project's 80 of them run in about seven seconds, with no setup at
-all. Integration tests are built to catch the second kind, and they cost
-more to run: they need a real Postgres, and two of this project's three
-integration test files also need real MinIO, neither of which this
-sandbox has always had available for free. Neither kind of test can
-catch what the other one is built for. A pipeline with 100% passing unit
-tests and zero integration tests could still be completely broken
-against the one real database it will actually run against — SQLite and
-Postgres are not the same database, and Section 12's own docstring
-already names one concrete way they disagree (their type systems don't
-share an exact vocabulary, which is why contract validation compares
-coarse categories, not exact types).
+The pyramid shape is the entire point. You want many unit tests, a moderate number of integration tests, and very few end-to-end tests, because every layer up costs more time to run and more effort to maintain, while catching a narrower, later class of bug. A single end-to-end test might take minutes and only tells you "something, somewhere, broke." A unit test takes milliseconds and tells you exactly which function has the bug.
 
-### Simple Example (generic, pre-URL-Shortener)
+Idea two: test doubles, and specifically mocks
 
-Picture a function that charges a customer's credit card:
+A test double is a fake, fully-controllable stand-in for something a unit test doesn't want to depend on for real: a real database connection, a real network call, a real system clock. You've already used one, extensively, without this name for it yet.
 
-```python
+The most common kind is a mock: an object that pretends to be the real thing, remembers exactly how it was called, and lets the test tell it precisely what to return, on command. You already met MagicMock() in an earlier session, when we walked through test_write_bronze_retries_then_succeeds line by line, the "stunt double" that failed twice then succeeded, on a script you wrote.
+
+The generic example: testing a function that charges a credit card
+
+Here's a small, made-up function, nothing to do with URL shorteners:
+
+python
 def charge_card(payment_gateway, amount_cents: int) -> str:
     if amount_cents <= 0:
         raise ValueError("amount must be positive")
     return payment_gateway.charge(amount_cents)
-```
 
-A unit test for the `ValueError` branch needs no real payment gateway at
-all — it can pass in `None` for `payment_gateway`, since that branch
-never touches it:
+A unit test for the error path doesn't need a real payment gateway at all, because that branch never touches it:
 
-```python
+python
 def test_charge_card_rejects_a_non_positive_amount():
     with pytest.raises(ValueError):
         charge_card(None, amount_cents=0)
-```
 
-A unit test for the success path uses a mock, so the test never actually
-moves real money:
+A unit test for the success path uses a mock, so the test never actually moves real money:
 
-```python
+python
 def test_charge_card_calls_the_gateway_with_the_right_amount():
     mock_gateway = MagicMock()
     mock_gateway.charge.return_value = "txn_123"
@@ -7648,389 +5438,114 @@ def test_charge_card_calls_the_gateway_with_the_right_amount():
 
     mock_gateway.charge.assert_called_once_with(500)
     assert result == "txn_123"
-```
 
-Neither test proves the real payment gateway's API actually accepts a
-call shaped this way. Only an integration test, against a real sandbox
-account for that payment provider, can prove that.
+Here's the important, honest limitation, worth sitting with. Neither of these two tests proves the real payment gateway's actual API accepts a call shaped this way. They prove your own code calls .charge(amount_cents) correctly, on whatever it's given. Only a real integration test, against a real sandbox account for that actual payment provider, can prove the real API agrees with your assumption about it.
 
-### URL Shortener Example
+2. URL SHORTENER EXAMPLE
 
-This project's own version of that same charge-card mock is
-`test_reconciliation.py`'s `s3_client = MagicMock()`, with
-`s3_client.list_objects_v2.return_value` set to whatever object keys the
-test wants to pretend exist in Bronze — no real MinIO involved, and the
-test runs in milliseconds. Its own version of the in-memory database is
-`conftest.py`'s `sqlite_engine` fixture, used by every unit test in
-`ingestion/tests/unit/` that needs a real, queryable
-`ingestion_metadata` table without needing real Postgres running.
+Your project's own version of that mocked payment gateway is test_reconciliation.py's s3_client = MagicMock(). Your version of an in-memory database is conftest.py's sqlite_engine fixture, a real, working SQLite database that lives only in memory, used by every unit test that needs a real, queryable ingestion_metadata table without needing real Postgres running at all.
 
-The pyramid's middle layer lives in `ingestion/tests/integration/`: three
-files, each marked `@pytest.mark.integration` and excluded from `make
-test` by default (`pyproject.toml`'s `addopts = "-m 'not integration'"`).
-`test_contracts_integration.py` needs only real Postgres.
-`test_full_load_integration.py` and `test_incremental_load_integration.py`
-need real Postgres *and* real MinIO, since they exercise this project's
-actual `boto3` calls against a real S3-compatible endpoint, not a mock of
-one.
+The pyramid's middle layer already lives in your project too, under ingestion/tests/integration/. Three real files, each marked @pytest.mark.integration, and deliberately excluded from make test's default run:
 
-### 24.2 Architecture
+test_contracts_integration.py needs only real Postgres.
+test_full_load_integration.py and test_incremental_load_integration.py need real Postgres and real MinIO, since they exercise your actual boto3 calls against a genuine S3-compatible endpoint, not a mock pretending to be one.
 
-```
- ingestion/tests/
-   unit/                          <- wide base of the pyramid
-     conftest.py                    sqlite_engine fixture (shared)
-     test_*.py                      80 tests total, MagicMock for S3,
-                                     sqlite_engine for the database
-     runs via:  make test           (pytest -m "not integration", the
-                                      default -- see pyproject.toml)
-         │
-         │  proves: this project's OWN logic is correct, in isolation,
-         │  in about 7 seconds, with nothing external required
-         ▼
-   integration/                   <- middle layer of the pyramid
-     test_contracts_integration.py       needs: real Postgres only
-     test_full_load_integration.py       needs: real Postgres + real MinIO
-     test_incremental_load_integration.py needs: real Postgres + real MinIO
-     runs via:  make test-integration  (pytest -m integration)
-         │
-         │  proves: this project's code ACTUALLY WORKS against the real
-         │  systems it depends on, not just against a mock or a stand-in
-         ▼
-   (no end-to-end layer exists yet -- there's no scheduler, so there's
-    no "run the whole pipeline the way production would" test to write)
+Notice what's missing: your project has no end-to-end layer at all yet. That's not an oversight. There's no scheduler running your pipeline automatically yet, so there's genuinely no "run the whole thing the way production would" scenario to write a test for.
 
- A THIRD, SEPARATE axis: coverage measurement.
-   make coverage  ->  pytest --cov=url_shortener_analytics --cov-report=term-missing
-   Measures which LINES the unit-test layer actually executes.
-   Says nothing by itself about whether the assertions are any good --
-   see Section 24.3 and 24.8 for why this project measures coverage
-   without gating on it yet.
-```
+3. DESIGN
+A third, separate axis: coverage
 
-### 24.3 Design Decision: measure coverage now, but don't gate on it yet
+Everything above answers "does my code do the right thing." Coverage answers a completely different question: "which lines of my code did the test suite actually run at all?" These are not the same question. A test can execute a line of code and still contain a wrong or missing assertion about what that line should have done. Coverage tells you nothing about assertion quality; it only tells you what got touched.
 
-**Context:** `pytest-cov` has been listed in `pyproject.toml`'s dev
-dependencies since this project's very first `pyproject.toml` was
-written. Nobody had ever actually run it. Running it for the first time,
-in this sandbox, for this section, produced a real number: 58% of this
-project's own source lines are exercised by the unit-test suite.
+bash
+make coverage
 
-**Decision:** wire up `make coverage` so that number is visible and
-reproducible on demand. Do not add a `--cov-fail-under` threshold to
-`pyproject.toml`'s `addopts`, and do not fail `make test` if coverage
-drops.
+runs pytest --cov=url_shortener_analytics --cov-report=term-missing. --cov=url_shortener_analytics tells the tool which package to actually measure. Without it, the report would measure pytest's own internal code, which is never what you want. --cov-report=term-missing doesn't just print a percentage; it prints the exact line numbers that were never executed, which is what turns the report into something actionable instead of a single, uninformative number.
 
-**Consequences:** coverage becomes a number a developer can check, but
-nothing currently stops it from getting worse over time. Section 24.8
-names this as a real, temporary gap, not a permanent design choice. Now
-recorded as [ADR-015](#adr-015-measure-test-coverage-now-dont-gate-on-it-yet)
-in Section 29, explicitly tied there to ADR-013's earlier
-detect-don't-remediate decision for Bronze file-layout health — the same
-posture, applied a second time, to a different concern.
+The real design decision: measure the number, but don't fail the build over it yet
 
-### Alternatives
+Here's a real, genuine discovery this section made. pytest-cov, the tool make coverage depends on, has been sitting listed as a dependency in your project's pyproject.toml since this project's very first version. Nobody had ever actually run it. This section ran it for the first time, and got a real, honest number: 58% of the project's own source lines are actually exercised by the unit-test suite.
 
-Set a hard threshold immediately (`--cov-fail-under=80`, enforced on
-every `make test` run). Or: leave `pytest-cov` uninstalled and unused, as
-it already was before this section — the actual status quo up to this
-point.
+The decision made here: wire up make coverage so this number is visible and reproducible on demand, but deliberately do not add a hard failure threshold (something like --cov-fail-under=80) that would make make test itself fail if coverage drops.
 
-### Trade-offs
+Why not just set a strict threshold immediately? Because a threshold picked before you've ever seen your real number is close to arbitrary, and your real number, 58%, sits well below a typical target like 80% anyway. Forcing that gate on immediately would mean either quietly lowering the bar to match reality, or scrambling to write tests today, possibly chasing the number itself rather than testing what actually matters.
 
-| | Measure only (chosen) | Measure and gate at a fixed threshold |
-|---|---|---|
-| Honesty about the real number | High — 58% is reported as exactly what it is | Risky — a number picked before seeing real coverage (like 80%) can be arbitrary, and this project's real number is currently well below it |
-| Forces new tests to be written today | No | Yes, immediately, possibly for the wrong reasons (chasing a number rather than testing what matters) |
-| Still better than the prior status quo | Yes — a real, visible number beats an unused, silently-declared dependency | Also yes, but the jump is bigger and better justified once there's a CI system to actually enforce it in |
-| Right choice for this project, right now | Yes — no CI exists yet to enforce a gate consistently, and a gate nobody enforces is worse than no gate at all, since it implies a guarantee that isn't real | Would be the right next step, once CI exists (Section 24.8) |
+This mirrors a decision you've already seen twice before in this project. Back in File Layout, get_file_layout_report was built to detect a small-file problem without ever automatically fixing it, because automatic remediation without a strong-enough safety net can cause more harm than the problem it's solving. Measuring coverage honestly, without gating on it yet, is that exact same cautious posture, applied here to a testing concern instead of a storage one. There's no CI system in this project yet to consistently enforce a gate at all. A gate that nothing actually enforces is arguably worse than no gate, because it implies a guarantee that isn't real.
 
-This mirrors a choice this project has made before, in a different
-context: Section 21.3 chose to detect a problem (small Bronze files)
-without automatically fixing it, because automatic remediation without
-enough surrounding safety net can do more harm than the problem it
-solves. Measuring coverage without gating on it is the same shape of
-caution, applied to a testing concern instead of a storage one.
-
-### 24.4 Implementation
-
-**Implementation Guide (write-it-yourself):** add a `coverage` target to
-the `Makefile` that runs `pytest --cov=url_shortener_analytics
---cov-report=term-missing`. `--cov=url_shortener_analytics` tells
-`pytest-cov` which package to measure — without it, coverage would
-report on `pytest`'s own internals, which is never what you want.
-`--cov-report=term-missing` prints not just a percentage per file, but
-the exact line numbers that were never executed, which is what makes the
-report actionable instead of just a number.
-
-**Reference Implementation** (`Makefile`, excerpt):
-
-```makefile
-# See docs/analytics-engineering-guide.md Section 24. Measured, not
-# gated -- no --cov-fail-under threshold yet (Section 24.3).
+	Measure only (chosen)	Measure and gate at a fixed threshold
+Honest about the real number	Yes, 58% reported exactly as it is	An arbitrary picked number, like 80%, risks looking authoritative when it's a guess
+Forces new tests today	No	Yes, immediately, possibly for the wrong reasons
+Right choice, right now	Yes, no CI exists yet to consistently enforce a gate	Becomes the right next step once real CI exists
+4. IMPLEMENTATION
+makefile
+# Measured, not gated -- no --cov-fail-under threshold yet.
 coverage:
 	pytest --cov=url_shortener_analytics --cov-report=term-missing
-```
-
-### Hands-on Challenge (implement-yourself)
-
-Before running `make coverage` yourself, write down a guess: which file
-in `ingestion/src/url_shortener_analytics/` do you expect to have the
-*lowest* coverage percentage, and why? Then run it for real and check
-your guess against 24.6's real numbers below. A common wrong guess:
-assuming the least-tested file must be the newest or most complex one.
-The real answer is more structural than that — see 24.7 for the reasoning.
-
-### 24.5 Hands-on Exercise
-
-**LAB 20 — Run the real coverage report, then reproduce a real
-environment-mismatch failure on purpose.**
-
-First, the coverage report:
-
-```bash
+5. RUN, and a real number worth understanding, not just reading
+bash
 make coverage
-```
 
-Then, the break-then-fix half of this lab. `test_contracts_integration.py`
-needs real Postgres, and this sandbox has one — but its `settings`
-fixture, un-overridden, points at port 5433 (this project's
-docker-compose mapping), not the 5432 this sandbox's Postgres actually
-listens on. Run it once with no override, and read the real error:
+Real, already-observed output from this exact project:
 
-```bash
-pytest ingestion/tests/integration/test_contracts_integration.py -v -m integration
-```
-
-Then run it again, this time supplying the port your own Postgres
-actually uses:
-
-```bash
-DATABASE_URL="postgresql+psycopg://analytics:analytics@localhost:5432/analytics" \
-  pytest ingestion/tests/integration/test_contracts_integration.py -v -m integration
-```
-
-What to observe: the first run fails with a real
-`sqlalchemy.exc.OperationalError`, naming the exact port it tried and
-the exact reason (connection refused). The second run passes. Nothing
-about the *code* changed between the two runs — only the environment
-variable did. This is the same distinction Section 24.7 turns into this
-section's Failure Scenario: a test that depends on an assumption about
-its environment can fail for a reason that has nothing to do with a bug
-in the code it's testing.
-
-### 24.6 How to test
-
-```bash
-make test
-```
-
-ACTUAL OBSERVED, this sandbox:
-
-```
-80 passed in 6.66s
-```
-
-```bash
-make coverage
-```
-
-ACTUAL OBSERVED, this sandbox:
-
-```
 Name                                                           Stmts   Miss  Cover   Missing
 --------------------------------------------------------------------------------------------
-ingestion/src/url_shortener_analytics/cli.py                     222    222     0%   50-479
-ingestion/src/url_shortener_analytics/config.py                   15      0   100%
-ingestion/src/url_shortener_analytics/contracts.py                79      2    97%   102, 105
-ingestion/src/url_shortener_analytics/db.py                        9      9     0%   11-32
-ingestion/src/url_shortener_analytics/exceptions.py                6      0   100%
-ingestion/src/url_shortener_analytics/extract_full.py             29      0   100%
-ingestion/src/url_shortener_analytics/extract_incremental.py      34      0   100%
-ingestion/src/url_shortener_analytics/logging_setup.py            20     20     0%   13-48
-ingestion/src/url_shortener_analytics/metadata.py                 98     16    84%   56-57, 117-118, ...
-ingestion/src/url_shortener_analytics/object_store.py             78      1    99%   38
-ingestion/src/url_shortener_analytics/pii.py                      30      0   100%
-ingestion/src/url_shortener_analytics/reconciliation.py           22      0   100%
+cli.py                                                            222    222     0%   50-479
+config.py                                                          15      0   100%
+contracts.py                                                       79      2    97%   102, 105
+db.py                                                               9      9     0%   11-32
+extract_full.py                                                    29      0   100%
+extract_incremental.py                                             34      0   100%
+logging_setup.py                                                   20     20     0%   13-48
+metadata.py                                                        98     16    84%
+object_store.py                                                    78      1    99%
+pii.py                                                             30      0   100%
+reconciliation.py                                                  22      0   100%
 --------------------------------------------------------------------------------------------
-TOTAL                                                            643    270    58%
-```
+TOTAL                                                             643    270    58%
 
-`ruff check ingestion/ benchmarks/` was also run — ACTUAL OBSERVED: `All
-checks passed!`
+Before reading further, predict: which file has the lowest coverage, and why? A common, wrong guess is "whichever file is newest or most complex." Look at the real table. cli.py sits at a flat 0%, and db.py and logging_setup.py sit at 0% too.
 
-Both integration checks named in this section's Hands-on Exercise were
-also genuinely run. Without `DATABASE_URL` set, ACTUAL OBSERVED:
+Here's the honest, structural reason, and it's worth understanding rather than memorizing. Open cli.py yourself and look at one of its command functions, say run_full_load_command. It does four things: read config, build a database engine, build an S3 client, call run_full_load. It's a thin wrapper. Every real decision inside it, the actual logic worth testing, already lives in a separate function, run_full_load, which already has its own direct, dedicated unit tests that don't go through cli.py at all. cli.py's own code, the argument parsing and the wiring together of other pieces, never gets executed by any unit test, because unit tests call the real logic functions directly, skipping the CLI layer entirely.
 
-```
-sqlalchemy.exc.OperationalError: (psycopg.OperationalError) connection failed:
-connection to server at "127.0.0.1", port 5433 failed: Connection refused
-```
+Is 0% on cli.py therefore nothing to worry about? Not quite, and it's worth being precise here rather than dismissing it. It means a narrower, specific class of bug could slip through unnoticed: wrong argument names, a typo in a logged field name, a wrong exit code, things that live specifically in the wiring, not in the logic it calls. A shallow reading of "0% coverage" calls this file untested. A more careful reading asks exactly what would actually break if that 0% never improved, and the honest answer is real, but narrower, bugs than the raw number alone suggests.
 
-With it set to this sandbox's real port, ACTUAL OBSERVED:
+6. EXPERIMENT (a real environment-mismatch failure, worth reproducing)
 
-```
-1 passed in 0.96s
-```
+Here's a genuine, already-observed failure, worth understanding closely, because it's a distinct kind of test failure from anything you've hit so far.
 
-The other two integration files were also run, with the correct
-`DATABASE_URL`, to confirm today's real status. ACTUAL OBSERVED: 5
-failed, all with the same root cause —
-`botocore.exceptions.EndpointConnectionError: Could not connect to the
-endpoint URL: "http://localhost:9000/..."` — because this sandbox has no
-MinIO. This is not a new finding; it's the expected, already-named
-consequence of this sandbox having real Postgres but no Docker, and it
-was worth re-confirming for real, for this section, rather than assumed
-to still be true.
+test_contracts_integration.py needs a real Postgres connection. Its settings fixture falls back to a class-level default connection string whenever nothing overrides it, and that default names port 5433, matching this project's own docker-compose.yml mapping. In this cloud sandbox, Postgres was installed directly, not through Docker, and genuinely listens on the standard port 5432 instead. Running the test with no override produced a real sqlalchemy.exc.OperationalError, a connection-refused failure, happening in the network driver layer, before a single line of this project's own contract-validation logic ever ran.
 
-### 24.7 Failure Scenario
+bash
+pytest ingestion/tests/integration/test_contracts_integration.py -v -m integration
 
-**What happens when a test's assumption about its environment is wrong,
-but the code under test is completely fine?**
+Then, supplying the correct port:
 
-This is exactly what LAB 20 reproduced. `test_contracts_integration.py`'s
-`settings` fixture builds a plain `Settings()` object, which falls back
-to its class-level default connection string whenever no environment
-variable overrides it (`config.py`, Section 6) — and that default names
-port 5433, this project's docker-compose mapping. This sandbox's real
-Postgres, installed directly rather than through Docker, listens on the
-standard port 5432 instead. Running the test with no override produces a
-real, genuine failure: a connection-refused error, in the driver layer,
-before a single line of this project's own contract-validation code ever
-runs.
+bash
+DATABASE_URL="postgresql+psycopg://analytics:analytics@localhost:5432/analytics" \
+  pytest ingestion/tests/integration/test_contracts_integration.py -v -m integration
 
-The honest, easy-to-miss point: this failure proves nothing about
-whether `validate_all_contracts` works. It proves only that this one
-test's default settings don't match this one sandbox's specific
-Postgres port. A developer unfamiliar with this distinction could read a
-failing integration test, assume the code is broken, and start
-debugging `contracts.py` — the wrong place entirely. This is also why
-Section 24.1 stressed that unit tests and integration tests catch
-different bugs: a unit test using `sqlite_engine` never touches a real
-port number at all, so it can never fail this particular way, for better
-(no environment-mismatch false alarms) and for worse (it also can't
-catch a *real* connectivity problem the way this integration test just
-did, for real, in this exact sandbox).
+The honest, easy-to-miss lesson: that first failure proved nothing about whether validate_all_contracts actually works. It only proved that one test's default settings didn't match one specific sandbox's Postgres port. A developer unfamiliar with this distinction could see a failing integration test, wrongly assume the real logic is broken, and go debugging contracts.py, the wrong file entirely.
 
-### 24.8 Production Considerations
+A note on your own real machine, since it's genuinely different here: your Mac runs Postgres through real docker-compose, which does map to port 5433, matching this fixture's own default. So this exact failure likely won't reproduce for you the same way it did in this sandbox. To feel the same class of failure yourself, deliberately point DATABASE_URL at a wrong port on purpose, something like port 9999, and run the same integration test. You should see the identical shape of failure: a connection error, before your real code ever runs, proving the same lesson, that an integration test's failure can be about the environment, not the code, even though the two look identical from the outside until you actually read the error.
 
-| Aspect | This repo (POC) | Production |
-|---|---|---|
-| Unit vs. integration separation | Two directories, one pytest marker, `addopts` excludes `integration` by default (Section 6) | Same structure, typically also split into separate CI jobs so integration tests don't block a fast unit-test-only feedback loop |
-| Coverage | Measured on demand (`make coverage`), not gated, 58% today | Measured on every CI run, gated at an agreed threshold, with the threshold raised over time rather than set once and forgotten |
-| CI | None — every check in this project has been run by hand, in this sandbox, and reported honestly as such | A pipeline that runs `make test`, `make lint`, and `make coverage` (with its gate) on every pull request, and `make test-integration` on a schedule or before a release, against real, ephemeral Postgres/MinIO containers |
-| Environment-mismatch failures (this section's Failure Scenario) | A developer has to already know this sandbox's port differs from docker-compose's, and pass `DATABASE_URL` by hand | A CI job's own environment is defined once, in one place (a docker-compose file or CI config), so no developer ever has to know or guess a port by hand |
-| Flaky-test handling | Not yet a concern — no test in this suite has ever been observed to fail non-deterministically | A quarantine mechanism (a marker, or a separate "known flaky" job) once a real flaky test is found, so one intermittent test can't block every other developer's CI run |
-| Test data management | Hand-written fixtures (`seeded_clicks`, `VALID_CONTRACT`) and this project's own `scripts/seed_sample_data.py` | Same idea at larger scale, often generated with a library like Faker (already a dev dependency here, listed in `pyproject.toml`, but not yet used by any test in this suite — a smaller version of the same "declared but unused" pattern this section found with `pytest-cov`) |
+7. PRODUCTION VIEW
+Aspect	This project right now	Real production
+Separating unit from integration	Two directories, one pytest marker, unit tests run by default	Same structure, typically split into two separate CI jobs, so integration tests don't slow down the fast unit-test feedback loop
+Coverage	Measured on demand, not gated, 58% today	Measured on every CI run, gated at an agreed threshold, with that threshold raised gradually over time, not fixed once
+CI	None. Every check in this whole project has been run by hand and reported honestly as such	A real pipeline running make test, make lint, and gated make coverage on every code change, plus make test-integration against real, disposable Postgres/MinIO containers
+Environment mismatches	A developer has to already know this sandbox's port differs from docker-compose's default	A CI job's environment is defined once, centrally, so no developer ever has to guess a port by hand
+Flaky tests	Not yet a concern, no test here has ever failed non-deterministically	A quarantine mechanism, once a real flaky test is found, so one intermittent failure can't block every other developer
+8. PRINCIPAL ENGINEER VIEW
 
-### Principal Data Engineer Perspective
+If asked "your unit tests all pass, does that mean your pipeline works," the strong answer isn't yes or no, it's precise: "unit tests prove my own logic is internally correct, in isolation. They cannot prove my code actually works against the real Postgres or real MinIO it depends on, because a mock only behaves however I told it to behave, and SQLite genuinely isn't Postgres." Having the real, concrete example ready, the port-mismatch failure above, that a real integration test genuinely caught and a unit test structurally never could have, is a much stronger answer than reciting the pyramid as theory.
 
-The habit worth defending here is the same one this guide has practiced
-since Section 16: actually running the thing before writing about it,
-instead of describing what a coverage report would probably say. `58%`
-is a real number, and it's genuinely lower in places than a casual guess
-might predict — `cli.py` sits at a flat 0%, not because nobody cares
-about it, but because its command functions are thin wrappers (parse
-config, build an engine, call the real logic, log the result), and every
-one of the *real* decisions inside them lives in functions like
-`run_full_load` or `classify_all_contracts`, which already have direct,
-dedicated unit tests. A shallow reading of "0% coverage" would call this
-untested. A more careful reading asks what, specifically, would break if
-that 0% stayed 0% forever — and the honest answer is: real bugs, but a
-narrower class of them than the number alone suggests (argument parsing,
-logging field names, exit codes — not the actual business logic those
-functions call into).
+The second thing worth naming plainly: the discovery pattern itself, not just this one result. pytest-cov sat declared and completely unused for the entire life of this project up to this point. Nobody lied about it; nobody had actually looked. This is the same shape of finding as watermark_start in the Ingestion Metadata section, and the validate-contracts-versus-pii-report ordering gap in the PII section: the real skill isn't writing correct code on the first try, it's habitually checking whether something you believe is done actually is, on a real schedule, rather than assuming it once and moving on.
 
-The second thing worth naming is the discovery pattern itself, not just
-its result. `pytest-cov` sat declared, unused, for every prior section
-of this guide. Nobody was lying about it — nobody had looked. The fix
-here wasn't clever; it was running one command that had always been
-available and reporting what it actually said. That's a smaller version
-of exactly what Section 22 did for `watermark_start`, and Section 23 did
-for the `validate-contracts`-vs-`pii-report` gap: the useful skill isn't
-writing correct code the first time, it's habitually checking whether
-something declared as done actually is, on a schedule, rather than once.
-
-### 24.9 Principal Engineer Interview Questions
-
-**Q (Category I: Testing Strategy — this closes the forward reference
-`ingestion/tests/integration/README.md` has carried since Section 12):
-"Your unit tests all pass. Does that mean your pipeline works?"**
-
-*What's tested:* whether the candidate understands the specific,
-narrower claim a passing unit-test suite actually makes, versus the
-broader claim non-technical stakeholders often assume it makes.
-
-*What a weak answer looks like:* "Yes, if the tests pass, the code
-works" — treats "the code's own logic is internally consistent" as the
-same claim as "the system works end-to-end," which it isn't.
-
-*What a strong answer covers:* no — passing unit tests prove this
-project's own logic behaves correctly against the specific inputs and
-mocks each test constructs. They say nothing about whether the real
-Postgres dialect actually matches what SQLite let a test get away with,
-or whether the real S3 API returns exactly the shape a `MagicMock`
-was told to return. This project's own `test_contracts_integration.py`
-is a real, demonstrated example: it passed cleanly here in this sandbox
-only once pointed at the correct real port — no unit test could have
-caught that port mismatch at all, because no unit test touches a real
-port.
-
-*Concepts:* the test pyramid; what a mock proves versus what it doesn't;
-the difference between "internally consistent" and "correct against the
-real world."
-
-*Expected follow-up:* "Given limited time before a release, would you
-rather add ten more unit tests or one more integration test?" — Depends
-entirely on what's already covered: if the pyramid's middle layer is
-thin relative to real integration risk (as this project's currently is —
-two of three integration files have never once run against real MinIO
-in this environment), the integration test usually buys more confidence
-per hour spent, precisely because it's the layer nothing else can
-substitute for.
-
-*Common mistake:* treating "we have good test coverage" as one single
-fact, rather than two separate facts — how much of the code runs during
-tests, and how well the real world is represented while it does.
-
-**Q: "You just found that `pytest-cov` had been declared as a dependency
-for the whole life of this project but never run. Whose fault is that,
-and what would you change to make sure it doesn't happen again?"**
-
-*What's tested:* whether the candidate reaches for blame or for a
-process fix, and whether they can name a concrete mechanism rather than
-a vague intention.
-
-*What a weak answer looks like:* "Whoever added the dependency should
-have used it" — assigns blame to an individual, and proposes nothing
-that would actually prevent a repeat.
-
-*What a strong answer covers:* this isn't really about one person
-forgetting something once — it's about a declared intention with no
-enforcement mechanism behind it, which will drift every time, for
-whoever's working on the project. The fix isn't "remember harder"; it's
-removing the need to remember at all — wiring the coverage command into
-CI (Section 24.8) so it runs on every change whether or not anyone
-thinks to run it by hand, the same way `ruff check` already runs
-automatically rather than depending on a developer remembering to lint.
-
-*Concepts:* the gap between a declared intention (a dependency in a
-manifest file) and an enforced behavior (something that actually runs);
-automation as the fix for "someone forgot," rather than individual
-diligence.
-
-*Expected follow-up:* "What's the smallest first step toward that, given
-this project has no CI at all yet?" — Even before a full CI pipeline
-exists, a `pre-commit` hook or a documented pre-merge checklist that
-runs `make test && make coverage` closes most of the gap immediately,
-without needing the larger infrastructure investment a full CI system
-represents.
-
-*Common mistake:* proposing a full CI/CD platform as the only acceptable
-answer, when the actual, immediately available first step is much
-smaller and could ship today.
-
----
+9. REMEMBER
+The test pyramid: many fast unit tests, fewer integration tests, almost no end-to-end tests. Each layer up costs more and catches a narrower, later class of bug.
+A mock proves your code calls something correctly. It never proves the real thing on the other end actually behaves the way you assumed.
+Coverage measures which lines ran, never whether the assertions checking them are any good. A high number with weak assertions can still hide real bugs.
+An integration test can fail for a reason that has nothing to do with your code, an environment mismatch, not a real bug. Read the actual error before assuming the logic is broken.
 
 ## 25. Failure Scenarios (all 10) ✅✅
 
