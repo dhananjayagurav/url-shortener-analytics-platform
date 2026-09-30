@@ -53,7 +53,7 @@ def main() -> None:
     # (Outcome 3), Spark reads the Parquet file and reruns the
     # transformations again here -- it does not remember action 1's result.
     valid_clicks.write.mode("overwrite").parquet(
-        f"s3a://{settings.minio_bucket}/phase2/explore_ckicks_output/"
+        f"s3a://{settings.minio_bucket}/phase2/explore_clicks_output/"
     )
     print("wrote output to phase2/explore_clicks_output/")
 

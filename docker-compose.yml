@@ -63,18 +63,22 @@ services:
   # is exec'd through unchanged, confirmed against apache/spark-docker's
   # own entrypoint.sh.template.
   spark-master:
-    image: spark:3.5.9-python3
+    build:
+      context: .
+      dockerfile: phase2-spark/docker/Dockerfile
     container_name: analytics-platform-spark-master
     restart: unless-stopped
     command: ["/opt/spark/bin/spark-class","org.apache.spark.deploy.master.Master"]
-    volumes:
-      - .:/opt/spark/work-dir
     ports:
       - "7077:7077" # Spark master RPC -- workers and spark-submit connect here
       - "8090:8080" # Spark master web UI (mapped to 8090 to avoid clashing with other local services on 8080)
+    volumes:
+      - .:/opt/spark/work-dir
   
   spark-worker:
-    image: spark:3.5.9-python3
+    build:
+      context: .
+      dockerfile: phase2-spark/docker/Dockerfile
     container_name: analytics-platform-spark-worker
     restart: unless-stopped
     depends_on:
@@ -85,6 +89,8 @@ services:
     environment:
       SPARK_WORKER_CORES: "2"
       SPARK_WORKER_MEMORY: "2g"
+    volumes:
+      - .:/opt/spark/work-dir:ro
 
 volumes:
   pg_data:

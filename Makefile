@@ -167,8 +167,9 @@ test-phase2-spark:
 # Must run *inside* the Docker network so the driver and executors resolve
 # spark-master/minio identically -- see Design, Outcome 1.
 explore-clicks:
-	docker compose exec -e PYTHONPATH=/opt/spark/work-dir/phase2-spark/src spark-master \
+	docker compose exec spark-master \
 		/opt/spark/bin/spark-submit \
 		--master spark://spark-master:7077 \
+		--packages org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 \
 		--conf spark.pyspark.python=python3 \
 		phase2-spark/src/jobs/explore_clicks.py

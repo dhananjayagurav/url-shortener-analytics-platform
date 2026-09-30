@@ -13,24 +13,26 @@ from phase2_spark.config import Phase2Settings
 def build_spark_session(settings: Phase2Settings, *, master: str | None = None) -> SparkSession:
     """Build a SparkSession wired to talk to MinIO over S3A.
 
-    `master` defaults to settings.spark_master_url (the real cluster, via
-    docker-compose's spark-master service). Tests override it to
-    "local[1]"/"local[*]" -- see tests/unit/conftest.py -- which is why
-    `master` is a parameter here rather than hardcoded.
+    IMPORTANT: spark.jars.packages is deliberately NOT set here. When this
+    function runs inside a process launched by `spark-submit` (the real
+    path -- see the Makefile's explore-clicks target), the driver JVM has
+    ALREADY started, with its classpath already fixed, by the time this
+    Python code executes. spark.jars.packages controls what gets added to
+    that classpath -- but by the time .config() runs here, it's too late;
+    a running JVM's classpath can't be changed after the fact. This has to
+    be passed to `spark-submit --packages ...` on the command line
+    instead, where Spark's own submission bootstrap resolves it via Ivy
+    BEFORE the JVM starts. The S3A settings below are different: Hadoop
+    reads fs.s3a.* properties lazily, the first time an s3a:// path is
+    actually accessed -- well after the JVM is already running -- so
+    setting those here, programmatically, is fine.
 
     hadoop-aws:3.3.4 + aws-java-sdk-bundle:1.12.262 are not arbitrary
-    versions: PySpark 3.5.9 bundles Hadoop client 3.3.4 (confirmed by
-    inspecting the installed jars in this sandbox), and Hadoop 3.3.4's own
-    pom.xml pins aws-java-sdk-bundle to exactly 1.12.262. A mismatched
-    aws-java-sdk-bundle version here is a common, confusing source of
-    NoSuchMethodError at runtime -- pinning both together avoids it.
+    versions: PySpark 3.5.9 bundles Hadoop client 3.3.4, and Hadoop 3.3.4's
+    own pom.xml pins aws-java-sdk-bundle to exactly 1.12.262.
     """
     builder = (
         SparkSession.builder.appName(settings.spark_app_name)
-        .config(
-            "spark.jars.packages",
-            "org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262",
-        )
         .config("spark.hadoop.fs.s3a.endpoint", settings.minio_endpoint)
         .config("spark.hadoop.fs.s3a.access.key", settings.minio_access_key)
         .config("spark.hadoop.fs.s3a.secret.key", settings.minio_secret_key)
